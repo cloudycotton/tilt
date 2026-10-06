@@ -1,0 +1,12 @@
+{
+  "name": "tilt-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Browser end-to-end tests for tilt (brief section 8); scripts/e2e.sh runs them against the desktop container.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

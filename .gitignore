@@ -1,0 +1,6 @@
+/target
+dist/
+node_modules/
+e2e/results/*
+!e2e/results/.gitkeep
+.DS_Store

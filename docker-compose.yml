@@ -1,0 +1,21 @@
+# Local desktop rig: tilt on http://localhost:6090/#token=devtoken (view-only: #token=viewtoken).
+# scripts/e2e.sh drives it through the variables below, e.g.
+#   SCREEN=1024x768x24 X_ABSTRACT_ONLY=1 TESTPATTERN=animate docker compose up -d
+services:
+  desktop:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: desktop
+    image: tilt-desktop
+    ports:
+      - "6090:6090"
+    environment:
+      TILT_TOKEN: devtoken
+      TILT_VIEW_TOKEN: viewtoken
+      TESTPATTERN: ${TESTPATTERN:-1}
+      SCREEN: ${SCREEN:-1920x1080x24}
+      X_ABSTRACT_ONLY: ${X_ABSTRACT_ONLY:-0}
+      DESKTOP: ${DESKTOP:-xfce}
+    shm_size: 1gb
+    init: true

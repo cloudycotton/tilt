@@ -1,0 +1,16 @@
+{
+  "name": "tilt-mock-e2e",
+  "private": true,
+  "description": "Mock tilt server (protocol v1, real OpenH264 fixtures) and Playwright tests for the web client",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

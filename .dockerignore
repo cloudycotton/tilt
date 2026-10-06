@@ -1,0 +1,8 @@
+# Build context for docker/Dockerfile, which COPYs only Cargo.toml, Cargo.lock, src, web and
+# tools. Keep the multi-GB build outputs and host-only test files out of the context.
+target/
+**/target*
+**/node_modules
+e2e/results
+dist/
+**/.DS_Store

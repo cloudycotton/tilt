@@ -1,0 +1,12 @@
+# Regenerates the mock server's H.264 fixtures. Standalone on purpose (empty [workspace]):
+# it is not part of the tilt workspace and never ships.
+[package]
+name = "tilt-mock-fixtures"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+openh264-sys2 = "=0.9.8"

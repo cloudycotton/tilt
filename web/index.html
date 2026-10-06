@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0c0e">
+<link rel="icon" href="data:,">
+<title>tilt</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0c0e;
+    --panel: rgba(26, 28, 33, 0.92);
+    --line: rgba(255, 255, 255, 0.1);
+    --fg: #e8eaef;
+    --muted: #9aa1ad;
+    --accent: #4f8cff;
+    --ok: #34c759;
+    --wait: #ffb020;
+    --bad: #ff453a;
+    --kb: 0px;
+    --strip: 0px;
+    --sat: env(safe-area-inset-top, 0px);
+    --sar: env(safe-area-inset-right, 0px);
+    --sab: env(safe-area-inset-bottom, 0px);
+    --sal: env(safe-area-inset-left, 0px);
+    /* The lowest usable line: above the home indicator, or above the on-screen keyboard. */
+    --bottom: max(var(--sab), var(--kb));
+    --tap: 44px;
+  }
+  @media (pointer: fine) {
+    :root { --tap: 34px; }
+  }
+  [hidden] { display: none !important; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+  /* Fixed so iOS never scrolls the page when the soft keyboard opens. */
+  body { position: fixed; inset: 0; }
+  button, input, textarea { font: inherit; color: inherit; }
+  button {
+    min-width: var(--tap);
+    height: var(--tap);
+    padding: 0 10px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  button:disabled { opacity: 0.38; cursor: default; }
+  button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  @media (hover: hover) {
+    button:not(:disabled):hover { background: rgba(255, 255, 255, 0.08); }
+  }
+
+  /* The remote screen stops above the on-screen keyboard and the extra-key strip, so no part of
+     it is hidden behind them. */
+  #viewport {
+    position: fixed;
+    top: var(--sat);
+    right: var(--sar);
+    bottom: calc(var(--bottom) + var(--strip));
+    left: var(--sal);
+    overflow: hidden;
+    background: #000;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+  /* Desktop 1:1 mode scrolls natively; the stage centres while it is smaller than the viewport. */
+  #viewport.scroll { overflow: auto; display: grid; }
+  #stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #viewport.scroll #stage { position: relative; margin: auto; }
+  #screen { display: block; width: 100%; height: 100%; }
+  #cursor {
+    position: absolute;
+    left: 0;
+    top: 0;
+    pointer-events: none;
+    transform-origin: 0 0;
+    image-rendering: pixelated;
+  }
+
+  /* The hidden keyboard field: 16px keeps iOS from zooming when it gains focus. */
+  #kbd {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    border: 0;
+    opacity: 0;
+    font-size: 16px;
+    resize: none;
+    overflow: hidden;
+    white-space: pre;
+    color: transparent;
+    background: transparent;
+    caret-color: transparent;
+  }
+
+  #edge {
+    position: fixed;
+    z-index: 19;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: calc(var(--sat) + 14px);
+    touch-action: none;
+  }
+  #edge::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    bottom: 4px;
+    width: 40px;
+    height: 4px;
+    margin-left: -20px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.35);
+  }
+
+  #toolbar {
+    position: fixed;
+    z-index: 20;
+    top: calc(var(--sat) + 6px);
+    left: calc(var(--sal) + 6px);
+    right: calc(var(--sar) + 6px);
+    width: fit-content;
+    max-width: calc(100% - 12px - var(--sal) - var(--sar));
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 3px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--panel);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    overflow-x: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+  }
+  #toolbar::-webkit-scrollbar { display: none; }
+  #toolbar.away {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(calc(-100% - 12px - var(--sat)));
+  }
+  #toolbar button {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  #toolbar svg {
+    width: 20px;
+    height: 20px;
+    flex: none;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  #toolbar button[aria-pressed="true"], #toolbar button[aria-expanded="true"] {
+    background: var(--accent);
+    color: #fff;
+  }
+  #btn-scale { font-variant-numeric: tabular-nums; min-width: calc(var(--tap) + 6px); }
+  @media (max-width: 719px) {
+    #toolbar .label { display: none; }
+  }
+  #dot {
+    flex: none;
+    width: 10px;
+    height: 10px;
+    margin: 0 8px 0 6px;
+    border-radius: 50%;
+    background: var(--wait);
+  }
+  #dot.ok { background: var(--ok); }
+  #dot.bad { background: var(--bad); }
+  #dot.wait { animation: pulse 1s ease-in-out infinite alternate; }
+  .sep { flex: none; width: 1px; height: 20px; margin: 0 2px; background: var(--line); }
+  /* Phones: every button stays on screen, at the cost of spacing and, if need be, a few pixels of
+     button width; only very narrow screens fall back to scrolling the bar. */
+  @media (max-width: 479px) {
+    #toolbar .sep { display: none; }
+    #dot { margin: 0 4px; }
+    #toolbar button { flex: 0 1 auto; width: var(--tap); min-width: min(36px, var(--tap)); padding: 0; }
+  }
+
+  .panel {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--panel);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+  }
+
+  /* Full-size keys that wrap (modifiers above arrows) instead of scrolling: the strip cannot pan
+     because its keys act on touch down. */
+  #keys {
+    position: fixed;
+    z-index: 21;
+    left: calc(var(--sal) + 6px);
+    right: calc(var(--sar) + 6px);
+    bottom: calc(var(--bottom) + 8px);
+    width: fit-content;
+    margin: 0 auto;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 4px;
+    padding: 4px;
+    touch-action: none;
+  }
+  .keyrow { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; }
+  #keys button {
+    flex: none;
+    min-width: 44px;
+    height: 44px;
+    background: rgba(255, 255, 255, 0.08);
+    font-weight: 600;
+  }
+  #keys button[data-state="1"] { box-shadow: inset 0 0 0 2px var(--accent); color: #cfe0ff; }
+  #keys button[data-state="2"] { background: var(--accent); color: #fff; }
+
+  #menu {
+    position: fixed;
+    z-index: 22;
+    top: calc(var(--sat) + var(--tap) + 20px);
+    right: calc(var(--sar) + 8px);
+    width: min(320px, calc(100% - 16px - var(--sal) - var(--sar)));
+    padding: 12px;
+    display: grid;
+    gap: 12px;
+  }
+  #menu h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .seg { display: flex; gap: 4px; padding: 3px; border-radius: 10px; background: rgba(255, 255, 255, 0.06); }
+  .seg button { flex: 1; }
+  .seg button[aria-checked="true"] { background: var(--accent); color: #fff; }
+  .check { display: flex; align-items: center; gap: 10px; min-height: var(--tap); cursor: pointer; }
+  .check input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
+  #menu-info { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+  #typer {
+    position: fixed;
+    z-index: 30;
+    inset: 0;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: calc(var(--sat) + 64px) calc(var(--sar) + 12px) 12px calc(var(--sal) + 12px);
+    background: rgba(0, 0, 0, 0.5);
+  }
+  #typer-form { width: min(520px, 100%); padding: 14px; display: grid; gap: 10px; }
+  #typer-form label { font-weight: 600; }
+  #typer-text {
+    width: 100%;
+    min-height: 120px;
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.35);
+    font-size: 16px;
+    resize: vertical;
+  }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .primary { background: var(--accent); color: #fff; font-weight: 600; padding: 0 18px; min-height: 44px; }
+  .secondary { background: rgba(255, 255, 255, 0.1); padding: 0 16px; min-height: 44px; }
+  @media (hover: hover) {
+    .primary:not(:disabled):hover { background: #6a9dff; }
+  }
+
+  #stats {
+    position: fixed;
+    z-index: 15;
+    left: calc(var(--sal) + 8px);
+    bottom: calc(var(--bottom) + var(--strip) + 8px);
+    max-width: calc(100% - 16px - var(--sal) - var(--sar));
+    margin: 0;
+    padding: 8px 10px;
+    overflow: hidden;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.66);
+    color: #d6f5d6;
+    font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre;
+    pointer-events: none;
+  }
+
+  #overlay {
+    position: fixed;
+    z-index: 18;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: calc(var(--sat) + 64px) calc(var(--sar) + 16px) calc(var(--sab) + 16px) calc(var(--sal) + 16px);
+    background: rgba(0, 0, 0, 0.55);
+    touch-action: none;
+  }
+  #overlay.solid { background: var(--bg); }
+  #overlay .card { width: min(420px, 100%); padding: 20px; display: grid; gap: 12px; justify-items: center; text-align: center; }
+  #overlay-msg { margin: 0; font-size: 16px; font-weight: 600; }
+  #overlay-detail { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+  .spinner {
+    display: none;
+    width: 28px;
+    height: 28px;
+    border: 3px solid rgba(255, 255, 255, 0.18);
+    border-top-color: var(--fg);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  #overlay.busy .spinner { display: block; }
+  #token-form { width: 100%; display: flex; gap: 8px; }
+  #token-input {
+    flex: 1;
+    min-width: 0;
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.35);
+    font-size: 16px;
+  }
+
+  #unsupported {
+    position: fixed;
+    z-index: 50;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: calc(var(--sat) + 16px) calc(var(--sar) + 16px) calc(var(--sab) + 16px) calc(var(--sal) + 16px);
+    background: var(--bg);
+  }
+  #unsupported .card { width: min(480px, 100%); padding: 20px; }
+  #unsupported h1 { margin: 0 0 8px; font-size: 18px; }
+  #unsupported-msg { margin: 0; color: var(--muted); }
+
+  #toast {
+    position: fixed;
+    z-index: 40;
+    left: 50%;
+    bottom: calc(var(--bottom) + var(--strip) + 24px);
+    max-width: calc(100% - 32px - var(--sal) - var(--sar));
+    padding: 10px 14px;
+    transform: translateX(-50%);
+    pointer-events: none;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { from { opacity: 1; } to { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) {
+    #toolbar { transition: none; }
+    #dot.wait, .spinner { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div id="viewport">
+  <div id="stage">
+    <canvas id="screen" width="0" height="0" aria-label="Remote desktop"></canvas>
+    <img id="cursor" alt="" draggable="false" hidden>
+  </div>
+</div>
+
+<textarea id="kbd" aria-label="Remote keyboard input" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="enter" tabindex="-1"></textarea>
+
+<div id="edge" hidden></div>
+
+<div id="toolbar" role="toolbar" aria-label="tilt">
+  <span id="dot" class="wait" role="img" aria-label="Connecting" title="Connecting"></span>
+  <button id="btn-control" type="button" aria-label="Control" aria-pressed="false" disabled>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3l14 7.5-6.2 1.7L10 18.5z"/><path d="M13.2 12.6l5 5"/></svg><span class="label">Control</span>
+  </button>
+  <span class="sep"></span>
+  <button id="btn-keyboard" type="button" aria-label="Keyboard" title="Show or hide the on-screen keyboard" hidden disabled>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7.5 14h9"/></svg><span class="label">Keyboard</span>
+  </button>
+  <button id="btn-keys" type="button" aria-label="Keys" title="Extra keys: Esc, Tab, Ctrl, Alt, Super, arrows" aria-pressed="false" disabled>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="7" width="8.5" height="10" rx="1.5"/><rect x="13" y="7" width="8.5" height="10" rx="1.5"/></svg><span class="label">Keys</span>
+  </button>
+  <button id="btn-type" type="button" aria-label="Type text" title="Type text into the remote desktop" disabled>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V5h16v2M12 5v14M9 19h6"/></svg><span class="label">Type</span>
+  </button>
+  <span class="sep"></span>
+  <button id="btn-scale" type="button" aria-label="Scale" title="Scaled to fit; switch to 1:1 pixels">Fit</button>
+  <button id="btn-fullscreen" type="button" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg><span class="label">Fullscreen</span>
+  </button>
+  <button id="btn-stats" type="button" aria-label="Stats" aria-pressed="false" title="Show stream statistics">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20v-6M12 20V5M19 20v-10"/></svg><span class="label">Stats</span>
+  </button>
+  <button id="btn-menu" type="button" aria-label="Settings" aria-haspopup="true" aria-expanded="false" aria-controls="menu" title="Settings">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01M12 12h.01M19 12h.01"/></svg>
+  </button>
+</div>
+
+<div id="keys" class="panel" role="group" aria-label="Extra keys" hidden>
+  <div class="keyrow">
+    <button type="button" data-ks="ff1b" disabled>Esc</button>
+    <button type="button" data-ks="ff09" disabled>Tab</button>
+    <button type="button" data-mod="ctrl" data-state="0" aria-pressed="false" disabled>Ctrl</button>
+    <button type="button" data-mod="alt" data-state="0" aria-pressed="false" disabled>Alt</button>
+    <button type="button" data-mod="super" data-state="0" aria-pressed="false" disabled>Super</button>
+  </div>
+  <div class="keyrow">
+    <button type="button" data-ks="ff51" aria-label="Left arrow" disabled>&larr;</button>
+    <button type="button" data-ks="ff52" aria-label="Up arrow" disabled>&uarr;</button>
+    <button type="button" data-ks="ff54" aria-label="Down arrow" disabled>&darr;</button>
+    <button type="button" data-ks="ff53" aria-label="Right arrow" disabled>&rarr;</button>
+  </div>
+</div>
+
+<div id="menu" class="panel" role="dialog" aria-label="Settings" hidden>
+  <div id="touch-row">
+    <h2>Touch input</h2>
+    <div class="seg" role="radiogroup" aria-label="Touch input">
+      <button type="button" role="radio" data-touch="trackpad" aria-checked="false">Trackpad</button>
+      <button type="button" role="radio" data-touch="direct" aria-checked="false">Direct</button>
+    </div>
+  </div>
+  <label id="cmd-row" class="check"><input id="opt-cmd" type="checkbox"> Cmd+C/V/X/A/Z/F act as Ctrl</label>
+  <label id="alt-row" class="check"><input id="opt-alt" type="checkbox"> Option acts as Alt (no special characters)</label>
+  <p id="menu-info"></p>
+</div>
+
+<div id="typer" hidden>
+  <form id="typer-form" class="panel" role="dialog" aria-labelledby="typer-title">
+    <label id="typer-title" for="typer-text">Type text into the remote desktop</label>
+    <textarea id="typer-text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+    <div class="actions">
+      <button id="typer-cancel" type="button" class="secondary">Cancel</button>
+      <button id="typer-send" type="submit" class="primary" disabled>Send</button>
+    </div>
+  </form>
+</div>
+
+<pre id="stats" aria-live="off" hidden></pre>
+
+<div id="overlay" class="busy solid">
+  <div class="card panel">
+    <div class="spinner" aria-hidden="true"></div>
+    <p id="overlay-msg" role="status">Connecting…</p>
+    <p id="overlay-detail" hidden></p>
+    <form id="token-form" hidden>
+      <input id="token-input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Access token" aria-label="Access token">
+      <button type="submit" class="primary">Connect</button>
+    </form>
+    <button id="overlay-retry" type="button" class="secondary" hidden>Retry</button>
+  </div>
+</div>
+
+<div id="unsupported" hidden>
+  <div class="card panel">
+    <h1>Unsupported browser</h1>
+    <p id="unsupported-msg"></p>
+  </div>
+</div>
+
+<div id="toast" class="panel" role="status" aria-live="polite" hidden></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
