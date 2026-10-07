@@ -7,7 +7,9 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 5_000 },
   fullyParallel: true,
-  workers: 4,
+  // Some checks are timed (decode latency, tap windows): on a CI runner's few slow cores, four
+  // browsers at once starve each other.
+  workers: process.env.CI ? 2 : 4,
   reporter: [['list']],
   use: {
     trace: 'retain-on-failure',
