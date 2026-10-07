@@ -228,6 +228,8 @@ const video = {
   needKey: true,
   frag: null,
   pending: new Map(), // seq -> receive time, in seq order, until acked
+  frame: null, // a decoded frame waiting for the next refresh
+  raf: 0, // the next refresh is booked: frames until then wait for it
   lastIdrAt: -Infinity,
   idrTimer: 0,
   sizeNotice: false, // the server cannot encode the screen at its size (until its next KEY frame)
@@ -770,9 +772,28 @@ function onDecoded(decoder, frame) {
   // The session works: the next drop starts the reconnect backoff afresh.
   conn.attempt = 0;
   ackThrough(Math.round(frame.timestamp / 1000));
-  // Drawn at once rather than at the next animation frame: the low-latency canvas shows it at
-  // the next refresh either way, and this one is half a refresh sooner on average.
+  // The first frame after a quiet refresh is drawn at once, half a refresh sooner on average
+  // than at the next animation frame (the low-latency canvas shows it at the next refresh
+  // either way); frames that follow before that refresh wait for it, newest first. So the
+  // canvas is drawn at most once per refresh: drawing each frame as it came made a busy main
+  // thread on a loaded machine fall behind the decoder.
+  if (video.raf) {
+    if (video.frame) video.frame.close();
+    video.frame = frame;
+    return;
+  }
   draw(frame);
+  video.raf = requestAnimationFrame(nextRefresh);
+}
+
+/** Draws the frame that waited for this refresh, if any, and books the next one for it. */
+function nextRefresh() {
+  video.raf = 0;
+  const frame = video.frame;
+  if (!frame) return;
+  video.frame = null;
+  draw(frame);
+  video.raf = requestAnimationFrame(nextRefresh);
 }
 
 /**
