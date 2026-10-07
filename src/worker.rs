@@ -136,7 +136,7 @@ const TAIL_SETTLE: Duration = Duration::from_millis(100);
 const FLOW_TICK: Duration = Duration::from_millis(100);
 const STATS_EVERY: Duration = Duration::from_secs(1);
 /// Longest sleep with nothing scheduled.
-const IDLE_WAIT: Duration = Duration::from_millis(250);
+const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// After the encoder fails (a frame, or creating one), the next attempt waits a frame interval,
 /// doubling with every further failure in a row up to this.
 const ENCODER_RETRY_MAX: Duration = Duration::from_secs(2);
@@ -275,9 +275,7 @@ impl Schedule {
         self.last_encode = Some(now);
     }
 
-    /// The encoder has nothing left to refine: a re-encode of the still screen came out as the
-    /// same all-skip frame as the one before, at the lowest quantizer, which every further
-    /// re-encode would repeat. Ends the tail.
+    /// The encoder has nothing left to refine (see Worker::encode). Ends the tail.
     fn converged(&mut self) {
         self.tail_left = 0;
     }
@@ -440,9 +438,11 @@ impl Worker {
     fn run(&mut self) {
         loop {
             let now = Instant::now();
-            let mut deadline = (now + IDLE_WAIT)
-                .min(self.next_flow_tick)
-                .min(self.next_stats);
+            let mut deadline = (now + IDLE_WAIT).min(self.next_stats);
+            // A quiet link (a still screen) needs no bitrate control until frames flow again.
+            if !self.flow.quiet() {
+                deadline = deadline.min(self.next_flow_tick);
+            }
             if let Some(t) = self.next_tick {
                 deadline = deadline.min(t);
             }
@@ -488,7 +488,7 @@ impl Worker {
             );
             self.flow.reset(now);
         }
-        if now >= self.next_flow_tick {
+        if now >= self.next_flow_tick && !self.flow.quiet() {
             self.next_flow_tick = now + FLOW_TICK;
             self.retarget(now);
         }
@@ -619,8 +619,11 @@ impl Worker {
                 self.flow.on_sent(self.seq, f.data.len(), sent);
                 let tail = frame.seq == self.sched.last_capture_seq;
                 self.sched.encoded(frame.seq, f.keyframe, now, sent);
+                // At the lowest quantizer, new content needs no refinement, and a tail is done
+                // once a re-encode comes out as the one before: what further re-encodes would
+                // add is invisible (encoder::tests::the_tail_stops_only_where_it_adds_nothing).
                 let au = (f.data.len(), f.qp);
-                if tail && f.qp <= self.cfg.qp_min && self.last_au == Some(au) {
+                if f.qp <= self.cfg.qp_min && (!tail || self.last_au == Some(au)) {
                     self.sched.converged();
                 }
                 self.last_au = Some(au);
@@ -1294,11 +1297,11 @@ mod tests {
         let (mut w, mut rx, pool) = worker(&["--tail-frames", "30"]);
         publish(&w, &pool, 1, SIZE);
         let frames = run_acking(&mut w, &mut rx, Duration::from_secs(3));
-        // A keyframe, then re-encodes of the still screen until two come out alike at the
-        // lowest quantizer: a handful, not the 30 allowed.
+        // A keyframe, then re-encodes of the still screen only until the quantizer is at its
+        // lowest: a handful at most, not the 30 allowed.
         assert!(frames[0].flags & FLAG_KEY != 0);
         assert!(
-            (2..10).contains(&frames.len()),
+            (1..10).contains(&frames.len()),
             "{} frames: {frames:?}",
             frames.len()
         );
@@ -1307,7 +1310,7 @@ mod tests {
         // New content brings a new tail, which converges again.
         publish(&w, &pool, 2, SIZE);
         let more = run_acking(&mut w, &mut rx, Duration::from_secs(3));
-        assert!((2..10).contains(&more.len()), "{more:?}");
+        assert!((1..10).contains(&more.len()), "{more:?}");
         assert!(more.iter().all(|h| h.flags & FLAG_KEY == 0));
     }
 

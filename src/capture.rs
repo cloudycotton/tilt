@@ -37,6 +37,9 @@ pub struct CaptureHandle {
 const MERGE_GAP: u32 = 32;
 /// More bands than this are grabbed as one, from the first damaged row to the last.
 const MAX_BANDS: usize = 4;
+/// While safety polls keep finding nothing, each waits twice as long as the last, up to this
+/// many times `--poll-ms`; damage starts over at `--poll-ms`.
+const POLL_BACKOFF_MAX: u32 = 8;
 /// Consecutive failed grabs before the Grabber is rebuilt (brief 5.2).
 const REBUILD_AFTER: u32 = 5;
 /// The first wait before rebuilding a failing grabber; it doubles on every rebuild up to
@@ -102,6 +105,7 @@ pub fn spawn_capture(
     let capture = Capture {
         fi: cfg.frame_interval(),
         poll: cfg.poll_interval(),
+        poll_gap: cfg.poll_interval().unwrap_or_default(),
         cfg,
         conn,
         hub,
@@ -115,6 +119,7 @@ pub fn spawn_capture(
         damage_pending: true,
         resize_pending: false,
         full_next: true,
+        idle: false,
         last_grab: None,
         last_grab_us: 0,
         next_slot: None,
@@ -173,6 +178,8 @@ struct Capture {
     cfg: Arc<Config>,
     fi: Duration,
     poll: Option<Duration>,
+    /// The wait before the next safety poll: `poll`, backed off while polls find nothing.
+    poll_gap: Duration,
     conn: Arc<RustConnection>,
     hub: Arc<FrameHub>,
     input: InputHandle,
@@ -187,6 +194,8 @@ struct Capture {
     resize_pending: bool,
     /// The next grab must be a full one: a failed grab took damage it never delivered.
     full_next: bool,
+    /// No session is subscribed, and the memory for frames has been given back.
+    idle: bool,
     /// When the last grab attempt started, in both clocks.
     last_grab: Option<Instant>,
     last_grab_us: u64,
@@ -209,13 +218,18 @@ impl Capture {
             if self.resize_pending {
                 self.resize();
             }
+            let unwatched = self.hub.unwatched();
+            if unwatched && !self.idle {
+                self.go_idle();
+            }
+            self.idle = unwatched;
             let now = Instant::now();
             let mut due = None;
             if self.hub.demand() {
                 let since_last = |gap| self.last_grab.map_or(now, |t| t + gap);
                 let next = match (self.damage_pending, self.poll) {
                     (true, _) => Some((GrabKind::Damage, self.paced_grab_at(now))),
-                    (false, Some(poll)) => Some((GrabKind::Poll, since_last(poll))),
+                    (false, Some(_)) => Some((GrabKind::Poll, since_last(self.poll_gap))),
                     (false, None) => None,
                 };
                 if let Some((kind, at)) = next {
@@ -262,18 +276,28 @@ impl Capture {
                 // leaves.
                 self.hub.screen_changed();
             }
-            if self.hub.unwatched() {
-                // Viewers come back to a fresh allocation; an idle server keeps no spare frames.
-                self.pool.trim();
-            }
         }
         self.ring_doorbell();
         debug!("capture stopped");
     }
 
+    /// The last viewer left: hold no frame, no spare buffers and no grab memory until the next
+    /// one comes, which gets a full grab at once.
+    fn go_idle(&mut self) {
+        self.hub.invalidate();
+        self.pool.trim();
+        self.grabber.release_pages();
+        self.damage_pending = true;
+        self.full_next = true;
+        crate::release_memory();
+    }
+
     fn on_event(&mut self, kind: XEventKind) {
         match kind {
-            XEventKind::Damage => self.damage_pending = true,
+            XEventKind::Damage => {
+                self.damage_pending = true;
+                self.poll_gap = self.poll.unwrap_or_default();
+            }
             XEventKind::ScreenChange => self.resize_pending = true,
             XEventKind::Other => {}
         }
@@ -387,9 +411,13 @@ impl Capture {
         if kind == GrabKind::Poll {
             let unchanged = self.hub.latest().is_some_and(|f| *f.image == *image);
             if unchanged {
+                if let Some(poll) = self.poll {
+                    self.poll_gap = (self.poll_gap * 2).min(poll * POLL_BACKOFF_MAX);
+                }
                 return;
             }
             debug!("safety poll found a change that damage did not report");
+            self.poll_gap = self.poll.unwrap_or_default();
         }
         self.seq += 1;
         let converted_us = clock::now_us();
@@ -760,7 +788,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs Xvfb; run in tilt-dev with --ignored"]
-    fn the_next_viewer_starts_from_a_fresh_grab_once_the_screen_changed() {
+    fn the_next_viewer_starts_from_a_fresh_grab() {
         let x = Xvfb::start("640x480x24", &[]);
         let args = ["tilt", "--no-auth", "--display", x.display.as_str()];
         let cfg = Arc::new(Config::try_load_from(args).unwrap());
@@ -801,10 +829,26 @@ mod tests {
         let fresh = next_frame(&hub, &rx, 2);
         assert!(fresh > first);
 
-        // With nothing drawn since, `latest` is still the screen and the next viewer gets it.
+        // With nobody watching nothing is held, even when nothing was drawn; the next viewer
+        // gets a fresh grab at once, without waiting for a safety poll.
         hub.unsubscribe(2);
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(hub.latest().map(|f| f.seq), Some(fresh));
+        assert!(
+            eventually(WAIT, || hub.latest().is_none()),
+            "a frame outlived the last session"
+        );
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        hub.subscribe(3, tx);
+        let asked = Instant::now();
+        assert!(next_frame(&hub, &rx, 3) > fresh);
+        assert!(
+            asked.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            asked.elapsed()
+        );
+        // The grab memory given back while idle is filled anew: the frame is the screen.
+        let (conn, screen) = crate::x11::conn::connect(&x.display).unwrap();
+        let want = full_frame(&mut Grabber::new(&conn, screen).unwrap(), &conn);
+        assert!(*hub.latest().unwrap().image == want);
 
         shutdown.store(true, Ordering::Relaxed);
         hub.wake_capture();

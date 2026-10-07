@@ -2,6 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<script>
+  // Behind a gateway that serves tilt under a path (https://host/desk/), the page must be opened
+  // as a directory: from https://host/desk, app.js and the stream would resolve to the host root.
+  // (Not a page loaded as a file, such as an app's WebView opening its own index.html.)
+  if (/^https?:$/.test(location.protocol) && !/(\/|\.html?)$/.test(location.pathname)) {
+    location.replace(location.pathname + '/' + location.search + location.hash);
+  }
+</script>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0b0c0e">

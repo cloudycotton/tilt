@@ -177,6 +177,8 @@ impl Grabber {
                 }
             }
             Buffer::Image(data) => {
+                // Empty after release_pages.
+                data.resize(stride * self.height as usize, 0);
                 for &(top, bottom) in bands {
                     let len = (bottom - top) as usize * stride;
                     let reply = conn
@@ -226,6 +228,15 @@ impl Grabber {
     /// The grab path in use, for logs.
     pub fn method(&self) -> &'static str {
         self.method.name()
+    }
+
+    /// Gives the memory the grabs land in back to the system while nobody watches; the next
+    /// grab must be a full one.
+    pub fn release_pages(&mut self) {
+        match &mut self.buf {
+            Buffer::Shm(segment) => segment.release_pages(),
+            Buffer::Image(data) => *data = Vec::new(),
+        }
     }
 
     /// Re-reads the root geometry; when it changed, re-creates the buffers and returns true.
@@ -394,6 +405,8 @@ mod shm {
         len: usize,
         /// Mapped with shmat rather than mmap.
         sysv: bool,
+        /// The memfd behind the segment, to give its pages back while nobody watches.
+        fd: Option<OwnedFd>,
     }
 
     // SAFETY: the mapping belongs to this value alone and is not tied to the creating thread.
@@ -454,6 +467,7 @@ mod shm {
                 ptr: map(&fd, len)?,
                 len,
                 sysv: false,
+                fd: Some(fd.try_clone().context("dup of the memfd")?),
             };
             // x11rb sends the fd and then closes it; both mappings outlive it.
             conn.shm_attach_fd(id, fd, false)?
@@ -476,6 +490,7 @@ mod shm {
                     ptr,
                     len,
                     sysv: false,
+                    fd: Some(reply.shm_fd),
                 }),
                 Err(e) => {
                     detach(conn, id);
@@ -515,6 +530,7 @@ mod shm {
                 ptr: addr.cast(),
                 len,
                 sysv: true,
+                fd: None,
             };
             // Non-negative: shmget succeeded.
             conn.shm_attach(id, shmid as u32, false)?
@@ -541,6 +557,24 @@ mod shm {
         /// Also drops the server's attachment; dropping alone unmaps only our side.
         pub(super) fn release(self, conn: &RustConnection) {
             detach(conn, self.id);
+        }
+
+        /// Frees the memory behind a memfd segment (on both sides) until the next grab writes
+        /// it again; the mappings stay valid. Does nothing for SysV segments.
+        pub(super) fn release_pages(&self) {
+            if let Some(fd) = &self.fd {
+                let len = libc::off_t::try_from(self.len).unwrap_or(libc::off_t::MAX);
+                // SAFETY: punches a hole in a memfd we hold; the size stays, so both mappings
+                // stay valid and read zeros until the server writes again.
+                unsafe {
+                    libc::fallocate(
+                        fd.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        0,
+                        len,
+                    )
+                };
+            }
         }
     }
 
@@ -569,7 +603,8 @@ mod shm {
         Ok(())
     }
 
-    /// Maps `len` bytes of `fd` read-only; MAP_POPULATE spares the first grabs the page faults.
+    /// Maps `len` bytes of `fd` read-only. Pages are faulted in as grabs fill them: an idle
+    /// server keeps none.
     fn map(fd: &OwnedFd, len: usize) -> anyhow::Result<*const u8> {
         // SAFETY: a new shared mapping of an fd we hold, checked against MAP_FAILED.
         let ptr = unsafe {
@@ -577,7 +612,7 @@ mod shm {
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
+                libc::MAP_SHARED,
                 fd.as_raw_fd(),
                 0,
             )
@@ -631,6 +666,10 @@ mod shm {
 
         pub(super) fn release(self, _conn: &RustConnection) {
             match self {}
+        }
+
+        pub(super) fn release_pages(&self) {
+            match *self {}
         }
     }
 }

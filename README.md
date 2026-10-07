@@ -74,12 +74,12 @@ viewers held, and exits.
 | `--qp-min <N>` | `TILT_QP_MIN` | 20 | lowest quantizer (best quality), 12 to 51; at least 20 with `--profile high` |
 | `--qp-max <N>` | `TILT_QP_MAX` | 28 | highest quantizer, up to 51; not below `--qp-min`. Higher values keep a busy screen within the bitrate, but text that moved stays blurred after it stops (see [Deployment](#deployment)) |
 | `--profile <high\|baseline>` | `TILT_PROFILE` | `high` | `high` = CABAC; `baseline` = CAVLC Constrained Baseline |
-| `--tail-frames <N>` | `TILT_TAIL_FRAMES` | 30 | most refinement frames after the screen goes still; the tail ends sooner once a re-encode at `--qp-min` comes out unchanged, as nothing is left to refine |
+| `--tail-frames <N>` | `TILT_TAIL_FRAMES` | 30 | most refinement frames after the screen goes still; none follow a frame coded at `--qp-min`, and the tail ends once a re-encode at `--qp-min` comes out unchanged, as nothing is left to refine |
 | `--rc-frame-skip` | `TILT_RC_FRAME_SKIP` | off | let OpenH264 rate control skip frames |
 | `--max-viewers <N>` | `TILT_MAX_VIEWERS` | 4 | simultaneous viewers; each costs one encoder |
 | `--max-msg-bytes <N>` | `TILT_MAX_MSG_BYTES` | 65536 | larger video frames are split into fragments; small ones keep a slow link's client hearing from the server while a keyframe arrives |
 | `--notsent-lowat <BYTES>` | `TILT_NOTSENT_LOWAT` | 32768 | TCP_NOTSENT_LOWAT, 0 = off (Linux only) |
-| `--poll-ms <N>` | `TILT_POLL_MS` | 1000 | safety full-frame compare while viewers wait, 0 = off |
+| `--poll-ms <N>` | `TILT_POLL_MS` | 1000 | safety full-frame compare while viewers wait, backing off to 8× while it finds nothing; 0 = off |
 
 At least one of `--token`, `--token-file` or `--no-auth` is required. Usage errors, such as a
 missing token or an inconsistent quantizer or bitrate range, exit with code 2 at startup.
@@ -94,10 +94,12 @@ viewer's picture; with it on, grabs took 3.6 ms (median) and 7.5 ms (p95). Also 
 compositing while one window covers the whole screen, and in our tests it did not start again
 when that window shrank.
 
-**CPU.** A still screen costs nothing, and an idle viewer under 1% of a core. Typing costs little:
-with two key presses a second on a 1080p screen, tilt took 6% of a core (x86-64, one viewer),
-since each change is grabbed only where it happened and the refinement tail stops as soon as
-the encoder has nothing left to sharpen. Each viewer has
+**CPU and memory.** With nobody watching tilt sleeps (about 0.03% of a core, 14 MB resident at
+1080p: frames, buffers and freed memory are given back when the last viewer leaves), and a
+viewer of a still screen costs about 0.1%: pointer moves, X damage and input are events, not
+polls. Typing costs little: two key presses a second on a 1080p screen took 3% of a core
+(x86-64, one viewer), since each change is grabbed only where it happened and a frame coded at
+`--qp-min` gets no refinement tail, which could not sharpen it. Each viewer has
 its own encoder, so a busy screen costs CPU per viewer. With a terminal scrolling over most of
 the screen (Apple M4, Docker, arm64; 100% = one core):
 
@@ -150,6 +152,53 @@ bitrate, where a smoother picture matters more than sharp text.
   screen. Busy content can exceed `--max-bitrate-kbps`: a terminal scrolling over most of a
   1920×1080 screen took 25–31 Mbit/s at the default `--qp-max 28`. A keyframe is sent once,
   however long it takes: a 1600×900 web page's was 142 KB, 7.6 s at 150 kbit/s.
+
+## A remote Linux VM behind a proxied URL
+
+Run tilt on the VM bound to loopback, so only the proxy reaches it, and route a path or a host of
+your HTTPS gateway to it. Any path prefix works: the page loads its scripts and opens `stream`
+relative to its own URL, and adds the trailing slash itself if the link lacks it
+(`https://gw.example.com/vm1` becomes `/vm1/`).
+
+```sh
+tilt --display :0 --bind 127.0.0.1:6090 --token-file /run/tilt/token
+```
+
+nginx (WebSocket upgrades are passed through unbuffered; the long read timeout keeps idle
+sessions open, though the client pings every second anyway):
+
+```nginx
+location /vm1/ {
+    proxy_pass http://127.0.0.1:6090/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 1h;
+}
+```
+
+Caddy: `handle_path /vm1/* { reverse_proxy 127.0.0.1:6090 }`.
+
+Open `https://gw.example.com/vm1/#token=<token>`. The gateway must speak HTTP/1.1 to tilt
+(WebSocket over HTTP/2 is not supported) and must not compress or buffer the stream.
+
+**Latency.** tilt adds about 10 ms from a change on the screen to its frame leaving the server
+(grab 0.6 ms, conversion 0.8 ms, encoding 6–10 ms at 1080p), and the page draws each frame as
+soon as it is decoded; the rest is the network's round trip. Through
+[e2e/proxy.mjs](e2e/proxy.mjs), a gateway under a path prefix that adds a fixed delay, the key
+press to drawn latency on a 1080p screen (e2e/tests) was:
+
+| round trip added | Chrome p50 / p95 | WebKit p50 / p95 |
+|---|---|---|
+| 0 ms | 22 / 27 ms | 38 / 47 ms |
+| 50 ms | 70 / 80 ms | 85 / 98 ms |
+
+and an animated screen kept 60 fps at 100 ms (frame gaps p50 16.7 ms, p95 21 ms): flow control
+keeps about one and a half bandwidth-delay products in flight, so the frame rate does not
+drop as the round trip grows. To measure your own gateway:
+`node e2e/proxy.mjs --upstream 127.0.0.1:6090 --prefix /desk/ --delay-ms 25` and
+`TILT_URL=http://localhost:6190/desk/ npx playwright test` in `e2e/`.
 
 ## E2B: attach to a running desktop sandbox
 

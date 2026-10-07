@@ -39,6 +39,18 @@ use crate::session::Sessions;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+extern "C" {
+    // libmimalloc, linked in by the mimalloc crate.
+    fn mi_collect(force: bool);
+}
+
+/// Hands memory that tilt freed back to the system (mimalloc otherwise keeps it for reuse):
+/// called when the server goes idle, so that it holds next to nothing between viewers.
+pub fn release_memory() {
+    // SAFETY: mi_collect only frees memory mimalloc no longer hands out; it is thread-safe.
+    unsafe { mi_collect(true) };
+}
+
 /// How long shutdown waits for each permanent thread.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -87,6 +99,8 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
         );
     }
     assets::init();
+    // Compressing the assets used some memory that is free again now.
+    release_memory();
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Input first: capture needs its handle for the pull-forward after injected input.
@@ -252,7 +266,7 @@ async fn wait_for_stop(
         Ok(s) => s,
         Err(e) => return Stop::Fatal(format!("cannot handle signals: {e}")),
     };
-    let mut check = tokio::time::interval(Duration::from_millis(250));
+    let mut check = tokio::time::interval(Duration::from_secs(1));
     loop {
         #[cfg(unix)]
         tokio::select! {

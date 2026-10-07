@@ -9,6 +9,8 @@ const TEXT = 0x31;
 const RELEASE_ALL = 0x32;
 
 const DRAG_INTERVAL_MS = 1000 / 240;
+// Hover moves go out at once, at most this often: 125 Hz, above most screens' refresh.
+const MOVE_INTERVAL_MS = 8;
 const WHEEL_LINE_PX = 40;
 const WHEEL_NOTCH_PX = 50;
 const TAP_MS = 250;
@@ -131,13 +133,15 @@ export function createInput(env) {
 
   let sentPos = null;
   let pendingPos = null;
-  let moveRaf = 0;
+  let moveTimer = 0;
+  let lastMoveAt = -Infinity;
   let lastDragAt = -Infinity;
   const held = new Set();
 
   function moveTo(p) {
     if (!p || (sentPos && sentPos[0] === p[0] && sentPos[1] === p[1])) return;
     sentPos = p;
+    lastMoveAt = performance.now();
     const [b, d] = message(MOVE, 5);
     d.setUint16(1, p[0], true);
     d.setUint16(3, p[1], true);
@@ -145,19 +149,24 @@ export function createInput(env) {
   }
 
   function flushMove() {
-    if (moveRaf) cancelAnimationFrame(moveRaf);
-    moveRaf = 0;
+    clearTimeout(moveTimer);
+    moveTimer = 0;
     const p = pendingPos;
     pendingPos = null;
     moveTo(p);
   }
 
+  /** Sends `p` now, or as soon as MOVE_INTERVAL_MS has passed since the last move. */
   function queueMove(p) {
     pendingPos = p;
-    if (!moveRaf) moveRaf = requestAnimationFrame(() => { moveRaf = 0; flushMove(); });
+    if (moveTimer) return;
+    const wait = lastMoveAt + MOVE_INTERVAL_MS - performance.now();
+    if (wait <= 0) flushMove();
+    else moveTimer = setTimeout(flushMove, wait);
   }
 
-  // Drags send every coalesced sample, at most one per DRAG_INTERVAL_MS; the rest wait for rAF.
+  // Drags send every coalesced sample, at most one per DRAG_INTERVAL_MS; the last of the rest
+  // follows within MOVE_INTERVAL_MS.
   function dragTo(e) {
     const samples = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
     for (const s of samples.length ? samples : [e]) {
@@ -936,8 +945,8 @@ export function createInput(env) {
   // ---- state
 
   function forget() {
-    if (moveRaf) cancelAnimationFrame(moveRaf);
-    moveRaf = 0;
+    clearTimeout(moveTimer);
+    moveTimer = 0;
     pendingPos = null;
     if (fakeCtrl) clearTimeout(fakeCtrl.timer);
     fakeCtrl = null;

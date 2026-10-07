@@ -305,6 +305,16 @@ impl FlowControl {
         }
     }
 
+    /// Nothing in flight, waiting or recently sent: `tick` would change nothing, so the worker
+    /// need not run it.
+    pub fn quiet(&self) -> bool {
+        self.inflight.is_empty()
+            && self.sent.is_empty()
+            && self.blocked.is_empty()
+            && self.blocked_since.is_none()
+            && !self.queue_congested
+    }
+
     /// Runs the bitrate controller; Some(bps) when the target bitrate changed.
     pub fn tick(&mut self, now: Instant) -> Option<u32> {
         self.see(now);

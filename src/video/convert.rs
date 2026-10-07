@@ -7,8 +7,8 @@ use anyhow::{ensure, Context};
 use yuv::{BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix};
 
 /// Idle buffers a pool keeps. Capture fills one frame at a time and encoders let go of theirs
-/// within a frame interval, so more would only hold memory.
-const MAX_IDLE: usize = 4;
+/// within a frame interval, so more would only hold memory (3 MB each at 1080p).
+const MAX_IDLE: usize = 2;
 
 /// Planar 4:2:0 with tight strides: `width` for Y, `width / 2` for U and V. Both dims are even.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,7 +74,7 @@ impl FramePool {
     }
 }
 
-/// An I420Frame that goes back to its pool, which keeps at most 4 idle, when dropped.
+/// An I420Frame that goes back to its pool, which keeps at most MAX_IDLE idle, when dropped.
 pub struct PooledFrame {
     frame: I420Frame,
     pool: FramePool,
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_reuses_buffers_and_keeps_four_idle() {
+    fn pool_reuses_buffers_and_keeps_two_idle() {
         let pool = FramePool::new();
         let first = pool.get(64, 32);
         assert_eq!((first.width, first.height), (64, 32));

@@ -852,50 +852,67 @@ mod tests {
         assert_refines(&quality, 0.5);
     }
 
-    /// The worker ends the refinement tail at the first re-encode of a still screen that comes
-    /// out with the same size and quantizer as the one before, at the lowest quantizer. From
-    /// there on, re-encodes must add no quality (they hover within a thousandth of a dB). At a
-    /// low bitrate the quantizer stays above the floor, and the tail keeps refining.
+    /// When the worker skips or ends the refinement tail, and why that loses nothing visible:
+    /// - new content coded at the lowest quantizer gets no tail: re-encodes of it add well
+    ///   under a tenth of a dB;
+    /// - a tail ends at a re-encode that came out like the one before, at the lowest
+    ///   quantizer: later ones add under a hundredth of a dB (before that, on a slow link, the
+    ///   quantizer can touch the floor and rise again, still sharpening).
+    ///
+    /// Above the floor, on a slow link, the tail is what sharpens the picture.
     #[test]
-    fn a_converged_tail_stays_converged() {
-        let (w, h) = (640, 360);
-        for (bitrate, scene) in [
-            (8_000_000, Scene::Text),
-            (8_000_000, Scene::Drag),
-            (300_000, Scene::Text),
-            (300_000, Scene::Drag),
-        ] {
-            let s = settings(w, h, bitrate, true);
-            let mut enc = H264Encoder::new(&s).unwrap();
-            let mut dec = Decoder::new();
-            let mut desktop = Desktop::new(w as usize, h as usize, 7);
-            let mut screen = vec![0; w as usize * h as usize * 4];
-            for i in 0..20 {
-                desktop.step(scene, i, &mut screen);
-                let out = encode(&mut enc, &to_i420(&screen, w, h), i, false);
-                assert!(out.qp >= s.min_qp && out.qp <= s.max_qp, "qp {}", out.qp);
-                dec.decode(&out.data).unwrap();
-            }
-            let still = to_i420(&screen, w, h);
-            let mut tail = Vec::new();
-            for i in 20..60 {
-                let out = encode(&mut enc, &still, i, false);
-                let (_, _, y) = dec.decode(&out.data).unwrap();
-                tail.push((out.data.len(), out.qp, psnr(&y, &still.y)));
-            }
-            let at = (1..tail.len()).find(|&i| {
-                tail[i].1 <= s.min_qp && (tail[i].0, tail[i].1) == (tail[i - 1].0, tail[i - 1].1)
-            });
-            let what = format!("{bitrate} bps {scene:?}: {tail:?}");
-            if let Some(at) = at {
-                let best_later = tail[at..].iter().map(|t| t.2).fold(f64::MIN, f64::max);
-                assert!(
-                    best_later - tail[at].2 < 0.01,
-                    "converged at {at} but refined later; {what}"
-                );
-            }
-            if bitrate == 8_000_000 {
-                assert!(at.is_some_and(|at| at < 5), "no early convergence; {what}");
+    fn the_tail_stops_only_where_it_adds_nothing() {
+        for (w, h) in [(640, 360), (1280, 720)] {
+            for (bitrate, scene) in [
+                (8_000_000, Scene::Text),
+                (8_000_000, Scene::Scroll),
+                (8_000_000, Scene::Drag),
+                (300_000, Scene::Text),
+                (300_000, Scene::Drag),
+            ] {
+                let s = settings(w, h, bitrate, true);
+                let mut enc = H264Encoder::new(&s).unwrap();
+                let mut dec = Decoder::new();
+                let mut desktop = Desktop::new(w as usize, h as usize, 7);
+                let mut screen = vec![0; w as usize * h as usize * 4];
+                // (size, qp, PSNR) of the last frame with new content, then of re-encodes.
+                let mut frames = Vec::new();
+                for i in 0..60 {
+                    if i < 20 {
+                        desktop.step(scene, i, &mut screen);
+                    }
+                    let f = to_i420(&screen, w, h);
+                    let out = encode(&mut enc, &f, i, false);
+                    assert!(out.qp >= s.min_qp && out.qp <= s.max_qp, "qp {}", out.qp);
+                    let (_, _, y) = dec.decode(&out.data).unwrap();
+                    if i >= 19 {
+                        frames.push((out.data.len(), out.qp, psnr(&y, &f.y)));
+                    }
+                }
+                let what = format!("{w}x{h} {bitrate} bps {scene:?}: {frames:.3?}");
+                let best_from =
+                    |at: usize| frames[at..].iter().map(|f| f.2).fold(f64::MIN, f64::max);
+                let at_floor = |f: &(usize, u8, f64)| f.1 <= s.min_qp;
+                if at_floor(&frames[0]) {
+                    assert!(best_from(0) - frames[0].2 < 0.05, "new content; {what}");
+                }
+                let end = (1..frames.len()).find(|&i| {
+                    at_floor(&frames[i])
+                        && (frames[i].0, frames[i].1) == (frames[i - 1].0, frames[i - 1].1)
+                });
+                if let Some(at) = end {
+                    assert!(best_from(at) - frames[at].2 < 0.01, "tail end {at}; {what}");
+                }
+                if bitrate == 8_000_000 {
+                    let stop = if at_floor(&frames[0]) { Some(0) } else { end };
+                    assert!(stop.is_some_and(|at| at <= 3), "no early stop; {what}");
+                } else {
+                    assert!(!at_floor(&frames[0]), "{what}");
+                    assert!(
+                        best_from(0) - frames[0].2 > 0.2,
+                        "the tail should sharpen; {what}"
+                    );
+                }
             }
         }
     }

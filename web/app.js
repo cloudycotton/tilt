@@ -228,8 +228,6 @@ const video = {
   needKey: true,
   frag: null,
   pending: new Map(), // seq -> receive time, in seq order, until acked
-  frame: null, // newest decoded frame not yet drawn
-  raf: 0,
   lastIdrAt: -Infinity,
   idrTimer: 0,
   sizeNotice: false, // the server cannot encode the screen at its size (until its next KEY frame)
@@ -772,9 +770,9 @@ function onDecoded(decoder, frame) {
   // The session works: the next drop starts the reconnect backoff afresh.
   conn.attempt = 0;
   ackThrough(Math.round(frame.timestamp / 1000));
-  if (video.frame) video.frame.close();
-  video.frame = frame;
-  if (!video.raf) video.raf = requestAnimationFrame(draw);
+  // Drawn at once rather than at the next animation frame: the low-latency canvas shows it at
+  // the next refresh either way, and this one is half a refresh sooner on average.
+  draw(frame);
 }
 
 /**
@@ -836,11 +834,7 @@ function requestIdr() {
   if (sendJson({ t: 'idr' })) video.lastIdrAt = performance.now();
 }
 
-function draw() {
-  video.raf = 0;
-  const frame = video.frame;
-  if (!frame) return;
-  video.frame = null;
+function draw(frame) {
   const w = frame.displayWidth;
   const h = frame.displayHeight;
   if (ui.canvas.width !== w || ui.canvas.height !== h) {

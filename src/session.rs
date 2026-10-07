@@ -348,6 +348,10 @@ pub async fn run(socket: WebSocket, state: Arc<AppState>) {
         }
     }
     state.sessions.unregister(sid);
+    if state.sessions.count() == 0 {
+        // The last encoder is gone: give its memory back while nobody watches.
+        crate::release_memory();
+    }
     info!(session = sid, "disconnected: {why}");
 }
 

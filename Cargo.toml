@@ -17,7 +17,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 bytes = "1"
 socket2 = { version = "0.6", features = ["all"] }
 crossbeam-channel = "0.5"
-x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "xtest", "randr"] }
+x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "xtest", "randr", "xinput"] }
 openh264-sys2 = "0.9.8"
 yuv = "0.8.19"
 clap = { version = "4.5", features = ["derive", "env"] }
