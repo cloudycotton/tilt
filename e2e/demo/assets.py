@@ -51,8 +51,8 @@ Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)).save(out / 'wallpaper.png
 # xfwm4 theme: the frame is the terminal's own colour, so a window reads as one dark card with
 # rounded corners, a quiet title and round buttons on the right. xfwm4's compositor adds the shadow.
 S = 2  # supersampling for smooth edges
-BG = (22, 19, 34, 255)
-BG_INACTIVE = (30, 27, 44, 255)
+BG = (24, 24, 27, 255)
+BG_INACTIVE = (32, 32, 36, 255)
 TITLE_H, R, SIDE, BOTTOM = 38, 12, 1, 12
 theme = out / 'themes' / 'tilt' / 'xfwm4'
 theme.mkdir(parents=True, exist_ok=True)
@@ -97,8 +97,8 @@ BW = 30
 
 
 def button(name, glyph):
-    for state, disc, ink in (('active', (255, 255, 255, 22), (214, 208, 232, 255)),
-                             ('inactive', (255, 255, 255, 12), (140, 134, 160, 255)),
+    for state, disc, ink in (('active', (255, 255, 255, 22), (212, 212, 216, 255)),
+                             ('inactive', (255, 255, 255, 12), (139, 139, 147, 255)),
                              ('prelight', (255, 255, 255, 44), (255, 255, 255, 255)),
                              ('pressed', (255, 255, 255, 70), (255, 255, 255, 255))):
         im = Image.new('RGBA', (BW * S, TITLE_H * S), BG if state != 'inactive' else BG_INACTIVE)
@@ -130,8 +130,8 @@ button('maximize', g_max)
 button('maximize-toggled', g_max)
 
 (theme / 'themerc').write_text('\n'.join([
-    'active_text_color=#e9e5f7',
-    'inactive_text_color=#8c86a0',
+    'active_text_color=#e4e4e7',
+    'inactive_text_color=#8b8b93',
     'button_offset=8',
     'button_spacing=2',
     'full_width_title=true',

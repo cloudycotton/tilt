@@ -55,9 +55,9 @@ pause(450);
 type('uname -sm');
 enter();
 pause(450);
-type('wave');
+type('top -bn1 | head -24');
 enter();
-pause(2300);
+pause(1600);
 
 // 2. Drag the terminal by its title bar.
 glide(300, 88, 600, { bow: -0.1 });

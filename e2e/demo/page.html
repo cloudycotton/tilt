@@ -5,35 +5,15 @@
 <title>Hello from a Linux VM</title>
 <style>
   * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font: 15px/1.5 Inter, "DejaVu Sans", sans-serif;
-    color: #231b3d;
-    background:
-      radial-gradient(60% 40% at 15% 0%, #efe6ff 0%, transparent 70%),
-      radial-gradient(50% 35% at 100% 10%, #ffe9dc 0%, transparent 70%),
-      #fbfaff;
-  }
-  header { padding: 44px 32px 20px; display: grid; justify-items: center; text-align: center; gap: 6px; }
-  header img { width: 64px; height: 64px; filter: drop-shadow(0 8px 16px rgba(69, 39, 160, 0.25)); }
-  #clock { margin: 10px 0 0; font-size: 64px; font-weight: 600; letter-spacing: -2px; line-height: 1; font-variant-numeric: tabular-nums; }
-  header p { margin: 0; color: #6b6488; font-size: 16px; }
-  .pill {
-    display: inline-flex; align-items: center; gap: 8px; margin-top: 10px; padding: 6px 12px;
-    border-radius: 999px; background: #fff; box-shadow: 0 1px 0 rgba(35, 27, 61, 0.06), 0 4px 14px rgba(35, 27, 61, 0.06);
-    font-size: 13px; font-weight: 500; color: #4b4366;
-  }
-  .pill i { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 4px #dcfce7; }
-  main { padding: 12px 24px 48px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .card {
-    padding: 16px; border-radius: 16px; background: #fff;
-    box-shadow: 0 1px 0 rgba(35, 27, 61, 0.05), 0 6px 20px rgba(35, 27, 61, 0.06);
-  }
-  .card b {
-    display: block; font-size: 22px; font-weight: 700; letter-spacing: -0.5px;
-    background: linear-gradient(100deg, #ff8a4c, #ec5fb4 55%, #8b5cf6); -webkit-background-clip: text; color: transparent;
-  }
-  .card span { color: #6b6488; font-size: 13px; }
+  body { margin: 0; font: 15px/1.5 Inter, "DejaVu Sans", sans-serif; color: #18181b; background: #fff; }
+  header { padding: 48px 32px 24px; display: grid; justify-items: center; text-align: center; gap: 8px; }
+  header img { width: 56px; height: 56px; }
+  #clock { margin: 8px 0 0; font-size: 60px; font-weight: 600; letter-spacing: -2px; line-height: 1; font-variant-numeric: tabular-nums; }
+  header p { margin: 0; color: #71717a; }
+  main { padding: 8px 24px 48px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .card { padding: 14px 16px; border: 1px solid #e4e4e7; border-radius: 12px; }
+  .card b { display: block; font-size: 18px; font-weight: 600; }
+  .card span { color: #71717a; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -41,7 +21,6 @@
   <img src="../../web/icon.svg" alt="">
   <h1 id="clock">00:00:00</h1>
   <p>Hello from a Linux VM. Every pixel here is live.</p>
-  <span class="pill"><i></i>Streaming with tilt</span>
 </header>
 <main id="cards"></main>
 <script>

@@ -34,8 +34,8 @@ DISPLAY=$remote XCURSOR_THEME=Adwaita XCURSOR_SIZE=24 setsid dbus-run-session --
   XDG_DATA_HOME='$work/look' xfwm4 & sleep 1
   xsetroot -cursor_name left_ptr
   export LANG=C.UTF-8
-  xterm -geometry 66x20+56+64 -fa 'DejaVu Sans Mono' -fs 11 -b 18 -bg '#161322' -fg '#e9e5f7' \\
-    -cr '#ff8a4c' -xrm 'XTerm*directColor: true' -T Terminal -e bash --rcfile e2e/demo/bashrc &
+  xterm -geometry 66x20+56+64 -fa 'DejaVu Sans Mono' -fs 11 -b 18 -bg '#18181b' -fg '#e4e4e7' \\
+    -cr '#e4e4e7' -T Terminal -e bash --rcfile e2e/demo/bashrc &
   google-chrome --no-sandbox --test-type --user-data-dir='$work/chrome-remote' --no-first-run \\
     --no-default-browser-check --disable-gpu --password-store=basic \\
     --window-position=700,92 --window-size=540,640 'file://$PWD/e2e/demo/page.html' &

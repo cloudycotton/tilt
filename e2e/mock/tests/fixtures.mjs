@@ -169,4 +169,20 @@ export async function tapToolbar(page, button) {
   }).toPass({ timeout: 20_000 });
 }
 
+/** Opens the settings menu and clicks one of its items (Type text, Extra keys, Scale). */
+export async function clickMenu(page, button) {
+  await expect(async () => {
+    if (await page.locator('#menu').isHidden()) await clickToolbar(page, page.getByRole('button', { name: 'Settings' }));
+    await button.click({ timeout: 2000 });
+  }).toPass({ timeout: 20_000 });
+}
+
+/** clickMenu for touch. */
+export async function tapMenu(page, button) {
+  await expect(async () => {
+    if (await page.locator('#menu').isHidden()) await tapToolbar(page, page.getByRole('button', { name: 'Settings' }));
+    await button.tap({ timeout: 2000 });
+  }).toPass({ timeout: 20_000 });
+}
+
 export { startMockServer };

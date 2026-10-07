@@ -1,69 +1,24 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
-    <linearGradient id="bg" x1=".2" y1="0" x2=".8" y2="1">
-      <stop offset="0" stop-color="#4527a0"/>
-      <stop offset=".55" stop-color="#26166b"/>
-      <stop offset="1" stop-color="#120a35"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1a2140"/>
+      <stop offset="1" stop-color="#080b16"/>
     </linearGradient>
-    <radialGradient id="glow" cx=".5" cy=".4" r=".55">
-      <stop offset="0" stop-color="#ff86c8" stop-opacity=".5"/>
-      <stop offset=".6" stop-color="#8b5cf6" stop-opacity=".12"/>
-      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#fff" stop-opacity=".22"/>
-      <stop offset=".3" stop-color="#fff" stop-opacity="0"/>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset=".55" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#c026d3"/>
     </linearGradient>
-    <linearGradient id="body" x1=".9" y1="0" x2=".1" y2="1">
-      <stop offset="0" stop-color="#ffd27a"/>
-      <stop offset=".42" stop-color="#ff7d6e"/>
-      <stop offset=".75" stop-color="#ec5fb4"/>
-      <stop offset="1" stop-color="#a75bff"/>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6366f1" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
     </linearGradient>
-    <radialGradient id="depth" cx=".35" cy=".25" r=".95">
-      <stop offset=".55" stop-color="#3a0f6e" stop-opacity="0"/>
-      <stop offset="1" stop-color="#3a0f6e" stop-opacity=".45"/>
-    </radialGradient>
-    <linearGradient id="neck" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#b65cff"/>
-      <stop offset="1" stop-color="#7342f5"/>
-    </linearGradient>
-    <linearGradient id="shine" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#fff" stop-opacity=".75"/>
-      <stop offset="1" stop-color="#fff" stop-opacity=".1"/>
-    </linearGradient>
-    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
-      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#08021f" flood-opacity=".6"/>
-    </filter>
-    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
-      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#2a0a5e" flood-opacity=".55"/>
-    </filter>
   </defs>
-
   <rect width="256" height="256" rx="58" fill="url(#bg)"/>
-  <rect width="256" height="256" rx="58" fill="url(#glow)"/>
-  <rect x="1.5" y="1.5" width="253" height="253" rx="56.5" fill="none" stroke="url(#rim)" stroke-width="3"/>
-
-  <g filter="url(#shadow)">
-    <path d="M140 170q-4 16-12 28" stroke="url(#neck)" stroke-width="18" stroke-linecap="round" fill="none"/>
-    <rect x="92" y="192" width="72" height="18" rx="9" fill="url(#neck)"/>
-    <g transform="rotate(-13 128 116)">
-      <rect x="46" y="48" width="164" height="132" rx="46" fill="url(#body)"/>
-      <rect x="46" y="48" width="164" height="132" rx="46" fill="url(#depth)"/>
-      <path d="M80 64h80a34 34 0 0 1 30 18" stroke="url(#shine)" stroke-width="9" stroke-linecap="round" fill="none"/>
-      <ellipse cx="103" cy="116" rx="13" ry="17" fill="#1b0b44"/>
-      <ellipse cx="153" cy="116" rx="13" ry="17" fill="#1b0b44"/>
-      <circle cx="107.5" cy="108.5" r="5" fill="#fff"/>
-      <circle cx="157.5" cy="108.5" r="5" fill="#fff"/>
-      <circle cx="99" cy="124" r="2.2" fill="#fff" opacity=".7"/>
-      <circle cx="149" cy="124" r="2.2" fill="#fff" opacity=".7"/>
-      <path d="M117 145q11 10 22 0" stroke="#1b0b44" stroke-width="6.5" stroke-linecap="round" fill="none"/>
-      <ellipse cx="79" cy="139" rx="11" ry="6.5" fill="#ff3d8b" opacity=".4"/>
-      <ellipse cx="177" cy="139" rx="11" ry="6.5" fill="#ff3d8b" opacity=".4"/>
-    </g>
+  <g transform="rotate(-10 128 124)">
+    <rect x="40" y="58" width="176" height="122" rx="20" fill="url(#screen)" stroke="url(#edge)" stroke-width="13"/>
+    <path d="M100 206h56M128 182v22" stroke="url(#edge)" stroke-width="13" stroke-linecap="round"/>
   </g>
-
-  <g filter="url(#soft)" transform="translate(174 152) rotate(-8)">
-    <path d="M0 0v50l13-12 9 21 11-5-9-20h18z" fill="#fff" stroke="#1b0b44" stroke-width="5" stroke-linejoin="round"/>
-  </g>
+  <path d="M58 112h34M48 132h40M62 152h26" stroke="#38bdf8" stroke-width="9" stroke-linecap="round"/>
+  <path d="M112 84v84l20-19 14 32 17-7-14-31 28-2z" fill="#fff" stroke="#080b16" stroke-width="7" stroke-linejoin="round"/>
 </svg>

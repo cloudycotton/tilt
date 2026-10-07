@@ -7,8 +7,8 @@
   Fast. Tiny. One command.
 </p>
 <p align="center">
-  <a href="https://github.com/cloudycotton/tilt/releases/latest"><img src="https://img.shields.io/github/v/release/cloudycotton/tilt?color=7c5cff&label=release" alt="latest release"></a>
-  <a href="https://www.npmjs.com/package/tilt-live"><img src="https://img.shields.io/npm/v/tilt-live?color=ec5fb4" alt="npm"></a>
+  <a href="https://github.com/cloudycotton/tilt/releases/latest"><img src="https://img.shields.io/github/v/release/cloudycotton/tilt?color=6366f1&label=release" alt="latest release"></a>
+  <a href="https://www.npmjs.com/package/tilt-live"><img src="https://img.shields.io/npm/v/tilt-live?color=c026d3" alt="npm"></a>
   <a href="https://github.com/cloudycotton/tilt/actions/workflows/ci.yml"><img src="https://github.com/cloudycotton/tilt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 <p align="center">
@@ -28,10 +28,10 @@ Open the link it prints, click the cursor button, and the desktop is yours.
 
 ## Why tilt
 
-- ⚡ **Fast.** 60 fps, about 20 ms from key press to pixel.
-- 🪶 **Tiny.** One static binary. Almost no CPU while nobody watches.
-- 🌐 **Goes anywhere.** One HTTPS port. Happy behind proxies and gateways.
-- 📱 **Any device.** Mouse, keyboard, touch, paste, view-only links.
+- **Fast.** 60 fps, about 20 ms from key press to pixel.
+- **Tiny.** One static binary. Almost no CPU while nobody watches.
+- **Goes anywhere.** One HTTPS port. Happy behind proxies and gateways.
+- **Any device.** Mouse, keyboard, touch, paste, view-only links.
 
 ## Next
 
