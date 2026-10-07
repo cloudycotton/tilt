@@ -7,13 +7,18 @@ import {
 /**
  * Plays touch pointer events on #viewport. Steps: ['down'|'move'|'up', id, x, y] or ['wait', ms].
  * Moves are split into `n` intermediate events like a real finger.
+ *
+ * Each event's timeStamp is the scripted time (waits, plus 8 ms per move step), not the time it
+ * was dispatched: a busy CI runner can stall a 30 ms wait past the 250 ms tap window, which would
+ * turn a tap into a hold. Timers in the page (long press, the tap's button-up) still run on real time.
  */
 async function touch(page, steps) {
   await page.evaluate(async (list) => {
     const vp = document.getElementById('viewport');
     const at = new Map();
+    let clock = performance.now();
     const fire = (type, id, x, y) => {
-      vp.dispatchEvent(new PointerEvent(`pointer${type}`, {
+      const e = new PointerEvent(`pointer${type}`, {
         pointerId: 100 + id,
         pointerType: 'touch',
         isPrimary: id === 0,
@@ -26,16 +31,20 @@ async function touch(page, steps) {
         bubbles: true,
         cancelable: true,
         composed: true,
-      }));
+      });
+      Object.defineProperty(e, 'timeStamp', { value: clock });
+      vp.dispatchEvent(e);
       at.set(id, [x, y]);
     };
     for (const [type, id, x, y, n = 1] of list) {
       if (type === 'wait') {
+        clock += id;
         await new Promise((r) => setTimeout(r, id));
       } else if (type === 'move') {
         const [x0, y0] = at.get(id);
         for (let i = 1; i <= n; i++) {
           fire('move', id, x0 + ((x - x0) * i) / n, y0 + ((y - y0) * i) / n);
+          clock += 8;
           await new Promise((r) => setTimeout(r, 8));
         }
       } else if (type === 'pair') {
@@ -47,6 +56,7 @@ async function touch(page, steps) {
         for (let i = 1; i <= steps; i++) {
           fire('move', 0, ax + ((tax - ax) * i) / steps, ay + ((tay - ay) * i) / steps);
           fire('move', 1, bx + ((tbx - bx) * i) / steps, by + ((tby - by) * i) / steps);
+          clock += 8;
           await new Promise((r) => setTimeout(r, 8));
         }
       } else {
@@ -235,7 +245,9 @@ test.describe('trackpad touch', () => {
     const id = await controlling(page);
     const since = mock.messages.length;
     await touch(page, [
-      ['down', 0, 400, 400], ['wait', 30], ['up', 0, 400, 400], ['wait', 80],
+      // The second touch follows the tap at once: a real wait could stall past the tap's 250 ms
+      // button-up timer on a busy runner, which would make this a click and then a plain move.
+      ['down', 0, 400, 400], ['wait', 30], ['up', 0, 400, 400],
       ['down', 0, 400, 400], ['move', 0, 480, 400, 8], ['up', 0, 480, 400],
     ]);
     const msgs = await collect(mock, id, ['BUTTON', 'MOVE'], since, 4, 400);

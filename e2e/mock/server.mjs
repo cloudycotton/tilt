@@ -284,11 +284,13 @@ export async function startMockServer(options = {}) {
     header.writeUInt16LE(st.h, 16);
     const room = Math.max(1, opts.maxMsgBytes - VIDEO_HEADER);
     const fragments = Math.max(1, Math.ceil(au.length / room));
+    // Taken before sending: on a busy machine this process can be preempted right after the
+    // write, long enough for the client to decode and ACK the frame first.
+    const at = now();
     for (let i = 0; i < fragments; i++) {
       header[1] = (frame.key ? FLAG_KEY : 0) | (i < fragments - 1 ? FLAG_MORE : 0);
       sendRaw(sess, Buffer.concat([header, au.subarray(i * room, (i + 1) * room)]));
     }
-    const at = now();
     sess.inflight.set(seq, at);
     sess.maxInflight = Math.max(sess.maxInflight, sess.inflight.size);
     sess.second.frames++;

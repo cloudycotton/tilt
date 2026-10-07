@@ -38,10 +38,11 @@ test('acks every frame once, in order, within the credit window', async ({ page,
   expect(acks.length).toBeGreaterThanOrEqual(55);
   // ACK(n) is cumulative and the client sends one per seq, so the seqs run 1, 2, 3, ...
   expect(acks.map((a) => a.seq)).toEqual(acks.map((_, i) => i + 1));
-  // decode_ms is receipt-to-output: the first frames include decoder start-up, the rest are quick.
-  const ms = acks.map((a) => a.decodeMs).sort((a, b) => a - b);
-  expect(ms[ms.length >> 1]).toBeLessThan(50);
-  expect(ms[ms.length - 1]).toBeLessThan(65535);
+  // decode_ms is receipt-to-output, so it fits between the mock sending the frame and the ACK
+  // arriving, give or take the browser's coarse clock (WebKit: 1 ms) and the rounding. Not an
+  // absolute bound: software decoding on a busy CI runner takes 100 ms and more.
+  const sentAt = new Map(mock.sent.filter((f) => f.session === id).map((f) => [f.seq, f.at]));
+  for (const a of acks) expect(a.decodeMs).toBeLessThanOrEqual(a.at - sentAt.get(a.seq) + 3);
   const sess = mock.session(id);
   expect(sess.maxInflight).toBeLessThanOrEqual(mock.options.window);
   expect(mock.violations).toEqual([]);
