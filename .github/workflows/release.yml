@@ -3,8 +3,8 @@ name: Release
 # Every push to main whose Cargo.toml version has no tag yet becomes a release: static binaries
 # for x86_64 and arm64 and the tilt-live launcher on GitHub. The tilt-live npm package follows
 # for any version npm does not have yet, so a failed or skipped publish is made up on the next
-# run (Actions > Release > Run workflow). npm needs the NPM_TOKEN secret (a granular token that
-# may publish tilt-live; the first publish needs one), or trusted publishing for this workflow.
+# run (Actions > Release > Run workflow). npm uses trusted publishing configured for
+# cloudycotton/tilt and release.yml in tilt-live's npm package settings.
 on:
   push:
     branches: [main]
@@ -26,6 +26,7 @@ jobs:
       - id: v
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test "$(node -p "require('./npm/package.json').version")" = "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
             echo "new=false" >> "$GITHUB_OUTPUT"
@@ -52,6 +53,16 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - name: Static binaries (cross-compiled with zig, no emulation)
         run: scripts/build-static.sh amd64 arm64
+      - name: Verify both release binaries start
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends qemu-user
+          test "$(dist/tilt-x86_64-unknown-linux-musl --version)" = "tilt $VERSION"
+          test "$(qemu-aarch64 dist/tilt-aarch64-unknown-linux-musl --version)" = "tilt $VERSION"
+          dist/tilt-x86_64-unknown-linux-musl --help
+          qemu-aarch64 dist/tilt-aarch64-unknown-linux-musl --help
       - name: Release v${{ needs.version.outputs.version }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -76,15 +87,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: 24
+      - name: Verify release assets are available
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          gh release download "v$VERSION" --dir dist
+          (cd dist && sha256sum -c SHA256SUMS)
+          test "$(dist/tilt-x86_64-unknown-linux-musl --version)" = "tilt $VERSION"
+      - name: Test launchers
+        run: node --test npm/test/launcher.test.mjs
       - name: Publish tilt-live ${{ needs.version.outputs.version }}
         working-directory: npm
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          npm install -g npm@latest
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm install -g npm@11.12.1
           cp ../LICENSE .
           npm publish --provenance --access public
+      - name: Verify installation from npm
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          smoke=$(mktemp -d)
+          npm install --prefix "$smoke" --ignore-scripts "tilt-live@$VERSION"
+          TILT_VERSION="$VERSION" "$smoke/node_modules/.bin/tilt-live" --version
+          TILT_VERSION="$VERSION" "$smoke/node_modules/.bin/tilt-live" --help

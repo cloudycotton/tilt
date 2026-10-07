@@ -1,6 +1,6 @@
 {
   "name": "tilt-live",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "See and control any Linux desktop, right in your browser (runs the latest tilt release)",
   "keywords": [
     "vnc",
