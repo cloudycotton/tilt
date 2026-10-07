@@ -49,6 +49,8 @@ scripts/demo.sh                                 # re-records docs/demo.webp
 ```
 
 A release ships on every push to `main` that bumps the version in `Cargo.toml`.
+Keep `npm/package.json` and Tilt's entry in `Cargo.lock` at the same version.
+See [releasing](docs/releasing.md) for the npm setup and verification steps.
 </details>
 
 MIT licensed.
