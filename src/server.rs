@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, FORWARDED, HOST, ORIGIN, WWW_AUTHENTICATE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::serve::ListenerExt;
@@ -18,17 +18,15 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::assets;
-use crate::auth::{AuthError, Role, TokenSource};
+use crate::auth::{AuthError, Role, TokenSource, AUTH_FAIL_DELAY};
 use crate::clock::LogEvery;
 use crate::config::Config;
 use crate::control::ControlState;
-use crate::events::EventStreams;
-use crate::governor::Governor;
 use crate::hub::FrameHub;
 use crate::input::InputHandle;
 use crate::protocol::ScreenSize;
 use crate::session::{self, SessionStatus, Sessions};
-use crate::x11::cursor::{CursorState, CursorWaker};
+use crate::x11::cursor::CursorState;
 
 /// Everything the handlers, sessions and encoder workers share.
 pub struct AppState {
@@ -38,15 +36,9 @@ pub struct AppState {
     pub control: ControlState,
     pub input: InputHandle,
     pub cursor: watch::Receiver<CursorState>,
-    /// Rung when the sessions watching video change.
-    #[expect(dead_code, reason = "phase 0 stub: rung by sessions (G4)")]
-    pub cursor_waker: CursorWaker,
     pub sessions: Sessions,
-    /// The CPU governor all encoder workers share.
-    pub governor: Arc<Governor>,
-    /// Open /api/events streams.
-    #[expect(dead_code, reason = "phase 0 stub: used by /api/events (G4 D3)")]
-    pub events: EventStreams,
+    /// The CPUs tilt may use, for `--profile auto`.
+    pub cpus: usize,
 }
 
 /// What main builds before the server: the parts of AppState that are not made here.
@@ -56,9 +48,8 @@ pub struct AppParts {
     pub hub: Arc<FrameHub>,
     pub input: InputHandle,
     pub cursor: watch::Receiver<CursorState>,
-    pub cursor_waker: CursorWaker,
     pub sessions: Sessions,
-    pub governor: Arc<Governor>,
+    pub cpus: usize,
 }
 
 impl AppState {
@@ -70,10 +61,8 @@ impl AppState {
             control: ControlState::new(p.input.clone()),
             input: p.input,
             cursor: p.cursor,
-            cursor_waker: p.cursor_waker,
             sessions: p.sessions,
-            governor: p.governor,
-            events: EventStreams::default(),
+            cpus: p.cpus,
         })
     }
 }
@@ -92,8 +81,6 @@ struct Status {
 /// (protocol::MAX_TEXT_BYTES). The margin lets a client that sends longer TEXT keep its
 /// session.
 const MAX_INCOMING_MSG: usize = 64 * 1024;
-/// Same delay as a failed WebSocket handshake.
-const AUTH_FAIL_DELAY: Duration = Duration::from_millis(500);
 /// How long `serve` waits for sessions to close after the shutdown signal.
 const SESSION_DRAIN: Duration = Duration::from_secs(3);
 const X_FORWARDED_HOST: &str = "x-forwarded-host";
@@ -103,17 +90,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/status", get(status))
         .route("/stream", get(stream));
-    for asset in assets::ASSETS {
-        router = router.route(asset.path, get(asset_handler));
+    for (i, asset) in assets::ASSETS.iter().enumerate() {
+        router = router.route(
+            asset.path,
+            get(move |headers: HeaderMap| async move { assets::respond(i, &headers) }),
+        );
     }
     router.with_state(state)
-}
-
-async fn asset_handler(uri: Uri, headers: HeaderMap) -> Response {
-    match assets::find(uri.path()) {
-        Some(asset) => assets::respond(asset, &headers),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -393,19 +376,13 @@ pub fn test_state(args: &[&str]) -> Arc<AppState> {
     );
     let (hub, _capture_wake) = FrameHub::new();
     let (input, _input_rx) = InputHandle::detached();
-    let cap = crate::sysres::CpuCapacity {
-        cpus: 4.0,
-        quota_cpus: None,
-        affinity: 4,
-    };
     AppState::new(AppParts {
         tokens: TokenSource::from_config(&cfg),
         hub,
         input,
         cursor: watch::channel(CursorState::default()).1,
-        cursor_waker: CursorWaker::detached(),
         sessions: Sessions::new(cfg.max_viewers),
-        governor: Governor::new(&cfg, cap),
+        cpus: 4,
         cfg,
     })
 }

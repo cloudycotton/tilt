@@ -10,8 +10,9 @@ use anyhow::{ensure, Context};
 use openh264_sys2::{
     cmMallocMemeError, videoFormatI420, videoFrameTypeIDR, videoFrameTypeInvalid,
     videoFrameTypeSkip, DynamicAPI, ISVCEncoder, ISVCEncoderVtbl, SBitrateInfo, SEncParamExt,
-    SFrameBSInfo, SSourcePicture, WelsTraceCallback, API, CAMERA_VIDEO_REAL_TIME, CM_BT709,
-    CONSTANT_ID, CP_BT709, ENCODER_OPTION, ENCODER_OPTION_BITRATE, ENCODER_OPTION_DATAFORMAT,
+    SEncoderStatistics, SFrameBSInfo, SSourcePicture, WelsTraceCallback, API,
+    CAMERA_VIDEO_REAL_TIME, CM_BT709, CONSTANT_ID, CP_BT709, ENCODER_OPTION,
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_DATAFORMAT, ENCODER_OPTION_GET_STATISTICS,
     ENCODER_OPTION_TRACE_CALLBACK, LOW_COMPLEXITY, PRO_BASELINE, PRO_HIGH, RC_BITRATE_MODE,
     SM_SINGLE_SLICE, SPATIAL_LAYER_ALL, TRC_BT709, UNSPECIFIED_BIT_RATE, VF_UNDEF, WELS_LOG_ERROR,
 };
@@ -62,6 +63,8 @@ pub struct EncodedFrame {
     /// The encoder produced an IDR, so SPS and PPS are included.
     pub keyframe: bool,
     pub encode_us: u32,
+    /// The frame's mean quantizer.
+    pub qp: u8,
 }
 
 /// One OpenH264 encoder. Dropping it must Uninitialize and WelsDestroySVCEncoder.
@@ -195,10 +198,12 @@ impl H264Encoder {
         if data.is_empty() {
             return Ok(None);
         }
+        let encode_us = u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX);
         Ok(Some(EncodedFrame {
             data,
             keyframe: frame_type == videoFrameTypeIDR,
-            encode_us: u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX),
+            encode_us,
+            qp: self.last_qp(),
         }))
     }
 
@@ -221,6 +226,27 @@ impl H264Encoder {
 
     pub fn settings(&self) -> &EncoderSettings {
         &self.settings
+    }
+
+    /// The mean quantizer of the last frame encoded; MAX_QP when OpenH264 cannot say.
+    fn last_qp(&self) -> u8 {
+        let Some(get_option) = self.vtable().GetOption else {
+            return MAX_QP;
+        };
+        let mut stats = SEncoderStatistics::default();
+        // SAFETY: ENCODER_OPTION_GET_STATISTICS fills an SEncoderStatistics, which outlives
+        // the call.
+        let rv = unsafe {
+            get_option(
+                self.raw,
+                ENCODER_OPTION_GET_STATISTICS,
+                ptr::from_mut(&mut stats).cast::<c_void>(),
+            )
+        };
+        if rv != 0 {
+            return MAX_QP;
+        }
+        u8::try_from(stats.uiAverageFrameQP).map_or(MAX_QP, |qp| qp.min(MAX_QP))
     }
 
     fn initialize(&mut self) -> anyhow::Result<()> {
@@ -420,7 +446,7 @@ fn fill_params(p: &mut SEncParamExt, s: &EncoderSettings) {
     p.bEnableLongTermReference = false;
     p.bEnableBackgroundDetection = true;
     // OpenH264 2.6 turns adaptive quantisation off in validation whatever this says.
-    p.bEnableAdaptiveQuant = true;
+    p.bEnableAdaptiveQuant = false;
     p.bEnableDenoise = false;
     p.iLoopFilterDisableIdc = 0;
     p.iMultipleThreadIdc = 1;
@@ -824,6 +850,54 @@ mod tests {
             "re-encodes did not shrink"
         );
         assert_refines(&quality, 0.5);
+    }
+
+    /// The worker ends the refinement tail at the first re-encode of a still screen that comes
+    /// out with the same size and quantizer as the one before, at the lowest quantizer. From
+    /// there on, re-encodes must add no quality (they hover within a thousandth of a dB). At a
+    /// low bitrate the quantizer stays above the floor, and the tail keeps refining.
+    #[test]
+    fn a_converged_tail_stays_converged() {
+        let (w, h) = (640, 360);
+        for (bitrate, scene) in [
+            (8_000_000, Scene::Text),
+            (8_000_000, Scene::Drag),
+            (300_000, Scene::Text),
+            (300_000, Scene::Drag),
+        ] {
+            let s = settings(w, h, bitrate, true);
+            let mut enc = H264Encoder::new(&s).unwrap();
+            let mut dec = Decoder::new();
+            let mut desktop = Desktop::new(w as usize, h as usize, 7);
+            let mut screen = vec![0; w as usize * h as usize * 4];
+            for i in 0..20 {
+                desktop.step(scene, i, &mut screen);
+                let out = encode(&mut enc, &to_i420(&screen, w, h), i, false);
+                assert!(out.qp >= s.min_qp && out.qp <= s.max_qp, "qp {}", out.qp);
+                dec.decode(&out.data).unwrap();
+            }
+            let still = to_i420(&screen, w, h);
+            let mut tail = Vec::new();
+            for i in 20..60 {
+                let out = encode(&mut enc, &still, i, false);
+                let (_, _, y) = dec.decode(&out.data).unwrap();
+                tail.push((out.data.len(), out.qp, psnr(&y, &still.y)));
+            }
+            let at = (1..tail.len()).find(|&i| {
+                tail[i].1 <= s.min_qp && (tail[i].0, tail[i].1) == (tail[i - 1].0, tail[i - 1].1)
+            });
+            let what = format!("{bitrate} bps {scene:?}: {tail:?}");
+            if let Some(at) = at {
+                let best_later = tail[at..].iter().map(|t| t.2).fold(f64::MIN, f64::max);
+                assert!(
+                    best_later - tail[at].2 < 0.01,
+                    "converged at {at} but refined later; {what}"
+                );
+            }
+            if bitrate == 8_000_000 {
+                assert!(at.is_some_and(|at| at < 5), "no early convergence; {what}");
+            }
+        }
     }
 
     #[test]

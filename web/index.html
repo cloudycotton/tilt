@@ -6,12 +6,15 @@
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0b0c0e">
 <link rel="icon" href="data:,">
+<!-- app.js imports these: fetching them now saves two round trips per load. -->
+<link rel="modulepreload" href="input.js">
+<link rel="modulepreload" href="keysyms.js">
 <title>tilt</title>
 <style>
   :root {
     color-scheme: dark;
     --bg: #0b0c0e;
-    --panel: rgba(26, 28, 33, 0.92);
+    --panel: #1a1c21;
     --line: rgba(255, 255, 255, 0.1);
     --fg: #e8eaef;
     --muted: #9aa1ad;
@@ -149,11 +152,8 @@
     gap: 2px;
     padding: 3px;
     border: 1px solid var(--line);
-    border-radius: 12px;
+    border-radius: 10px;
     background: var(--panel);
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
-    -webkit-backdrop-filter: blur(10px);
-    backdrop-filter: blur(10px);
     overflow-x: auto;
     overscroll-behavior: contain;
     scrollbar-width: none;
@@ -170,7 +170,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
+    padding: 0 6px;
     white-space: nowrap;
   }
   #toolbar svg {
@@ -188,9 +188,6 @@
     color: #fff;
   }
   #btn-scale { font-variant-numeric: tabular-nums; min-width: calc(var(--tap) + 6px); }
-  @media (max-width: 719px) {
-    #toolbar .label { display: none; }
-  }
   #dot {
     flex: none;
     width: 10px;
@@ -201,23 +198,18 @@
   }
   #dot.ok { background: var(--ok); }
   #dot.bad { background: var(--bad); }
-  #dot.wait { animation: pulse 1s ease-in-out infinite alternate; }
-  .sep { flex: none; width: 1px; height: 20px; margin: 0 2px; background: var(--line); }
   /* Phones: every button stays on screen, at the cost of spacing and, if need be, a few pixels of
      button width; only very narrow screens fall back to scrolling the bar. */
   @media (max-width: 479px) {
-    #toolbar .sep { display: none; }
     #dot { margin: 0 4px; }
     #toolbar button { flex: 0 1 auto; width: var(--tap); min-width: min(36px, var(--tap)); padding: 0; }
   }
 
+  /* Flat panels: a backdrop blur or shadow over the video would be recomposited on every frame. */
   .panel {
     border: 1px solid var(--line);
-    border-radius: 12px;
+    border-radius: 10px;
     background: var(--panel);
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
-    -webkit-backdrop-filter: blur(10px);
-    backdrop-filter: blur(10px);
   }
 
   /* Full-size keys that wrap (modifiers above arrows) instead of scrolling: the strip cannot pan
@@ -327,16 +319,6 @@
   #overlay .card { width: min(420px, 100%); padding: 20px; display: grid; gap: 12px; justify-items: center; text-align: center; }
   #overlay-msg { margin: 0; font-size: 16px; font-weight: 600; }
   #overlay-detail { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
-  .spinner {
-    display: none;
-    width: 28px;
-    height: 28px;
-    border: 3px solid rgba(255, 255, 255, 0.18);
-    border-top-color: var(--fg);
-    border-radius: 50%;
-    animation: spin 0.9s linear infinite;
-  }
-  #overlay.busy .spinner { display: block; }
   #token-form { width: 100%; display: flex; gap: 8px; }
   #token-input {
     flex: 1;
@@ -374,11 +356,8 @@
     pointer-events: none;
   }
 
-  @keyframes spin { to { transform: rotate(360deg); } }
-  @keyframes pulse { from { opacity: 1; } to { opacity: 0.35; } }
   @media (prefers-reduced-motion: reduce) {
     #toolbar { transition: none; }
-    #dot.wait, .spinner { animation: none; }
   }
 </style>
 </head>
@@ -397,25 +376,20 @@
 <div id="toolbar" role="toolbar" aria-label="tilt">
   <span id="dot" class="wait" role="img" aria-label="Connecting" title="Connecting"></span>
   <button id="btn-control" type="button" aria-label="Control" aria-pressed="false" disabled>
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3l14 7.5-6.2 1.7L10 18.5z"/><path d="M13.2 12.6l5 5"/></svg><span class="label">Control</span>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3l14 7.5-6.2 1.7L10 18.5z"/><path d="M13.2 12.6l5 5"/></svg>
   </button>
-  <span class="sep"></span>
   <button id="btn-keyboard" type="button" aria-label="Keyboard" title="Show or hide the on-screen keyboard" hidden disabled>
-    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7.5 14h9"/></svg><span class="label">Keyboard</span>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7.5 14h9"/></svg>
   </button>
   <button id="btn-keys" type="button" aria-label="Keys" title="Extra keys: Esc, Tab, Ctrl, Alt, Super, arrows" aria-pressed="false" disabled>
-    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="7" width="8.5" height="10" rx="1.5"/><rect x="13" y="7" width="8.5" height="10" rx="1.5"/></svg><span class="label">Keys</span>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="7" width="8.5" height="10" rx="1.5"/><rect x="13" y="7" width="8.5" height="10" rx="1.5"/></svg>
   </button>
   <button id="btn-type" type="button" aria-label="Type text" title="Type text into the remote desktop" disabled>
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V5h16v2M12 5v14M9 19h6"/></svg><span class="label">Type</span>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V5h16v2M12 5v14M9 19h6"/></svg>
   </button>
-  <span class="sep"></span>
   <button id="btn-scale" type="button" aria-label="Scale" title="Scaled to fit; switch to 1:1 pixels">Fit</button>
   <button id="btn-fullscreen" type="button" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg><span class="label">Fullscreen</span>
-  </button>
-  <button id="btn-stats" type="button" aria-label="Stats" aria-pressed="false" title="Show stream statistics">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20v-6M12 20V5M19 20v-10"/></svg><span class="label">Stats</span>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
   </button>
   <button id="btn-menu" type="button" aria-label="Settings" aria-haspopup="true" aria-expanded="false" aria-controls="menu" title="Settings">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01M12 12h.01M19 12h.01"/></svg>
@@ -446,6 +420,7 @@
       <button type="button" role="radio" data-touch="direct" aria-checked="false">Direct</button>
     </div>
   </div>
+  <label class="check"><input id="opt-stats" type="checkbox"> Stream statistics</label>
   <label id="cmd-row" class="check"><input id="opt-cmd" type="checkbox"> Cmd+C/V/X/A/Z/F act as Ctrl</label>
   <label id="alt-row" class="check"><input id="opt-alt" type="checkbox"> Option acts as Alt (no special characters)</label>
   <p id="menu-info"></p>
@@ -464,9 +439,8 @@
 
 <pre id="stats" aria-live="off" hidden></pre>
 
-<div id="overlay" class="busy solid">
+<div id="overlay" class="solid">
   <div class="card panel">
-    <div class="spinner" aria-hidden="true"></div>
     <p id="overlay-msg" role="status">Connecting…</p>
     <p id="overlay-detail" hidden></p>
     <form id="token-form" hidden>

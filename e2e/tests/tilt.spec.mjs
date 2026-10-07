@@ -31,8 +31,9 @@ test.afterEach(async ({ page }) => {
 
 test('stream renders at the screen size', async ({ page }) => {
   await openTilt(page, `token=${CONTROL_TOKEN}&stats=1`);
-  // A new viewer gets a keyframe plus the refinement tail, even from a static screen.
-  await page.waitForFunction(() => window.tilt.stats.framesDecoded >= 10, null, { timeout: 10_000 });
+  // A new viewer gets a keyframe plus the refinement tail, even from a static screen; the tail
+  // ends as soon as the encoder has nothing left to refine, after a few frames.
+  await page.waitForFunction(() => window.tilt.stats.framesDecoded >= 2, null, { timeout: 10_000 });
   const s = await page.evaluate(() => {
     const canvas = document.getElementById('screen');
     return { ...window.tilt.stats, canvas: [canvas.width, canvas.height] };

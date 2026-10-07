@@ -21,6 +21,14 @@ pub struct I420Frame {
 }
 
 impl I420Frame {
+    /// Copies `other`'s pixels, which must have the same size.
+    pub fn copy_from(&mut self, other: &I420Frame) {
+        debug_assert_eq!((self.width, self.height), (other.width, other.height));
+        self.y.copy_from_slice(&other.y);
+        self.u.copy_from_slice(&other.u);
+        self.v.copy_from_slice(&other.v);
+    }
+
     /// Sizes the planes for `width` x `height`, reusing their allocations.
     fn reshape(&mut self, width: u32, height: u32) {
         let chroma = (width / 2) as usize * (height / 2) as usize;
@@ -41,6 +49,12 @@ pub struct FramePool {
 impl FramePool {
     pub fn new() -> FramePool {
         FramePool::default()
+    }
+
+    /// Frees the idle buffers, for when nobody watches.
+    pub fn trim(&self) {
+        let idle = std::mem::take(&mut *self.idle.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(idle);
     }
 
     /// A `width`x`height` frame with unspecified contents, reusing an idle buffer if there is one.
@@ -98,21 +112,54 @@ impl Drop for PooledFrame {
 /// Converts the top-left `dst.width` x `dst.height` of `src` (32-bpp B,G,R,X rows `src_stride`
 /// bytes apart) into `dst`, cropping the odd column and row of odd screen sizes.
 pub fn bgrx_to_i420(src: &[u8], src_stride: usize, dst: &mut I420Frame) -> anyhow::Result<()> {
+    let height = dst.height;
+    bgrx_rows_to_i420(src, src_stride, dst, 0, height)
+}
+
+/// Like [`bgrx_to_i420`] for rows `[top, bottom)` only, which must be even, leaving the rest of
+/// `dst` as it was. `src` is the whole image, as for `bgrx_to_i420`.
+pub fn bgrx_rows_to_i420(
+    src: &[u8],
+    src_stride: usize,
+    dst: &mut I420Frame,
+    top: u32,
+    bottom: u32,
+) -> anyhow::Result<()> {
     let (width, height) = (dst.width, dst.height);
     ensure!(
         width % 2 == 0 && height % 2 == 0,
         "I420 frame {width}x{height} has an odd dimension"
     );
+    ensure!(
+        (top | bottom) & 1 == 0 && top < bottom && bottom <= height,
+        "rows {top}..{bottom} are not an even span of {height}"
+    );
+    let rows = bottom - top;
+    let (w, cw) = (width as usize, width as usize / 2);
+    let (top, bottom) = (top as usize, bottom as usize);
+    let src = src
+        .get(top * src_stride..)
+        .context("source image ends before the rows to convert")?;
     let src_stride = u32::try_from(src_stride).context("source stride out of range")?;
+    let short = || anyhow::anyhow!("I420 planes are too short for {width}x{height}");
+    let y_plane = dst.y.get_mut(top * w..bottom * w).ok_or_else(short)?;
+    let u_plane = dst
+        .u
+        .get_mut(top / 2 * cw..bottom / 2 * cw)
+        .ok_or_else(short)?;
+    let v_plane = dst
+        .v
+        .get_mut(top / 2 * cw..bottom / 2 * cw)
+        .ok_or_else(short)?;
     let mut image = YuvPlanarImageMut {
-        y_plane: BufferStoreMut::Borrowed(&mut dst.y),
+        y_plane: BufferStoreMut::Borrowed(y_plane),
         y_stride: width,
-        u_plane: BufferStoreMut::Borrowed(&mut dst.u),
+        u_plane: BufferStoreMut::Borrowed(u_plane),
         u_stride: width / 2,
-        v_plane: BufferStoreMut::Borrowed(&mut dst.v),
+        v_plane: BufferStoreMut::Borrowed(v_plane),
         v_stride: width / 2,
         width,
-        height,
+        height: rows,
     };
     // yuv checks the source length and stride and the plane sizes, and reports them as errors.
     // Its alpha input is X here, which a YUV conversion never reads.
@@ -124,7 +171,7 @@ pub fn bgrx_to_i420(src: &[u8], src_stride: usize, dst: &mut I420Frame) -> anyho
         YuvStandardMatrix::Bt709,
         YuvConversionMode::Balanced,
     )
-    .with_context(|| format!("BGRX to I420 at {width}x{height}, stride {src_stride}"))
+    .with_context(|| format!("BGRX to I420 at {width}x{rows}, stride {src_stride}"))
 }
 
 #[cfg(test)]
@@ -205,6 +252,39 @@ mod tests {
     }
 
     #[test]
+    fn converting_rows_matches_a_full_conversion_and_leaves_the_rest() {
+        let (w, h, stride) = (32, 24, 32 * 4 + 8);
+        let before = bgrx(w, h, stride, |x, y| [(x * 7) as u8, (y * 9) as u8, 40]);
+        let after = bgrx(w, h, stride, |x, y| {
+            if (6..14).contains(&y) {
+                [200, (x * 3) as u8, (y * 11) as u8]
+            } else {
+                [(x * 7) as u8, (y * 9) as u8, 40]
+            }
+        });
+        let mut want = frame(w as u32, h as u32);
+        bgrx_to_i420(&after, stride, &mut want).unwrap();
+        let mut got = frame(w as u32, h as u32);
+        bgrx_to_i420(&before, stride, &mut got).unwrap();
+        bgrx_rows_to_i420(&after, stride, &mut got, 6, 14).unwrap();
+        assert_eq!(got, want);
+
+        let mut copy = frame(w as u32, h as u32);
+        copy.copy_from(&got);
+        assert_eq!(copy, got);
+
+        for (top, bottom) in [(5, 14), (6, 13), (6, 6), (8, 6), (0, 26)] {
+            assert!(
+                bgrx_rows_to_i420(&after, stride, &mut got, top, bottom).is_err(),
+                "rows {top}..{bottom}"
+            );
+        }
+        let mut short = frame(w as u32, h as u32);
+        short.u.truncate(10);
+        assert!(bgrx_rows_to_i420(&after, stride, &mut short, 20, 24).is_err());
+    }
+
+    #[test]
     fn rejects_bad_geometry_without_panicking() {
         let src = bgrx(8, 8, 32, |_, _| [1, 2, 3]);
         assert!(
@@ -269,6 +349,10 @@ mod tests {
         let src = bgrx(16, 8, 64, |_, _| [255, 255, 255]);
         bgrx_to_i420(&src, 64, &mut small).unwrap();
         assert_near(&small.y, 235, "pooled Y");
+        drop(small);
+        assert_eq!(pool.idle.lock().unwrap().len(), MAX_IDLE);
+        pool.trim();
+        assert_eq!(pool.idle.lock().unwrap().len(), 0);
     }
 
     #[test]

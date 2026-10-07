@@ -6,7 +6,8 @@ x11vnc + noVNC in sandboxes such as E2B and Sail:
 
 - one HTTP/1.1 port serves the web client and a binary WebSocket at `/stream`;
 - each viewer gets its own H.264 encoder (OpenH264, built in), decoded by WebCodecs in the page;
-- capture is demand-driven (DAMAGE + MIT-SHM): a still screen costs no CPU;
+- capture is demand-driven (DAMAGE + MIT-SHM): a still screen costs no CPU, and only the rows
+  that changed are read and converted;
 - flow control is ack-based: frames are never dropped, the newest frame is sent when credit
   returns, and the bitrate follows the measured link;
 - tokens are checked in the first WebSocket message, never in the URL query; a token file is
@@ -21,7 +22,9 @@ docker compose up
 ```
 
 Then open http://localhost:6090/#token=devtoken (view-only: `#token=viewtoken`). Press
-**Control** in the toolbar to take over the desktop.
+**Control** in the toolbar to take over the desktop. The toolbar is a small strip of icons that
+slides away while you control the desktop (move the pointer to the top edge, or tap it, to bring
+it back); stream statistics are in its settings menu, or add `&stats=1` to the URL.
 
 ## Build
 
@@ -71,7 +74,7 @@ viewers held, and exits.
 | `--qp-min <N>` | `TILT_QP_MIN` | 20 | lowest quantizer (best quality), 12 to 51; at least 20 with `--profile high` |
 | `--qp-max <N>` | `TILT_QP_MAX` | 28 | highest quantizer, up to 51; not below `--qp-min`. Higher values keep a busy screen within the bitrate, but text that moved stays blurred after it stops (see [Deployment](#deployment)) |
 | `--profile <high\|baseline>` | `TILT_PROFILE` | `high` | `high` = CABAC; `baseline` = CAVLC Constrained Baseline |
-| `--tail-frames <N>` | `TILT_TAIL_FRAMES` | 30 | refinement frames after the screen goes still |
+| `--tail-frames <N>` | `TILT_TAIL_FRAMES` | 30 | most refinement frames after the screen goes still; the tail ends sooner once a re-encode at `--qp-min` comes out unchanged, as nothing is left to refine |
 | `--rc-frame-skip` | `TILT_RC_FRAME_SKIP` | off | let OpenH264 rate control skip frames |
 | `--max-viewers <N>` | `TILT_MAX_VIEWERS` | 4 | simultaneous viewers; each costs one encoder |
 | `--max-msg-bytes <N>` | `TILT_MAX_MSG_BYTES` | 65536 | larger video frames are split into fragments; small ones keep a slow link's client hearing from the server while a keyframe arrives |
@@ -91,7 +94,10 @@ viewer's picture; with it on, grabs took 3.6 ms (median) and 7.5 ms (p95). Also 
 compositing while one window covers the whole screen, and in our tests it did not start again
 when that window shrank.
 
-**CPU.** A still screen costs nothing, and an idle viewer about 1% of a core. Each viewer has
+**CPU.** A still screen costs nothing, and an idle viewer under 1% of a core. Typing costs little:
+with two key presses a second on a 1080p screen, tilt took 6% of a core (x86-64, one viewer),
+since each change is grabbed only where it happened and the refinement tail stops as soon as
+the encoder has nothing left to sharpen. Each viewer has
 its own encoder, so a busy screen costs CPU per viewer. With a terminal scrolling over most of
 the screen (Apple M4, Docker, arm64; 100% = one core):
 

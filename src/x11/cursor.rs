@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::sync::watch;
@@ -19,7 +19,13 @@ use super::conn::connect;
 
 /// Browsers ignore CSS cursor images larger than this.
 const MAX_SIDE: u16 = 128;
+/// Position polling while viewers watch and the pointer moved within MOVING_FOR.
 const ACTIVE_POLL: Duration = Duration::from_millis(8);
+/// While viewers watch a pointer that has been still for MOVING_FOR: the first move after a
+/// rest shows up at most this late, and the rest of it at ACTIVE_POLL.
+const RESTING_POLL: Duration = Duration::from_millis(50);
+const MOVING_FOR: Duration = Duration::from_millis(500);
+/// With no viewers.
 const IDLE_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,33 +48,14 @@ pub struct CursorState {
     pub y: i32,
 }
 
-/// Wakes the cursor thread, so that it re-reads how many sessions watch video, or sees the
-/// shutdown flag. (Phase 0 stub: the thread still polls, so ringing does nothing yet.)
-#[derive(Debug, Clone)]
-pub struct CursorWaker(());
-
-impl CursorWaker {
-    #[expect(
-        dead_code,
-        reason = "phase 0 stub: rung by sessions and at shutdown (G3, G4)"
-    )]
-    pub fn ring(&self) {}
-
-    /// A waker with no thread behind it, for other modules' tests.
-    #[cfg(test)]
-    pub fn detached() -> CursorWaker {
-        CursorWaker(())
-    }
-}
-
 /// Connects to `display` and starts `tilt-cursor`. The position is polled every 8 ms while
-/// `watching > 0` and every 250 ms otherwise; the returned receiver sees only changes. Ring the
-/// returned waker when `watching` changes, and at shutdown.
+/// `watching > 0` and the pointer moves, every 50 ms while it rests, and every 250 ms with
+/// nobody watching; the returned receiver sees only changes.
 pub fn spawn_cursor_thread(
     display: String,
     watching: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
-) -> anyhow::Result<(watch::Receiver<CursorState>, CursorWaker, JoinHandle<()>)> {
+) -> anyhow::Result<(watch::Receiver<CursorState>, JoinHandle<()>)> {
     let (tx, rx) = watch::channel(CursorState::default());
     let (conn, screen) = connect(&display)?;
     let root = conn.setup().roots[screen].root;
@@ -85,7 +72,7 @@ pub fn spawn_cursor_thread(
             }
         })
         .context("cannot start tilt-cursor")?;
-    Ok((rx, CursorWaker(()), thread))
+    Ok((rx, thread))
 }
 
 fn track(
@@ -97,6 +84,7 @@ fn track(
 ) -> anyhow::Result<()> {
     // Read after selecting CursorNotify, so no change can fall in between.
     let mut shape = Some(read_shape(conn)?);
+    let mut moved_at = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         let mut cursor_changed = false;
         while let Some(event) = conn.poll_for_event()? {
@@ -106,23 +94,29 @@ fn track(
             shape = Some(read_shape(conn)?);
         }
         let pointer = conn.query_pointer(root)?.reply()?;
-        publish(
+        let now = Instant::now();
+        if publish(
             tx,
             shape.take(),
             pointer.root_x.into(),
             pointer.root_y.into(),
-        );
-        std::thread::sleep(if watching.load(Ordering::Relaxed) > 0 {
+        ) {
+            moved_at = now;
+        }
+        std::thread::sleep(if watching.load(Ordering::Relaxed) == 0 {
+            IDLE_POLL
+        } else if now.saturating_duration_since(moved_at) < MOVING_FOR {
             ACTIVE_POLL
         } else {
-            IDLE_POLL
+            RESTING_POLL
         });
     }
     Ok(())
 }
 
-/// Stores a newly read shape and the position, waking receivers only if either changed.
-fn publish(tx: &watch::Sender<CursorState>, shape: Option<CursorShape>, x: i32, y: i32) {
+/// Stores a newly read shape and the position, waking receivers only if either changed;
+/// returns whether one did.
+fn publish(tx: &watch::Sender<CursorState>, shape: Option<CursorShape>, x: i32, y: i32) -> bool {
     tx.send_if_modified(|state| {
         let mut changed = false;
         if let Some(shape) = shape {
@@ -136,7 +130,7 @@ fn publish(tx: &watch::Sender<CursorState>, shape: Option<CursorShape>, x: i32, 
             changed = true;
         }
         changed
-    });
+    })
 }
 
 fn read_shape(conn: &RustConnection) -> anyhow::Result<CursorShape> {
@@ -291,18 +285,18 @@ mod tests {
     #[test]
     fn publishes_only_changes() {
         let (tx, mut rx) = watch::channel(CursorState::default());
-        publish(&tx, None, 0, 0);
+        assert!(!publish(&tx, None, 0, 0));
         assert!(!rx.has_changed().unwrap());
-        publish(&tx, None, 3, 4);
+        assert!(publish(&tx, None, 3, 4));
         assert!(rx.has_changed().unwrap());
         assert_eq!(position(&mut rx), (3, 4));
 
         let shape = cursor_shape(&image(1, 1, 0, 0, vec![0xff00_0000]));
-        publish(&tx, Some(shape.clone()), 3, 4);
+        assert!(publish(&tx, Some(shape.clone()), 3, 4));
         assert!(rx.has_changed().unwrap());
         assert_eq!(rx.borrow_and_update().shape.as_ref(), Some(&shape));
         // CursorNotify fires on every cursor switch, including back to the shape last sent.
-        publish(&tx, Some(shape), 3, 4);
+        assert!(!publish(&tx, Some(shape), 3, 4));
         assert!(!rx.has_changed().unwrap());
     }
 }
@@ -345,7 +339,7 @@ mod x_tests {
         let x = Xvfb::start("640x480x24", &[]);
         let viewers = Arc::new(AtomicUsize::new(1));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (mut rx, _waker, thread) = spawn_cursor_thread(
+        let (mut rx, thread) = spawn_cursor_thread(
             x.display.clone(),
             Arc::clone(&viewers),
             Arc::clone(&shutdown),

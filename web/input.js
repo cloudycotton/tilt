@@ -52,7 +52,8 @@ const FINE_POINTER = matchMedia('(pointer: fine)');
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
-function message(type, len) {
+/** A zeroed `len`-byte binary message of `type`, and a view for writing its fields. */
+export function message(type, len) {
   const b = new Uint8Array(len);
   b[0] = type;
   return [b, new DataView(b.buffer)];
@@ -69,7 +70,8 @@ function message(type, len) {
  *   cmdToCtrl() -> bool          Apple: map Cmd+C/V/X/A/Z/F to Ctrl
  *   optionAsAlt() -> bool        Apple: Option is plain Alt instead of typing characters
  *   view: { scale(), zoomAt(f, clientX, clientY), panBy(dx, dy), reveal(x, y) }  local zoom/pan
- *   onChange()                   sticky modifiers or the virtual cursor changed
+ *   onChange()                   sticky modifiers changed
+ *   onCursor()                   the virtual cursor moved
  *   onPointerType(type)          the last pointer type used on the viewer
  * }
  */
@@ -84,8 +86,23 @@ export function createInput(env) {
 
   // ---- coordinates
 
+  // The canvas rect and the viewport's client-area edges, read at most once per layout change:
+  // pointer events can come at 120 Hz and more, and each read may force a layout.
+  let geo = null;
+  function geometry() {
+    if (!geo) {
+      const v = viewport.getBoundingClientRect();
+      geo = {
+        r: canvas.getBoundingClientRect(),
+        right: v.left + viewport.clientLeft + viewport.clientWidth,
+        bottom: v.top + viewport.clientTop + viewport.clientHeight,
+      };
+    }
+    return geo;
+  }
+
   function norm(clientX, clientY) {
-    const r = canvas.getBoundingClientRect();
+    const { r } = geometry();
     if (!r.width || !r.height) return null;
     return [
       Math.round(clamp((clientX - r.left) / r.width, 0, 1) * 65535),
@@ -95,11 +112,9 @@ export function createInput(env) {
 
   // Inside the video and inside the viewport's client area (not on its scrollbars in 1:1 mode).
   function overCanvas(clientX, clientY) {
-    const r = canvas.getBoundingClientRect();
-    const v = viewport.getBoundingClientRect();
+    const { r, right, bottom } = geometry();
     return clientX >= r.left && clientX < r.right && clientY >= r.top && clientY < r.bottom
-      && clientX < v.left + viewport.clientLeft + viewport.clientWidth
-      && clientY < v.top + viewport.clientTop + viewport.clientHeight;
+      && clientX < right && clientY < bottom;
   }
 
   // Clamped like norm(): a cursor position from before the screen shrank must not wrap around.
@@ -699,7 +714,7 @@ export function createInput(env) {
     localMoveAt = performance.now();
     moveTo(fromVideo(vc));
     env.view.reveal(vc[0], vc[1]);
-    env.onChange();
+    env.onCursor();
   }
 
   function touchDown(e) {
@@ -881,6 +896,8 @@ export function createInput(env) {
     return e.pointerType === 'mouse';
   }
 
+  // Desktop 1:1 mode scrolls the viewport natively, which moves the canvas.
+  viewport.addEventListener('scroll', () => { geo = null; }, { passive: true });
   viewport.addEventListener('pointerdown', (e) => (pointerType(e) ? mouseDown(e) : touchDown(e)));
   viewport.addEventListener('pointermove', (e) => (e.pointerType === 'mouse' ? mouseMove(e) : touchMove(e)));
   viewport.addEventListener('pointerup', (e) => (e.pointerType === 'mouse' ? mouseUp(e) : touchUp(e)));
@@ -972,6 +989,8 @@ export function createInput(env) {
       env.onChange();
     },
     releaseAll,
+    /** The video or viewport moved or changed size: re-read their rects on the next event. */
+    layoutChanged() { geo = null; },
     /** Must run inside a user gesture handler: iOS only opens the keyboard from one. */
     focusKeyboard,
     blurKeyboard() { ta.blur(); },

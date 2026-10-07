@@ -10,7 +10,6 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use crate::flow::FlowConfig;
-use crate::sysres::CpuCapacity;
 use crate::video::encoder::{EncoderSettings, MAX_QP, MIN_CABAC_QP, MIN_QP};
 
 // `tilt [serve] [OPTIONS]`: options may follow `serve` or stand alone, since serve is the default.
@@ -38,28 +37,6 @@ pub enum Profile {
     Baseline,
     /// Baseline on boxes with 2 CPUs or fewer, where CAVLC's lower cost matters most; else High
     Auto,
-}
-
-/// `--cpu-budget`: how much CPU tilt may use before the governor lowers the frame rate.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CpuBudgetArg {
-    /// Half the box's CPUs, at least 0.35 of a core.
-    Auto,
-    /// No governor.
-    Off,
-    /// This many cores.
-    Cores(f32),
-}
-
-/// How capture finds what changed on the screen.
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DamageModeArg {
-    /// Grab only the damaged rectangles, as DAMAGE reports them
-    Delta,
-    /// Grab the damaged region fetched from the server
-    Fetch,
-    /// Grab the whole screen on any damage
-    Full,
 }
 
 /// Server settings. Every flag can also be set through its `TILT_*` environment variable.
@@ -131,69 +108,6 @@ pub struct Config {
     #[arg(long, env = "TILT_TAIL_FRAMES", default_value_t = 30)]
     pub tail_frames: u32,
 
-    /// End the refinement tail early once a tail frame is smaller than this many bytes, 0 = off
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: read by the worker (G1 A1)")
-    )]
-    #[arg(long, env = "TILT_TAIL_STOP_BYTES", default_value_t = 128)]
-    pub tail_stop_bytes: u32,
-
-    /// Quantizer of the refresh frame sent once the screen goes still after motion, 0 = off
-    #[arg(long, env = "TILT_REFRESH_QP", default_value_t = 20, value_parser = qp_or_off)]
-    pub refresh_qp: u8,
-
-    /// Send the refresh frame only when motion was coded above this quantizer
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: read by the worker (G1 A1)")
-    )]
-    #[arg(long, env = "TILT_REFRESH_ABOVE_QP", default_value_t = 23, value_parser = qp_parser())]
-    pub refresh_above_qp: u8,
-
-    /// Let OpenH264's background detection skip blocks it judges unchanged
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "phase 0 stub: read by the encoder settings (G1 A1)"
-        )
-    )]
-    #[arg(long, env = "TILT_BGD", value_parser = BoolishValueParser::new())]
-    pub bgd: bool,
-
-    /// CPU tilt may use before it lowers the frame rate: auto (half the CPUs, at least 0.35),
-    /// off, or a number of cores
-    #[arg(long, env = "TILT_CPU_BUDGET", default_value = "auto", value_parser = cpu_budget_parser)]
-    pub cpu_budget: CpuBudgetArg,
-
-    /// Lowest frame rate the CPU governor may choose (capped at --max-fps)
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: read by the governor (G1 A2)")
-    )]
-    #[arg(long, env = "TILT_MIN_FPS", default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..=60))]
-    pub min_fps: u32,
-
-    /// After input, the next frame is sent at once, whatever the governor's rate, for this long
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "phase 0 stub: read by the worker schedule (G1 A2)"
-        )
-    )]
-    #[arg(long, env = "TILT_INPUT_BOOST_MS", default_value_t = 300)]
-    pub input_boost_ms: u64,
-
-    /// Cap the frame rate at 30 while moving content is coded above this quantizer, 0 = off
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: read by the governor (G1 A6)")
-    )]
-    #[arg(long, env = "TILT_GOV_QP", default_value_t = 38, value_parser = qp_or_off)]
-    pub gov_qp: u8,
-
     /// Let OpenH264's rate control skip frames
     #[arg(long, env = "TILT_RC_FRAME_SKIP", value_parser = BoolishValueParser::new())]
     pub rc_frame_skip: bool,
@@ -213,30 +127,6 @@ pub struct Config {
     /// Safety full-frame compare interval while viewers wait, in ms, 0 = off
     #[arg(long, env = "TILT_POLL_MS", default_value_t = 1000)]
     pub poll_ms: u64,
-
-    /// How capture reads damaged screen areas; full is the fallback
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: read by capture (G2 B1)")
-    )]
-    #[arg(long, env = "TILT_DAMAGE_MODE", value_enum, default_value_t = DamageModeArg::Delta)]
-    pub damage_mode: DamageModeArg,
-
-    /// Check every damage-built frame against a full grab (slow; for tests)
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: read by capture (G2 B1)")
-    )]
-    #[arg(long, env = "TILT_CAPTURE_VERIFY", hide = true, value_parser = BoolishValueParser::new())]
-    pub capture_verify: bool,
-
-    /// Refuse a viewer unless the memory limit leaves room for it plus this many MiB, 0 = off
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: read by admission (G4 D2)")
-    )]
-    #[arg(long, env = "TILT_MEM_RESERVE_MB", default_value_t = 32)]
-    pub mem_reserve_mb: u32,
 }
 
 impl Config {
@@ -288,17 +178,16 @@ impl Config {
         // Checked again when each encoder is created; here it fails at startup, not per viewer.
         // `auto` may resolve to High, so it is held to High's floor.
         let cabac = self.profile != Profile::Baseline;
-        for (flag, qp) in [("--qp-min", self.qp_min), ("--refresh-qp", self.refresh_qp)] {
-            if cabac && qp != 0 && qp < MIN_CABAC_QP {
-                return Err((
-                    ErrorKind::ArgumentConflict,
-                    format!(
-                        "{flag} {qp} is below {MIN_CABAC_QP}, the lowest that is safe with \
-                         --profile high: OpenH264's CABAC writer can overrun its buffer below \
-                         it. Use {flag} {MIN_CABAC_QP} or more, or --profile baseline"
-                    ),
-                ));
-            }
+        let qp = self.qp_min;
+        if cabac && qp < MIN_CABAC_QP {
+            return Err((
+                ErrorKind::ArgumentConflict,
+                format!(
+                    "--qp-min {qp} is below {MIN_CABAC_QP}, the lowest that is safe with \
+                     --profile high: OpenH264's CABAC writer can overrun its buffer below \
+                     it. Use --qp-min {MIN_CABAC_QP} or more, or --profile baseline"
+                ),
+            ));
         }
         if self.min_bitrate_kbps > self.bitrate_kbps || self.bitrate_kbps > self.max_bitrate_kbps {
             return Err((
@@ -319,18 +208,13 @@ impl Config {
         (self.poll_ms > 0).then(|| Duration::from_millis(self.poll_ms))
     }
 
-    /// `--profile`, with `auto` resolved for a box of `cap`: never Auto.
-    pub fn resolved_profile(&self, cap: &CpuCapacity) -> Profile {
+    /// `--profile`, with `auto` resolved for a box of `cpus` CPUs: never Auto.
+    pub fn resolved_profile(&self, cpus: usize) -> Profile {
         match self.profile {
-            Profile::Auto if cap.cpus <= 2.0 => Profile::Baseline,
+            Profile::Auto if cpus <= 2 => Profile::Baseline,
             Profile::Auto => Profile::High,
             p => p,
         }
-    }
-
-    /// Whether `profile` (a resolved one) codes with CABAC.
-    pub fn cabac_for(&self, profile: Profile) -> bool {
-        profile == Profile::High
     }
 
     pub fn flow_config(&self) -> FlowConfig {
@@ -358,7 +242,7 @@ impl Config {
             bitrate_bps,
             min_qp: self.qp_min,
             max_qp: self.qp_max,
-            cabac: self.cabac_for(profile),
+            cabac: profile == Profile::High,
             frame_skip: self.rc_frame_skip,
         }
     }
@@ -373,23 +257,9 @@ fn qp_parser() -> RangedI64ValueParser<u8> {
     RangedI64ValueParser::<u8>::new().range(i64::from(MIN_QP)..=i64::from(MAX_QP))
 }
 
-/// A QP as [`qp_parser`] takes it, or 0 for off.
-fn qp_or_off(s: &str) -> Result<u8, String> {
-    match s.parse::<u8>() {
-        Ok(qp) if qp == 0 || (MIN_QP..=MAX_QP).contains(&qp) => Ok(qp),
-        _ => Err(format!("expected 0 (off) or a QP in {MIN_QP}..={MAX_QP}")),
-    }
-}
-
-fn cpu_budget_parser(s: &str) -> Result<CpuBudgetArg, String> {
-    match s {
-        "auto" => Ok(CpuBudgetArg::Auto),
-        "off" => Ok(CpuBudgetArg::Off),
-        _ => match s.parse::<f32>() {
-            Ok(cores) if cores.is_finite() && cores > 0.0 => Ok(CpuBudgetArg::Cores(cores)),
-            _ => Err("expected auto, off or a number of cores above 0".to_owned()),
-        },
-    }
+/// The CPUs this process may run on (its affinity mask), at least 1.
+pub fn available_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
 }
 
 fn default_display() -> String {
@@ -432,86 +302,23 @@ mod tests {
             (c.max_msg_bytes, c.notsent_lowat, c.poll_ms),
             (65_536, 32_768, 1000)
         );
-        assert_eq!(
-            (c.tail_stop_bytes, c.refresh_qp, c.refresh_above_qp, c.bgd),
-            (128, 20, 23, false)
-        );
-        assert_eq!(
-            (c.cpu_budget, c.min_fps, c.input_boost_ms, c.gov_qp),
-            (CpuBudgetArg::Auto, 15, 300, 38)
-        );
-        assert_eq!(
-            (c.damage_mode, c.capture_verify, c.mem_reserve_mb),
-            (DamageModeArg::Delta, false, 32)
-        );
-    }
-
-    #[test]
-    fn governor_and_capture_flags() {
-        let c = parse(&[
-            "--no-auth",
-            "--cpu-budget",
-            "0.75",
-            "--min-fps",
-            "10",
-            "--input-boost-ms",
-            "0",
-            "--gov-qp",
-            "0",
-            "--refresh-qp",
-            "0",
-            "--refresh-above-qp",
-            "30",
-            "--tail-stop-bytes",
-            "0",
-            "--bgd",
-            "--damage-mode",
-            "full",
-            "--capture-verify",
-            "--mem-reserve-mb",
-            "0",
-        ])
-        .unwrap();
-        assert_eq!(
-            (c.cpu_budget, c.min_fps, c.input_boost_ms, c.gov_qp),
-            (CpuBudgetArg::Cores(0.75), 10, 0, 0)
-        );
-        assert_eq!(
-            (c.refresh_qp, c.refresh_above_qp, c.tail_stop_bytes, c.bgd),
-            (0, 30, 0, true)
-        );
-        assert_eq!(
-            (c.damage_mode, c.capture_verify, c.mem_reserve_mb),
-            (DamageModeArg::Full, true, 0)
-        );
-        let budget = |v: &str| parse(&["--no-auth", "--cpu-budget", v]).map(|c| c.cpu_budget);
-        assert_eq!(budget("off").unwrap(), CpuBudgetArg::Off);
-        assert_eq!(budget("auto").unwrap(), CpuBudgetArg::Auto);
-        assert_eq!(budget("2").unwrap(), CpuBudgetArg::Cores(2.0));
-        for bad in ["0", "-1", "inf", "NaN", "half", ""] {
-            assert!(budget(bad).is_err(), "--cpu-budget {bad:?}");
-        }
-        let mode = |v: &str| parse(&["--no-auth", "--damage-mode", v]).map(|c| c.damage_mode);
-        assert_eq!(mode("fetch").unwrap(), DamageModeArg::Fetch);
-        assert!(mode("all").is_err());
     }
 
     #[test]
     fn auto_profile_picks_cavlc_on_small_boxes() {
-        let cap = |cpus| CpuCapacity {
-            cpus,
-            quota_cpus: None,
-            affinity: 8,
-        };
         let c = parse(&["--no-auth", "--profile", "auto"]).unwrap();
-        assert_eq!(c.resolved_profile(&cap(1.0)), Profile::Baseline);
-        assert_eq!(c.resolved_profile(&cap(2.0)), Profile::Baseline);
-        assert_eq!(c.resolved_profile(&cap(2.5)), Profile::High);
+        assert_eq!(c.resolved_profile(1), Profile::Baseline);
+        assert_eq!(c.resolved_profile(2), Profile::Baseline);
+        assert_eq!(c.resolved_profile(3), Profile::High);
         for p in ["high", "baseline"] {
             let c = parse(&["--no-auth", "--qp-min", "20", "--profile", p]).unwrap();
-            assert_eq!(c.resolved_profile(&cap(1.0)), c.profile, "{p} stays {p}");
+            assert_eq!(c.resolved_profile(1), c.profile, "{p} stays {p}");
         }
-        assert!(c.cabac_for(Profile::High) && !c.cabac_for(Profile::Baseline));
+        assert!(c.encoder_settings(64, 64, 1_000_000, Profile::High).cabac);
+        assert!(
+            !c.encoder_settings(64, 64, 1_000_000, Profile::Baseline)
+                .cabac
+        );
         // Auto may resolve to High, so it is held to High's QP floor.
         assert!(parse(&["--no-auth", "--profile", "auto", "--qp-min", "12"]).is_err());
     }
@@ -553,20 +360,9 @@ mod tests {
             // Below the CABAC floor with the High profile (the default).
             &["--qp-min", "19"],
             &["--qp-min", "12", "--profile", "high"],
-            &["--refresh-qp", "19"],
-            &[
-                "--refresh-qp",
-                "11",
-                "--qp-min",
-                "12",
-                "--profile",
-                "baseline",
-            ],
-            &["--refresh-qp", "52"],
-            &["--gov-qp", "5"],
-            &["--refresh-above-qp", "0"],
-            &["--min-fps", "0"],
-            &["--min-fps", "61"],
+            // Flags of features that were never built are gone.
+            &["--cpu-budget", "1"],
+            &["--tail-stop-bytes", "0"],
             &["--bitrate-kbps", "500"],
             &["--bitrate-kbps", "30000"],
             &["--max-viewers", "0"],

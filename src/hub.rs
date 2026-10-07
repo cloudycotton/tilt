@@ -92,42 +92,14 @@ impl FrameHub {
         }
     }
 
-    /// Wakes the capture thread.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "phase 0 stub: used by event-driven capture (G2 B3)"
-        )
-    )]
+    /// Wakes the capture thread, which blocks while nothing is due (shutdown rings this).
     pub fn wake_capture(&self) {
         let _ = self.wake.try_send(());
     }
 
-    /// True while any session is subscribed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: used by capture (G2 B4)")
-    )]
-    pub fn has_subscribers(&self) -> bool {
-        !self.lock().subscribers.is_empty()
-    }
-
-    /// Drops `latest` if no session is subscribed, so that an idle server holds no frame.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 0 stub: used by capture (G2 B4)")
-    )]
-    pub fn release_latest(&self) {
-        let old = {
-            let mut inner = self.lock();
-            if !inner.subscribers.is_empty() {
-                return;
-            }
-            inner.stale = false;
-            inner.latest.take()
-        };
-        drop(old);
+    /// True while no session is subscribed.
+    pub fn unwatched(&self) -> bool {
+        self.lock().subscribers.is_empty()
     }
 
     /// True when any subscriber waits for a newer frame.
@@ -162,9 +134,8 @@ impl FrameHub {
         self.lock().stale
     }
 
-    /// Replaces `latest` and wakes every waiting subscriber, clearing its flag. Returns the
-    /// published frame.
-    pub fn publish(&self, frame: Frame) -> Arc<Frame> {
+    /// Replaces `latest` and wakes every waiting subscriber, clearing its flag.
+    pub fn publish(&self, frame: Frame) {
         let frame = Arc::new(frame);
         let old = {
             let mut inner = self.lock();
@@ -173,11 +144,10 @@ impl FrameHub {
                 let _ = sub.wake.try_send(());
             }
             inner.stale = false;
-            inner.latest.replace(Arc::clone(&frame))
+            inner.latest.replace(frame)
         };
         // The old frame's buffer goes back to the pool outside the lock.
         drop(old);
-        frame
     }
 
     /// Drops `latest` after a resize: workers then wait for a grab at the new size instead of
@@ -350,22 +320,23 @@ mod tests {
     fn latest_is_released_only_without_subscribers() {
         let (hub, wake) = FrameHub::new();
         let pool = FramePool::new();
-        assert!(!hub.has_subscribers());
         hub.wake_capture();
         assert!(wake.try_recv().is_ok());
-        let published = hub.publish(frame(&pool, 1));
-        assert!(Arc::ptr_eq(&published, &hub.latest().unwrap()));
+        hub.publish(frame(&pool, 1));
         hub.subscribe(1, crossbeam_channel::bounded(1).0);
-        assert!(hub.has_subscribers());
-        hub.release_latest();
+        hub.screen_changed();
         assert_eq!(
             hub.latest().map(|f| f.seq),
             Some(1),
             "a subscriber keeps it"
         );
         hub.unsubscribe(1);
-        hub.release_latest();
-        assert!(hub.latest().is_none() && !hub.has_subscribers());
+        assert!(
+            wake.try_recv().is_ok(),
+            "the last one leaving wakes capture"
+        );
+        hub.screen_changed();
+        assert!(hub.latest().is_none());
     }
 
     #[test]

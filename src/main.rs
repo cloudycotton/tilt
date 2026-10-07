@@ -7,15 +7,12 @@ mod capture;
 mod clock;
 mod config;
 mod control;
-mod events;
 mod flow;
-mod governor;
 mod hub;
 mod input;
 mod protocol;
 mod server;
 mod session;
-mod sysres;
 mod video;
 mod worker;
 mod x11;
@@ -34,7 +31,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::auth::TokenSource;
 use crate::config::Config;
-use crate::governor::Governor;
 use crate::hub::FrameHub;
 use crate::server::{AppParts, AppState};
 use crate::session::Sessions;
@@ -107,13 +103,12 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
     )
     .context("starting screen capture")?;
     let sessions = Sessions::new(cfg.max_viewers);
-    let (cursor, cursor_waker, cursor_thread) = x11::cursor::spawn_cursor_thread(
+    let (cursor, cursor_thread) = x11::cursor::spawn_cursor_thread(
         cfg.display.clone(),
-        sessions.watching_counter(),
+        sessions.viewer_counter(),
         Arc::clone(&shutdown),
     )
     .context("starting cursor tracking")?;
-    let governor = Governor::new(&cfg, sysres::cpu_capacity());
     let (w, h) = hub.screen_size();
     info!(
         bind = %cfg.bind,
@@ -130,9 +125,8 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
         hub,
         input,
         cursor,
-        cursor_waker,
         sessions,
-        governor,
+        cpus: config::available_cpus(),
     });
     let mut threads: Vec<(&'static str, JoinHandle<()>)> = vec![("tilt-cursor", cursor_thread)];
     threads.extend(
@@ -177,6 +171,8 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
     // Sessions are closed and their input released; now the threads, input last so that it
     // can restore autorepeat and unbind spare keycodes.
     shutdown.store(true, Ordering::Relaxed);
+    // Capture sleeps until something is due; this gets it to see the flag.
+    state.hub.wake_capture();
     let deadline = Instant::now() + JOIN_TIMEOUT;
     for (name, handle) in threads {
         join_by(name, handle, deadline);

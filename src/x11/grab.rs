@@ -123,48 +123,84 @@ impl Grabber {
 
     /// Grabs the whole root into `pixels()`.
     pub fn grab(&mut self, conn: &RustConnection) -> Result<(), GrabError> {
-        let len = self.stride * self.height as usize;
+        self.grab_rows(conn, &[(0, self.height)])
+    }
+
+    /// Grabs the full-width row bands `[top, bottom)` of the root into their place in
+    /// `pixels()`; the other rows keep what earlier grabs left there. Every request is sent
+    /// before the first reply is awaited, so several bands cost one round trip.
+    pub fn grab_rows(
+        &mut self,
+        conn: &RustConnection,
+        bands: &[(u32, u32)],
+    ) -> Result<(), GrabError> {
         // Lossless: the size came from GetGeometry's u16 fields.
-        let (width, height) = (self.width as u16, self.height as u16);
+        let width = self.width as u16;
+        let stride = self.stride;
         let send_failed = |e: x11rb::errors::ConnectionError| GrabError::Other(e.into());
+        let in_range = |&(top, bottom): &(u32, u32)| top < bottom && bottom <= self.height;
+        if !bands.iter().all(in_range) {
+            return Err(GrabError::Other(anyhow!(
+                "row bands {bands:?} are not within the screen's {} rows",
+                self.height
+            )));
+        }
         match &mut self.buf {
             Buffer::Shm(segment) => {
-                let reply = conn
-                    .shm_get_image(
-                        self.root,
-                        0,
-                        0,
-                        width,
-                        height,
-                        !0,
-                        ImageFormat::Z_PIXMAP.into(),
-                        segment.id(),
-                        0,
-                    )
-                    .map_err(send_failed)?
-                    .reply()
-                    .map_err(grab_error)?;
-                if reply.size as usize != len {
-                    return Err(GrabError::Other(anyhow!(
-                        "ShmGetImage wrote {} bytes, expected {len}",
-                        reply.size
-                    )));
+                let mut cookies = Vec::with_capacity(bands.len());
+                for &(top, bottom) in bands {
+                    let offset = u32::try_from(top as usize * stride)
+                        .map_err(|_| GrabError::Other(anyhow!("segment offset out of range")))?;
+                    let cookie = conn
+                        .shm_get_image(
+                            self.root,
+                            0,
+                            top as i16,
+                            width,
+                            (bottom - top) as u16,
+                            !0,
+                            ImageFormat::Z_PIXMAP.into(),
+                            segment.id(),
+                            offset,
+                        )
+                        .map_err(send_failed)?;
+                    cookies.push((cookie, (bottom - top) as usize * stride));
+                }
+                for (cookie, len) in cookies {
+                    let reply = cookie.reply().map_err(grab_error)?;
+                    if reply.size as usize != len {
+                        return Err(GrabError::Other(anyhow!(
+                            "ShmGetImage wrote {} bytes, expected {len}",
+                            reply.size
+                        )));
+                    }
                 }
             }
             Buffer::Image(data) => {
-                let reply = conn
-                    .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, width, height, !0)
-                    .map_err(send_failed)?
-                    .reply()
-                    .map_err(grab_error)?;
-                if reply.data.len() < len {
-                    return Err(GrabError::Other(anyhow!(
-                        "GetImage returned {} bytes, expected {len}",
-                        reply.data.len()
-                    )));
+                for &(top, bottom) in bands {
+                    let len = (bottom - top) as usize * stride;
+                    let reply = conn
+                        .get_image(
+                            ImageFormat::Z_PIXMAP,
+                            self.root,
+                            0,
+                            top as i16,
+                            width,
+                            (bottom - top) as u16,
+                            !0,
+                        )
+                        .map_err(send_failed)?
+                        .reply()
+                        .map_err(grab_error)?;
+                    if reply.data.len() < len {
+                        return Err(GrabError::Other(anyhow!(
+                            "GetImage returned {} bytes, expected {len}",
+                            reply.data.len()
+                        )));
+                    }
+                    let at = top as usize * stride;
+                    data[at..at + len].copy_from_slice(&reply.data[..len]);
                 }
-                *data = reply.data;
-                data.truncate(len);
             }
         }
         Ok(())

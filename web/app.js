@@ -1,5 +1,5 @@
 // tilt web client: connection, decoder, renderer, UI, stats and debug hooks (brief 6).
-import { createInput } from './input.js';
+import { createInput, message } from './input.js';
 
 const VIDEO = 0x01;
 const CURSOR_SHAPE = 0x02;
@@ -67,7 +67,6 @@ const ui = {
   type: $('btn-type'),
   scale: $('btn-scale'),
   fullscreen: $('btn-fullscreen'),
-  statsBtn: $('btn-stats'),
   menuBtn: $('btn-menu'),
   strip: $('keys'),
   menu: $('menu'),
@@ -77,6 +76,7 @@ const ui = {
   altRow: $('alt-row'),
   altToggle: $('opt-alt'),
   info: $('menu-info'),
+  statsToggle: $('opt-stats'),
   typer: $('typer'),
   typerForm: $('typer-form'),
   typerText: $('typer-text'),
@@ -240,7 +240,9 @@ let lastPointer = finePointer.matches ? 'mouse' : 'touch';
 let spriteRaf = 0;
 let cssCursor = '';
 
-const view = { mode: opts.scale, s: 1, z: 1, tx: 0, ty: 0, scroll: false };
+// vw, vh: the viewport's client size, re-read by layout() (the ResizeObserver calls it) so that
+// per-event pans and zooms do not force a layout.
+const view = { mode: opts.scale, s: 1, z: 1, tx: 0, ty: 0, scroll: false, vw: 0, vh: 0 };
 
 function context2d() {
   try {
@@ -252,12 +254,6 @@ function context2d() {
 const ctx = context2d();
 
 // ---- sending
-
-function packet(type, len) {
-  const b = new Uint8Array(len);
-  b[0] = type;
-  return [b, new DataView(b.buffer)];
-}
 
 function wsSend(data) {
   const ws = conn.ws;
@@ -515,7 +511,7 @@ function onServerError(m) {
       // The session stays open without video. The server sends this once per size; a KEY frame
       // follows only once the screen has a size that works.
       video.sizeNotice = true;
-      showOverlay('The remote screen cannot be streamed at its current size.', msg, { busy: false });
+      showOverlay('The remote screen cannot be streamed at its current size.', msg);
       break;
     default:
       toast(msg || `Server error: ${code}`);
@@ -523,7 +519,7 @@ function onServerError(m) {
 }
 
 function sendPing(now) {
-  const [b, d] = packet(PING, 5);
+  const [b, d] = message(PING, 5);
   d.setUint32(1, Math.floor(now) >>> 0, true);
   if (wsSend(b) && !conn.pingSentAt) conn.pingSentAt = now;
 }
@@ -818,7 +814,7 @@ function ackThrough(seq) {
   for (const [s, at] of video.pending) {
     if (s > seq) break;
     video.pending.delete(s);
-    const [b, d] = packet(ACK, 7);
+    const [b, d] = message(ACK, 7);
     d.setUint32(1, s, true);
     d.setUint16(5, Math.min(65535, Math.round(now - at)), true);
     wsSend(b);
@@ -1054,7 +1050,7 @@ function updateSprite() {
 // ---- layout: fit or 1:1, plus local pinch zoom as a transform on the stage
 
 function viewportSize() {
-  return [ui.viewport.clientWidth, ui.viewport.clientHeight];
+  return [view.vw, view.vh];
 }
 
 function zoomLimits() {
@@ -1065,6 +1061,9 @@ function zoomLimits() {
 }
 
 function layout() {
+  view.vw = ui.viewport.clientWidth;
+  view.vh = ui.viewport.clientHeight;
+  input.layoutChanged();
   const W = ui.canvas.width;
   const H = ui.canvas.height;
   const [vw, vh] = viewportSize();
@@ -1096,6 +1095,7 @@ function clampPan() {
 
 function applyView() {
   ui.stage.style.transform = view.scroll ? '' : `translate(${view.tx}px, ${view.ty}px) scale(${view.z})`;
+  input.layoutChanged();
   scheduleSprite();
 }
 
@@ -1170,6 +1170,7 @@ const input = createInput({
     renderSticky();
     scheduleSprite();
   },
+  onCursor: scheduleSprite,
   onPointerType(type) {
     lastPointer = type === 'mouse' ? 'mouse' : 'touch';
     applyCursor();
@@ -1217,13 +1218,12 @@ function renderSticky() {
   }
 }
 
-function showOverlay(title, detail = '', { retry = false, askToken = false, busy = !retry } = {}) {
+function showOverlay(title, detail = '', { retry = false, askToken = false } = {}) {
   ui.overlayMsg.textContent = title;
   ui.overlayDetail.textContent = detail;
   ui.overlayDetail.hidden = !detail;
   ui.retry.hidden = !retry;
   ui.tokenForm.hidden = !askToken;
-  ui.overlay.classList.toggle('busy', busy);
   ui.overlay.classList.toggle('solid', !ui.canvas.width);
   ui.overlay.hidden = false;
   showToolbar();
@@ -1291,7 +1291,7 @@ function setMenu(open) {
 
 function setStats(on) {
   ui.stats.hidden = !on;
-  ui.statsBtn.setAttribute('aria-pressed', String(on));
+  ui.statsToggle.checked = on;
   if (on) updateStats(performance.now());
 }
 
@@ -1413,10 +1413,9 @@ function wireUi() {
   ui.fullscreen.addEventListener('click', toggleFullscreen);
   document.addEventListener('fullscreenchange', onFullscreenChange);
   document.addEventListener('webkitfullscreenchange', onFullscreenChange);
-  ui.statsBtn.addEventListener('click', () => {
-    const on = ui.stats.hidden;
-    setStats(on);
-    save('localStorage', 'tilt.stats', on ? '1' : '0');
+  ui.statsToggle.addEventListener('change', () => {
+    setStats(ui.statsToggle.checked);
+    save('localStorage', 'tilt.stats', ui.statsToggle.checked ? '1' : '0');
   });
   ui.menuBtn.addEventListener('click', () => setMenu(ui.menu.hidden));
   document.addEventListener('pointerdown', (e) => {

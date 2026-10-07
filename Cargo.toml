@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mimalloc = { version = "0.1", default-features = false }
 libc = "0.2"
 getrandom = "0.3"
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
 [profile.release]
 opt-level = 3

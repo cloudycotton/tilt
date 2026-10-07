@@ -75,6 +75,27 @@ impl DamageTracker {
         Ok(())
     }
 
+    /// Re-arms the damage like `subtract` and returns the row spans `[top, bottom)` of what was
+    /// damaged since the last subtract, one per rectangle of the region, unsorted and possibly
+    /// overlapping. Costs one round trip.
+    pub fn subtract_rows(&self, conn: &RustConnection) -> anyhow::Result<Vec<(u32, u32)>> {
+        conn.damage_subtract(self.damage, x11rb::NONE, self.region)?;
+        let region = conn
+            .xfixes_fetch_region(self.region)?
+            .reply()
+            .context("XFixesFetchRegion")?;
+        Ok(region
+            .rectangles
+            .iter()
+            .filter(|r| r.width > 0 && r.height > 0)
+            .map(|r| {
+                let top = i32::from(r.y).max(0) as u32;
+                (top, (i32::from(r.y) + i32::from(r.height)).max(0) as u32)
+            })
+            .filter(|(top, bottom)| top < bottom)
+            .collect())
+    }
+
     /// Whether screen-change events were selected.
     pub fn has_randr(&self) -> bool {
         self.randr

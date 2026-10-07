@@ -156,8 +156,8 @@ Server to client:
 - `{"t":"stats","fps":f,"kbps":f,"bitrate_kbps":n,"rtt_ms":f,"min_rtt_ms":f,"queue_ms":f,"enc_ms":f,"inflight":n,"skipped":n,"viewers":n,"gov_fps":n,"qp":f}`:
   sent every 1 s while video is on. `fps`, `kbps` and `enc_ms` cover the last second; `skipped`
   counts captures this session never encoded, over the whole session. `gov_fps` is the frame
-  rate cap in force (`--max-fps` unless the server's CPU governor lowered it); `qp` is the mean
-  quantizer of the last second's frames, 0 when the server does not report it. Older servers
+  rate cap in force (`--max-fps`); `qp` is the mean quantizer of the last second's frames, 0
+  when there were none. Older servers
   send neither.
 - `{"t":"error","code":"auth"|"busy"|"version"|"not_ready"|"forbidden"|"hello_timeout"|"unsupported_size","msg":"…"}`.
   `unsupported_size` means the encoder cannot take the screen's size (smaller than 16×16, or
