@@ -12,7 +12,7 @@
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#0b0c0e">
+<meta name="theme-color" content="#0d0b1a">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <!-- app.js imports these: fetching them now saves two round trips per load. -->
 <link rel="modulepreload" href="input.js">
@@ -21,12 +21,14 @@
 <style>
   :root {
     color-scheme: dark;
-    --bg: #0b0c0e;
-    --panel: #1a1c21;
+    --bg: #0d0b1a;
+    --panel: #1b1830;
     --line: rgba(255, 255, 255, 0.1);
-    --fg: #e8eaef;
-    --muted: #9aa1ad;
-    --accent: #4f8cff;
+    --fg: #ecebf5;
+    --muted: #a19db8;
+    --accent: #a66bff;
+    /* The mascot's colours: sunrise orange through pink to violet. */
+    --brand: linear-gradient(135deg, #ff8a4c, #ff4f8b 55%, #9b5cff);
     --ok: #34c759;
     --wait: #ffb020;
     --bad: #ff453a;
@@ -160,7 +162,7 @@
     gap: 2px;
     padding: 3px;
     border: 1px solid var(--line);
-    border-radius: 10px;
+    border-radius: 14px;
     background: var(--panel);
     overflow-x: auto;
     overscroll-behavior: contain;
@@ -192,7 +194,7 @@
     stroke-linejoin: round;
   }
   #toolbar button[aria-pressed="true"], #toolbar button[aria-expanded="true"] {
-    background: var(--accent);
+    background: var(--brand);
     color: #fff;
   }
   #btn-scale { font-variant-numeric: tabular-nums; min-width: calc(var(--tap) + 6px); }
@@ -216,7 +218,7 @@
   /* Flat panels: a backdrop blur or shadow over the video would be recomposited on every frame. */
   .panel {
     border: 1px solid var(--line);
-    border-radius: 10px;
+    border-radius: 14px;
     background: var(--panel);
   }
 
@@ -246,7 +248,7 @@
     font-weight: 600;
   }
   #keys button[data-state="1"] { box-shadow: inset 0 0 0 2px var(--accent); color: #cfe0ff; }
-  #keys button[data-state="2"] { background: var(--accent); color: #fff; }
+  #keys button[data-state="2"] { background: var(--brand); color: #fff; }
 
   #menu {
     position: fixed;
@@ -261,7 +263,7 @@
   #menu h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .seg { display: flex; gap: 4px; padding: 3px; border-radius: 10px; background: rgba(255, 255, 255, 0.06); }
   .seg button { flex: 1; }
-  .seg button[aria-checked="true"] { background: var(--accent); color: #fff; }
+  .seg button[aria-checked="true"] { background: var(--brand); color: #fff; }
   .check { display: flex; align-items: center; gap: 10px; min-height: var(--tap); cursor: pointer; }
   .check input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
   #menu-info { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
@@ -289,10 +291,10 @@
     resize: vertical;
   }
   .actions { display: flex; justify-content: flex-end; gap: 8px; }
-  .primary { background: var(--accent); color: #fff; font-weight: 600; padding: 0 18px; min-height: 44px; }
+  .primary { background: var(--brand); color: #fff; font-weight: 600; padding: 0 18px; min-height: 44px; border-radius: 10px; }
   .secondary { background: rgba(255, 255, 255, 0.1); padding: 0 16px; min-height: 44px; }
   @media (hover: hover) {
-    .primary:not(:disabled):hover { background: #6a9dff; }
+    .primary:not(:disabled):hover { background: var(--brand); filter: brightness(1.1); }
   }
 
   #stats {
@@ -323,7 +325,10 @@
     background: rgba(0, 0, 0, 0.55);
     touch-action: none;
   }
-  #overlay.solid { background: var(--bg); }
+  #overlay.solid { background: radial-gradient(120% 90% at 50% 0%, #3d2b94, #171236 55%, var(--bg)); }
+  #overlay .logo { width: 72px; height: 72px; animation: bob 2.4s ease-in-out infinite; }
+  #overlay:not(.solid) .logo { display: none; }
+  @keyframes bob { 50% { transform: translateY(-5px) rotate(-3deg); } }
   #overlay .card { width: min(420px, 100%); padding: 20px; display: grid; gap: 12px; justify-items: center; text-align: center; }
   #overlay-msg { margin: 0; font-size: 16px; font-weight: 600; }
   #overlay-detail { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
@@ -366,6 +371,7 @@
 
   @media (prefers-reduced-motion: reduce) {
     #toolbar { transition: none; }
+    #overlay .logo { animation: none; }
   }
 </style>
 </head>
@@ -449,6 +455,7 @@
 
 <div id="overlay" class="solid">
   <div class="card panel">
+    <img class="logo" src="icon.svg" alt="" draggable="false">
     <p id="overlay-msg" role="status">Connecting…</p>
     <p id="overlay-detail" hidden></p>
     <form id="token-form" hidden>

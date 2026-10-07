@@ -1,0 +1,19 @@
+# The shell in the demo's terminal (scripts/demo.sh).
+PS1='\[\e[1;38;2;255;138;76m\]vm\[\e[0m\] \[\e[38;2;166;107;255m\]~\[\e[0m\] \[\e[2m\]›\[\e[0m\] '
+
+# A ribbon in the mascot's colours that sways down the screen.
+wave() {
+  awk 'BEGIN {
+    for (i = 0; i < 52; i++) {
+      line = sprintf("%" int(9 + 8 * sin(i * 0.28)) "s", "")
+      for (j = 0; j < 38; j++) {
+        v = (sin(j * 0.16 + i * 0.22) + 1) / 2
+        if (v < 0.5) { t = v * 2;       r = 255;              g = 138 - 59 * t; b = 76 + 63 * t }
+        else         { t = (v - 0.5) * 2; r = 255 - 100 * t; g = 79 + 13 * t;  b = 139 + 116 * t }
+        line = line sprintf("\033[48;2;%d;%d;%dm ", r, g, b)
+      }
+      print line "\033[0m"
+    }
+  }' | while IFS= read -r l; do printf '%s\n' "$l"; sleep 0.03; done
+}
+clear

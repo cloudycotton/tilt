@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tilt</title>
+<!-- The stage the README demo is filmed on: the real tilt client, in a frame. Opened by
+     record.mjs as showcase.html?src=<tilt url>. -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background:
+      radial-gradient(60% 50% at 15% 0%, rgba(155, 92, 255, 0.28), transparent 70%),
+      radial-gradient(50% 45% at 90% 100%, rgba(255, 138, 76, 0.22), transparent 70%),
+      #0d0b1a;
+    font: 500 17px/1 Inter, "DejaVu Sans", sans-serif;
+    color: #ecebf5;
+  }
+  .frame {
+    padding: 12px;
+    border-radius: 30px;
+    background: linear-gradient(160deg, #d9ccff, #9b8be6 45%, #6a5bc4);
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  }
+  iframe { display: block; width: 1136px; height: 639px; border: 0; border-radius: 19px; background: #000; }
+  .pill {
+    margin-top: -1px;
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 12px 12px 18px;
+    border-radius: 0 0 22px 22px;
+    background: linear-gradient(180deg, #6a5bc4, #5d4fb5);
+  }
+  .live { width: 9px; height: 9px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 0 4px rgba(74, 222, 128, 0.25); }
+  .tag { padding: 8px 14px; border-radius: 14px; background: rgba(255, 255, 255, 0.16); font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .tag img { width: 22px; height: 22px; }
+</style>
+</head>
+<body>
+<div class="frame"><iframe id="tilt" allow="fullscreen; clipboard-read; clipboard-write"></iframe></div>
+<div class="pill">
+  <span class="live"></span><span>You have control</span>
+  <span class="tag"><img src="../../web/icon.svg" alt="">tilt</span>
+</div>
+<script>
+  document.getElementById('tilt').src = new URLSearchParams(location.search).get('src');
+</script>
+</body>
+</html>

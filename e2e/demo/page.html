@@ -2,28 +2,37 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="theme-color" content="#17142b">
 <title>Live from the VM</title>
 <style>
-  body { margin: 0; font: 16px/1.5 "DejaVu Sans", sans-serif; background: #0b1020; color: #e2e8f0; }
-  header { padding: 28px 28px 22px; background: linear-gradient(120deg, #0ea5e9, #6366f1 55%, #c026d3); }
-  h1 { margin: 0; font-size: 30px; letter-spacing: -0.5px; }
-  header p { margin: 4px 0 0; opacity: 0.85; }
-  main { padding: 18px 28px 60px; display: grid; gap: 12px; }
-  .card { padding: 14px 16px; border-radius: 12px; background: #151b33; border: 1px solid #252d52; }
-  .card b { color: #7dd3fc; }
-  .bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, #38bdf8, #a855f7); }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 Inter, "DejaVu Sans", sans-serif; background: #17142b; color: #ecebf5; }
+  header { padding: 26px 26px 18px; display: flex; gap: 14px; align-items: center; }
+  header img { width: 52px; height: 52px; }
+  h1 { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.4px; }
+  h1 span { background: linear-gradient(90deg, #ff8a4c, #ff4f8b 55%, #9b5cff); -webkit-background-clip: text; color: transparent; }
+  header p { margin: 0; color: #a19db8; font-size: 14px; }
+  main { padding: 4px 18px 60px; display: grid; gap: 10px; }
+  .card { padding: 14px 16px; border-radius: 16px; background: #211d3b; border: 1px solid #2e2950; transition: transform .15s, border-color .15s, background .15s; }
+  .card:hover { transform: translateY(-2px); border-color: #ff8a4c; background: #262147; }
+  .card b { font-size: 17px; background: linear-gradient(90deg, #ffb36b, #ff6f91); -webkit-background-clip: text; color: transparent; }
+  .card div { color: #c9c5de; font-size: 14px; }
+  .bar { margin-top: 10px; height: 6px; border-radius: 3px; background: linear-gradient(90deg, #ff8a4c, #ff4f8b, #9b5cff); }
 </style>
 </head>
 <body>
 <header>
-  <h1>Live from the VM</h1>
-  <p>Every pixel here is streamed by tilt.</p>
+  <img src="../../web/icon.svg" alt="">
+  <div>
+    <h1>Live from the <span>VM</span></h1>
+    <p>Every pixel here is streamed by tilt.</p>
+  </div>
 </header>
 <main id="list"></main>
 <script>
   const facts = [
-    ['60 fps', 'H.264 frames from a damage-driven capture'],
-    ['~20 ms', 'from a key press to the pixel on your screen'],
+    ['60 fps', 'H.264, drawn the moment it arrives'],
+    ['~20 ms', 'from a key press to the pixel'],
     ['0.03%', 'of a core while nobody watches'],
     ['1 binary', 'static, no X11 libraries, no VNC'],
     ['WebCodecs', 'hardware decoding in the browser'],
@@ -34,7 +43,7 @@
     for (const [k, v] of facts) {
       const card = document.createElement('div');
       card.className = 'card';
-      card.innerHTML = `<b>${k}</b> &nbsp; ${v}<div class="bar" style="width:${30 + ((i * 7 + k.length * 11) % 70)}%"></div>`;
+      card.innerHTML = `<b>${k}</b><div>${v}</div><div class="bar" style="width:${30 + ((i * 7 + k.length * 11) % 70)}%"></div>`;
       list.append(card);
     }
   }
