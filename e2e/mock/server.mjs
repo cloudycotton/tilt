@@ -26,6 +26,7 @@ const ASSETS = {
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/input.js': ['input.js', 'text/javascript; charset=utf-8'],
   '/keysyms.js': ['keysyms.js', 'text/javascript; charset=utf-8'],
+  '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
 
 const VIDEO = 0x01;

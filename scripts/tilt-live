@@ -1,0 +1,108 @@
+#!/bin/sh
+# tilt-live: runs the latest tilt release (https://github.com/cloudycotton/tilt), downloading or
+# updating it first when a newer one is out, and passes every argument through to it. The sh
+# twin of npm/bin/tilt-live.js, installed by install.sh; needs curl and sha256sum.
+#
+#   TILT_VERSION=0.2.0   run that release instead of the latest
+#   TILT_NO_UPDATE=1     do not look for updates (run the newest one already downloaded)
+#
+# With no --token, --token-file or --no-auth (nor their TILT_* variables), it makes a token,
+# keeps it in ~/.config/tilt-live/token and prints the link to open.
+set -u
+releases=${TILT_RELEASES:-https://github.com/cloudycotton/tilt/releases}
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/tilt-live
+config=${XDG_CONFIG_HOME:-$HOME/.config}/tilt-live
+say() { echo "tilt-live: $*" >&2; }
+
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64 | Linux/amd64) triple=x86_64-unknown-linux-musl ;;
+  Linux/aarch64 | Linux/arm64) triple=aarch64-unknown-linux-musl ;;
+  *) say "tilt runs on Linux, on x86_64 or arm64"; exit 1 ;;
+esac
+
+# Downloaded versions, newest first.
+cached() {
+  for d in "$cache"/*/; do
+    v=$(basename "$d")
+    case "$v" in *[!0-9.]*) continue ;; esac
+    [ -x "$d/tilt" ] && echo "$v"
+  done 2>/dev/null | sort -t. -k1,1nr -k2,2nr -k3,3nr
+}
+
+# The newest release's version, from the redirect of /releases/latest.
+latest() {
+  curl -fsS -o /dev/null --max-time 2 -w '%{redirect_url}' "$releases/latest" 2>/dev/null |
+    sed -n 's#.*/tag/v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p'
+}
+
+download() {
+  tmp=$(mktemp -d) || return 1
+  if curl -fsSL --max-time 120 -o "$tmp/tilt" "$releases/download/v$1/tilt-$triple" &&
+    curl -fsSL --max-time 30 -o "$tmp/sums" "$releases/download/v$1/SHA256SUMS"; then
+    want=$(awk -v n="tilt-$triple" '$2 == n { print $1 }' "$tmp/sums")
+    got=$(sha256sum "$tmp/tilt" | cut -d' ' -f1)
+    if [ -n "$want" ] && [ "$want" = "$got" ]; then
+      mkdir -p "$cache/$1" && chmod 755 "$tmp/tilt" && mv "$tmp/tilt" "$cache/$1/tilt"
+      rm -rf "$tmp"
+      cached | tail -n +3 | while read -r old; do rm -rf "${cache:?}/$old"; done
+      return 0
+    fi
+    error="checksum mismatch"
+  else
+    error="cannot fetch release v$1"
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+
+have=$(cached | head -n 1)
+version=${TILT_VERSION:-}
+[ -n "$version" ] || [ -n "${TILT_NO_UPDATE:-}" ] || version=$(latest)
+[ -n "$version" ] || version=$have
+[ -n "$version" ] || { say "cannot find the latest tilt release (check the network, or set TILT_VERSION)"; exit 1; }
+if [ ! -x "$cache/$version/tilt" ]; then
+  say "downloading tilt $version..."
+  error=""
+  if ! download "$version"; then
+    [ -n "$have" ] || { say "download failed: $error"; exit 1; }
+    say "download failed ($error); running $have"
+    version=$have
+  fi
+fi
+
+# Access control: a kept token unless the caller chose one, and the link to open.
+given=""
+bind=${TILT_BIND:-0.0.0.0:6090}
+prev=""
+for a in "$@"; do
+  case "$a" in
+    --token | --token=* | --token-file | --token-file=* | --no-auth | --no-auth=* | -h | --help | -V | --version) given=1 ;;
+    --bind=*) bind=${a#--bind=} ;;
+  esac
+  [ "$prev" = --bind ] && bind=$a
+  prev=$a
+done
+[ -n "${TILT_TOKEN:-}${TILT_TOKEN_FILE:-}${TILT_NO_AUTH:-}" ] && given=1
+if [ -z "$given" ]; then
+  file=$config/token
+  token=$(cat "$file" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$token" ]; then
+    token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    (umask 077 && mkdir -p "$config" && echo "$token" >"$file")
+  fi
+  host=${bind%:*}
+  port=${bind##*:}
+  if [ "$host" = 0.0.0.0 ] || [ "$host" = "[::]" ]; then
+    hosts="localhost $(hostname -I 2>/dev/null)"
+  else
+    hosts=$host
+  fi
+  sep="open"
+  for h in $hosts; do
+    case "$h" in *:*) [ "$h" = "${h#[}" ] && continue ;; esac
+    say "$sep http://$h:$port/#token=$token"
+    sep="  or"
+  done
+  set -- "$@" --token-file "$file"
+fi
+exec "$cache/$version/tilt" "$@"

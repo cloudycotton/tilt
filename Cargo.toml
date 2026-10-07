@@ -7,6 +7,8 @@ name = "tilt"
 version = "0.1.0"
 edition = "2021"
 description = "Stream a Linux X11 desktop to a browser over WebSocket + WebCodecs H.264, with remote control"
+license = "MIT"
+repository = "https://github.com/cloudycotton/tilt"
 publish = false
 
 [dependencies]

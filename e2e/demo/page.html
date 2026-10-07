@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live from the VM</title>
+<style>
+  body { margin: 0; font: 16px/1.5 "DejaVu Sans", sans-serif; background: #0b1020; color: #e2e8f0; }
+  header { padding: 28px 28px 22px; background: linear-gradient(120deg, #0ea5e9, #6366f1 55%, #c026d3); }
+  h1 { margin: 0; font-size: 30px; letter-spacing: -0.5px; }
+  header p { margin: 4px 0 0; opacity: 0.85; }
+  main { padding: 18px 28px 60px; display: grid; gap: 12px; }
+  .card { padding: 14px 16px; border-radius: 12px; background: #151b33; border: 1px solid #252d52; }
+  .card b { color: #7dd3fc; }
+  .bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, #38bdf8, #a855f7); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Live from the VM</h1>
+  <p>Every pixel here is streamed by tilt.</p>
+</header>
+<main id="list"></main>
+<script>
+  const facts = [
+    ['60 fps', 'H.264 frames from a damage-driven capture'],
+    ['~20 ms', 'from a key press to the pixel on your screen'],
+    ['0.03%', 'of a core while nobody watches'],
+    ['1 binary', 'static, no X11 libraries, no VNC'],
+    ['WebCodecs', 'hardware decoding in the browser'],
+    ['Any proxy', 'one HTTP/1.1 port, path prefixes welcome'],
+  ];
+  const list = document.getElementById('list');
+  for (let i = 0; i < 4; i++) {
+    for (const [k, v] of facts) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `<b>${k}</b> &nbsp; ${v}<div class="bar" style="width:${30 + ((i * 7 + k.length * 11) % 70)}%"></div>`;
+      list.append(card);
+    }
+  }
+</script>
+</body>
+</html>

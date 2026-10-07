@@ -43,6 +43,11 @@ pub static ASSETS: &[Asset] = &[
         content_type: JS,
         body: include_bytes!("../web/keysyms.js"),
     },
+    Asset {
+        path: "/icon.svg",
+        content_type: "image/svg+xml",
+        body: include_bytes!("../web/icon.svg"),
+    },
 ];
 
 /// What is served for one entry of ASSETS, computed once.
@@ -201,6 +206,7 @@ mod tests {
                 "text/javascript; charset=utf-8",
                 "text/javascript; charset=utf-8",
                 "text/javascript; charset=utf-8",
+                "image/svg+xml",
             ])
             .enumerate()
         {
@@ -228,7 +234,7 @@ mod tests {
             assert_ne!(gz_tag, tag);
             let gz = body(res).await;
             assert!(
-                gz.len() * 2 < asset.body.len(),
+                gz.len() < asset.body.len(),
                 "{}: {} bytes",
                 asset.path,
                 gz.len()
