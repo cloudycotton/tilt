@@ -26,7 +26,7 @@
     --line: rgba(255, 255, 255, 0.1);
     --fg: #e8eaef;
     --muted: #9aa1ad;
-    --accent: #4f8cff;
+    --accent: #7c5cff;
     --ok: #34c759;
     --wait: #ffb020;
     --bad: #ff453a;
@@ -245,7 +245,7 @@
     background: rgba(255, 255, 255, 0.08);
     font-weight: 600;
   }
-  #keys button[data-state="1"] { box-shadow: inset 0 0 0 2px var(--accent); color: #cfe0ff; }
+  #keys button[data-state="1"] { box-shadow: inset 0 0 0 2px var(--accent); color: #e2dbff; }
   #keys button[data-state="2"] { background: var(--accent); color: #fff; }
 
   #menu {
@@ -292,7 +292,7 @@
   .primary { background: var(--accent); color: #fff; font-weight: 600; padding: 0 18px; min-height: 44px; }
   .secondary { background: rgba(255, 255, 255, 0.1); padding: 0 16px; min-height: 44px; }
   @media (hover: hover) {
-    .primary:not(:disabled):hover { background: #6a9dff; }
+    .primary:not(:disabled):hover { background: #9277ff; }
   }
 
   #stats {
@@ -325,6 +325,7 @@
   }
   #overlay.solid { background: var(--bg); }
   #overlay .card { width: min(420px, 100%); padding: 20px; display: grid; gap: 12px; justify-items: center; text-align: center; }
+  #overlay-logo { width: 56px; height: 56px; }
   #overlay-msg { margin: 0; font-size: 16px; font-weight: 600; }
   #overlay-detail { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
   #token-form { width: 100%; display: flex; gap: 8px; }
@@ -449,6 +450,7 @@
 
 <div id="overlay" class="solid">
   <div class="card panel">
+    <img id="overlay-logo" src="icon.svg" alt="">
     <p id="overlay-msg" role="status">Connecting…</p>
     <p id="overlay-detail" hidden></p>
     <form id="token-form" hidden>

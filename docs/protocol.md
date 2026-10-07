@@ -3,6 +3,11 @@
 This is the contract between the tilt server and any client: the bundled web page, a native
 WebView or a test probe. The server's implementation is `src/protocol.rs` and `src/session.rs`.
 
+**In short:** open a WebSocket at `stream` next to the page, send
+`{"t":"hello","v":1,"token":"…"}`, then receive H.264 frames (decode them with WebCodecs) and
+send ACKs, a PING every second, and mouse and key events back. The rest of this page is the
+exact contract.
+
 All binary integers are little-endian. Every WebSocket message is either:
 - binary: the first byte is the message type;
 - text: a JSON object with a string field `t`.

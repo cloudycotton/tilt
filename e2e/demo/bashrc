@@ -1,0 +1,20 @@
+# The demo terminal's shell: a short prompt, and `wave`, which fills the terminal with a
+# moving colour gradient so the recording shows a busy screen streaming at full speed.
+PS1='\[\e[38;2;236;95;180m\]dot@vm\[\e[0m\] \[\e[38;2;139;160;255m\]~\[\e[0m\] \[\e[38;2;255;138;76m\]❯\[\e[0m\] '
+PROMPT_COMMAND='printf "\e]0;Terminal\a"'
+cd ~ 2>/dev/null
+
+wave() {
+  # Peach, coral, pink, violet, indigo and back to peach, flowing diagonally.
+  local -a R=(255 255 236 167 99 255) G=(210 125 95 91 102 210) B=(122 110 180 255 241 122)
+  local cols=$(( ${COLUMNS:-66} - 1 )) n x p i t line
+  for n in $(seq 0 44); do
+    line=
+    for ((x = 0; x < cols; x++)); do
+      p=$(( (x * 5 + n * 9) % 500 )) i=$(( p / 100 )) t=$(( p % 100 ))
+      line+="\e[48;2;$(( R[i] + (R[i+1] - R[i]) * t / 100 ));$(( G[i] + (G[i+1] - G[i]) * t / 100 ));$(( B[i] + (B[i+1] - B[i]) * t / 100 ))m "
+    done
+    printf "${line}\e[0m\n"
+    sleep 0.03
+  done
+}

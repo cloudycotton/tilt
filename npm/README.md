@@ -1,13 +1,14 @@
 # tilt-live
 
-Extremely fast live view and control of any Linux desktop, right in your browser.
+See and control any Linux desktop, right in your browser.
 
 ```sh
-npx tilt-live                 # streams $DISPLAY (or :0) on port 6090 and prints the link to open
-npx tilt-live --display :1    # every flag goes to tilt
+npx tilt-live
 ```
 
-Each start runs the latest [tilt](https://github.com/cloudycotton/tilt) release, downloading it
-(checksum-verified) when a newer one is out. `TILT_VERSION=0.2.0` pins a release and
-`TILT_NO_UPDATE=1` skips the check. Without `--token`, `--token-file` or `--no-auth`, a token is
-kept in `~/.config/tilt-live/token`. Linux on x86_64 or arm64, Node 18+. MIT licensed.
+Open the link it prints, click the cursor button, and the desktop is yours.
+
+- `npx tilt-live --display :1`: every flag goes to [tilt](https://github.com/cloudycotton/tilt/blob/main/docs/guide.md#flags).
+- Always runs the latest release (checksum-verified). Pin one with `TILT_VERSION=0.2.0`, skip the check with `TILT_NO_UPDATE=1`.
+- Keeps its token in `~/.config/tilt-live/token` unless you pass `--token`, `--token-file` or `--no-auth`.
+- Linux on x86_64 or arm64, Node 18+. MIT licensed.

@@ -1,56 +1,82 @@
-// Records the README demo: a viewer controlling the desktop scripts/demo.sh sets up (an xterm
-// and a browser window under xfwm4), through tilt, in Chrome.
-//   node e2e/demo/record.mjs <tilt url with #token=...> <output.webm>
-import fs from 'node:fs';
-import path from 'node:path';
-import { chromium } from '@playwright/test';
+// Plays the README demo on the viewer's display with xdotool: real pointer moves along eased
+// curves, real key presses, so the recorded cursor glides and the remote desktop answers live.
+//   DISPLAY=<viewer display> node e2e/demo/record.mjs <left> <top>
+// <left> <top> is where the remote screen's top-left pixel is on the viewer's display.
+import { spawnSync } from 'node:child_process';
 
-const [url, out] = process.argv.slice(2);
-const size = { width: 1280, height: 720 };
-const dir = fs.mkdtempSync(path.join(path.dirname(path.resolve(out)), 'video-'));
+const [ox, oy] = process.argv.slice(2).map(Number);
+const FPS = 60;
+let at = [ox + 640, oy + 420];
 
-const browser = await chromium.launch({ channel: 'chrome' });
-const context = await browser.newContext({ viewport: size, recordVideo: { dir, size } });
-const page = await context.newPage();
-const pause = (ms) => page.waitForTimeout(ms);
+const xdo = (...args) => {
+  const r = spawnSync('xdotool', args.map(String), { stdio: 'inherit' });
+  if (r.status !== 0) throw new Error(`xdotool ${args.join(' ')} failed`);
+};
+const pause = (ms) => xdo('sleep', ms / 1000);
+const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
 
-await page.goto(url);
-await page.waitForFunction(() => window.tilt?.stats.control && window.tilt.stats.framesDrawn > 0);
-await pause(1200);
-
-// The terminal: type, and watch it answer at once.
-await page.mouse.click(300, 300);
-for (const line of ['echo "hello from a remote VM"', 'uname -srm', 'for i in $(seq 40); do echo "frame $i  $(date +%T.%N)"; sleep 0.04; done']) {
-  await page.keyboard.type(line, { delay: 35 });
-  await page.keyboard.press('Enter');
-  await pause(500);
+/** Glides to remote (x, y) on a gentle arc, easing in and out. */
+function glide(x, y, ms = 700, { bow = 0.12 } = {}) {
+  const [x0, y0] = at;
+  const [x1, y1] = [ox + x, oy + y];
+  // A control point off the straight line bends the path, as a hand does.
+  const cx = (x0 + x1) / 2 - (y1 - y0) * bow;
+  const cy = (y0 + y1) / 2 + (x1 - x0) * bow;
+  const steps = Math.max(2, Math.round((ms / 1000) * FPS));
+  const args = [];
+  for (let i = 1; i <= steps; i++) {
+    const t = ease(i / steps);
+    const px = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t * t * x1;
+    const py = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t * t * y1;
+    args.push('mousemove', Math.round(px), Math.round(py), 'sleep', (1 / FPS).toFixed(4));
+  }
+  xdo(...args);
+  at = [x1, y1];
 }
-await pause(1500);
+const click = () => xdo('click', 1);
+const type = (text, delay = 55) => xdo('type', '--delay', delay, '--', text);
+const enter = () => xdo('key', 'Return');
+const wheel = (dir, n, ms) => {
+  const args = [];
+  for (let i = 0; i < n; i++) args.push('click', dir > 0 ? 5 : 4, 'sleep', (ms / 1000).toFixed(3));
+  xdo(...args);
+};
 
-// Drag the terminal by its title bar.
-await page.mouse.move(250, 54);
-await page.mouse.down();
-for (let i = 1; i <= 40; i++) {
-  await page.mouse.move(250 + i * 6, 54 + i * 3);
-  await pause(16);
-}
-await page.mouse.up();
-await pause(600);
+// The remote desktop (scripts/demo.sh): a terminal at the top left, Chrome on the right.
+pause(900);
 
-// Scroll the browser window.
-await page.mouse.move(950, 430);
-for (let i = 0; i < 24; i++) {
-  await page.mouse.wheel(0, 60);
-  await pause(40);
-}
-for (let i = 0; i < 24; i++) {
-  await page.mouse.wheel(0, -60);
-  await pause(40);
-}
-await pause(1200);
+// 1. Terminal: click in, type, and watch it answer at once.
+glide(330, 300, 900);
+click();
+pause(300);
+type('echo "hello from a Linux VM"');
+enter();
+pause(450);
+type('uname -sm');
+enter();
+pause(450);
+type('wave');
+enter();
+pause(2300);
 
-await context.close();
-await browser.close();
-const [video] = fs.readdirSync(dir);
-fs.renameSync(path.join(dir, video), out);
-fs.rmdirSync(dir);
+// 2. Drag the terminal by its title bar.
+glide(300, 88, 600, { bow: -0.1 });
+xdo('mousedown', 1);
+pause(120);
+glide(420, 200, 1100, { bow: 0.15 });
+pause(80);
+xdo('mouseup', 1);
+pause(500);
+
+// 3. Over to Chrome: bring it forward and scroll the page.
+glide(1000, 560, 900);
+click();
+pause(250);
+wheel(1, 14, 70);
+pause(500);
+wheel(-1, 14, 70);
+pause(400);
+
+// 4. Settle on the clock.
+glide(980, 380, 800);
+pause(1400);
