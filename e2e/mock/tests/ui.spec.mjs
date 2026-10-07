@@ -64,7 +64,8 @@ test.describe('in an 800x600 window', () => {
     const id = await controlling(page);
     expect(await canvasRect(page)).toEqual({ left: 0, top: 75, width: 800, height: 450 });
     const dpr = await page.evaluate(() => window.devicePixelRatio);
-    const scale = page.getByRole('button', { name: 'Scale' });
+    // It lives in the settings menu: found by id, as roles skip the closed menu.
+    const scale = page.locator('#btn-scale');
     await expect(scale).toHaveText('Fit');
     await clickMenu(page, scale);
     await expect(scale).toHaveText('1:1');
@@ -140,7 +141,7 @@ test('scale=1 starts in 1:1 mode', async ({ page, mock }) => {
   await waitDrawn(page, 1);
   const dpr = await page.evaluate(() => window.devicePixelRatio);
   expect((await canvasRect(page)).width).toBeCloseTo(1280 / dpr, 3);
-  await expect(page.getByRole('button', { name: 'Scale' })).toHaveText('1:1');
+  await expect(page.locator('#btn-scale')).toHaveText('1:1');
 });
 
 test('Type text sends the dialog contents as TEXT', async ({ page, mock }) => {

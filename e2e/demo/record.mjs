@@ -55,7 +55,7 @@ pause(450);
 type('uname -sm');
 enter();
 pause(450);
-type('top -bn1 | head -24');
+type('ls /usr/share');
 enter();
 pause(1600);
 
