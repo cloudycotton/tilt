@@ -1,0 +1,4 @@
+# The demo terminal's shell: a short, quiet prompt.
+PS1='\[\e[2m\]dot@vm\[\e[0m\] ~ \[\e[1m\]$\[\e[0m\] '
+PROMPT_COMMAND='printf "\e]0;Terminal\a"'
+cd ~ 2>/dev/null

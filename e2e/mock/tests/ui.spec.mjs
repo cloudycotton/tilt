@@ -1,7 +1,7 @@
 import { solidCursor } from '../server.mjs';
 import {
-  canvasRect, clickToolbar, collect, controlling, expect, from, inputLog, isApple, keyEvents, keyLog, norm, open,
-  tapToolbar, test, waitDrawn,
+  canvasRect, clickMenu, clickToolbar, collect, controlling, expect, from, inputLog, isApple, keyEvents, keyLog, norm, open,
+  tapMenu, test, waitDrawn,
 } from './fixtures.mjs';
 
 test('shows the unsupported panel without WebCodecs', async ({ page, mock }) => {
@@ -64,9 +64,10 @@ test.describe('in an 800x600 window', () => {
     const id = await controlling(page);
     expect(await canvasRect(page)).toEqual({ left: 0, top: 75, width: 800, height: 450 });
     const dpr = await page.evaluate(() => window.devicePixelRatio);
-    const scale = page.getByRole('button', { name: 'Scale' });
+    // It lives in the settings menu: found by id, as roles skip the closed menu.
+    const scale = page.locator('#btn-scale');
     await expect(scale).toHaveText('Fit');
-    await clickToolbar(page, scale);
+    await clickMenu(page, scale);
     await expect(scale).toHaveText('1:1');
     const r = await canvasRect(page);
     expect(r.width).toBeCloseTo(1280 / dpr, 3);
@@ -84,7 +85,7 @@ test.describe('in an 800x600 window', () => {
       expect(Math.abs(down.px - 600)).toBeLessThanOrEqual(1);
       expect(Math.abs(down.py - 400)).toBeLessThanOrEqual(1);
     }
-    await clickToolbar(page, scale);
+    await clickMenu(page, scale);
     await expect(scale).toHaveText('Fit');
     expect(await canvasRect(page)).toEqual({ left: 0, top: 75, width: 800, height: 450 });
   });
@@ -140,13 +141,13 @@ test('scale=1 starts in 1:1 mode', async ({ page, mock }) => {
   await waitDrawn(page, 1);
   const dpr = await page.evaluate(() => window.devicePixelRatio);
   expect((await canvasRect(page)).width).toBeCloseTo(1280 / dpr, 3);
-  await expect(page.getByRole('button', { name: 'Scale' })).toHaveText('1:1');
+  await expect(page.locator('#btn-scale')).toHaveText('1:1');
 });
 
 test('Type text sends the dialog contents as TEXT', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickToolbar(page, page.getByRole('button', { name: 'Type text' }));
+  await clickMenu(page, page.getByRole('button', { name: 'Type text' }));
   await expect(page.locator('#typer')).toBeVisible();
   await page.fill('#typer-text', 'echo "hi"\nls -la');
   const since = mock.messages.length;
@@ -161,7 +162,7 @@ test('Type text sends the dialog contents as TEXT', async ({ page, mock }) => {
 test('long text goes out in TEXT messages of at most 4096 UTF-8 bytes, split between characters', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickToolbar(page, page.getByRole('button', { name: 'Type text' }));
+  await clickMenu(page, page.getByRole('button', { name: 'Type text' }));
   // 9801 bytes; the 2-byte 'é' straddles the first 4096-byte boundary.
   const text = `${'x'.repeat(4095)}é${'€'.repeat(1500)}${'😀'.repeat(300)}\nend`;
   await page.fill('#typer-text', text);
@@ -176,7 +177,7 @@ test('long text goes out in TEXT messages of at most 4096 UTF-8 bytes, split bet
 test('extra keys: Esc, arrows with repeat, one-shot and locked Ctrl', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickToolbar(page, page.getByRole('button', { name: 'Keys' }));
+  await clickMenu(page, page.getByRole('button', { name: 'Keys' }));
   const strip = page.locator('#keys');
   await expect(strip).toBeVisible();
 
@@ -222,7 +223,7 @@ test('extra keys: Esc, arrows with repeat, one-shot and locked Ctrl', async ({ p
 test('a held extra key stops when the window loses focus', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickToolbar(page, page.getByRole('button', { name: 'Keys' }));
+  await clickMenu(page, page.getByRole('button', { name: 'Keys' }));
   const box = await page.locator('#keys').getByRole('button', { name: 'Esc' }).boundingBox();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.down();
@@ -244,7 +245,7 @@ test('a held extra key stops when the window loses focus', async ({ page, mock }
 test('extra-key modifiers are let go for typed text', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickToolbar(page, page.getByRole('button', { name: 'Keys' }));
+  await clickMenu(page, page.getByRole('button', { name: 'Keys' }));
   const ctrl = page.locator('#keys').getByRole('button', { name: 'Ctrl' });
   // One-shot Ctrl, then a soft keyboard commits a whole word: text, not Ctrl+c Ctrl+v.
   let since = mock.messages.length;
@@ -261,7 +262,7 @@ test('extra-key modifiers are let go for typed text', async ({ page, mock }) => 
   await ctrl.click();
   await ctrl.click();
   await expect(ctrl).toHaveAttribute('data-state', '2');
-  await clickToolbar(page, page.getByRole('button', { name: 'Type text' }));
+  await clickMenu(page, page.getByRole('button', { name: 'Type text' }));
   await page.fill('#typer-text', 'hello');
   await page.click('#typer-send');
   expect(inputLog(await collect(mock, id, ['KEY', 'TEXT'], since, 4))).toEqual(['down ffe3', 'up ffe3', 'TEXT hello', 'down ffe3']);
@@ -329,7 +330,7 @@ test.describe('on a narrow touch phone', () => {
   test('fits every toolbar button and extra key on screen, above which the video sits', async ({ page, mock }) => {
     await open(page, mock, 'token=devtoken&control=1');
     await controlling(page);
-    await tapToolbar(page, page.getByRole('button', { name: 'Keys' }));
+    await tapMenu(page, page.getByRole('button', { name: 'Keys' }));
     await expect(page.locator('#keys')).toBeVisible();
     // The remote screen gives way to the strip (a frame after the strip appears).
     await expect.poll(() => page.evaluate(() => document.getElementById('viewport').getBoundingClientRect().bottom
@@ -349,7 +350,7 @@ test.describe('on a narrow touch phone', () => {
     });
     expect(m.pageScroll).toBeLessThanOrEqual(m.width);
     expect(m.barOverflow).toBe(0);
-    expect(m.buttons.map((b) => b.name)).toEqual(expect.arrayContaining(['Control', 'Keyboard', 'Keys', 'Type text', 'Scale', 'Settings']));
+    expect(m.buttons.map((b) => b.name)).toEqual(expect.arrayContaining(['Control', 'Keyboard', 'Settings']));
     for (const b of m.buttons) {
       expect(b.left, b.name).toBeGreaterThanOrEqual(0);
       expect(b.right, b.name).toBeLessThanOrEqual(m.width);

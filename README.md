@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="web/icon.svg" width="112" alt="tilt icon">
+  <img src="web/icon.svg" width="120" alt="tilt">
 </p>
 <h1 align="center">tilt</h1>
 <p align="center">
-  <b>Extremely fast live view and control of any Linux desktop, right in your browser.</b><br>
-  60 fps · ~20 ms from key press to pixel · one static Rust binary
+  <b>See and control any Linux desktop, right in your browser.</b><br>
+  Fast. Tiny. One command.
 </p>
 <p align="center">
   <a href="https://github.com/cloudycotton/tilt/releases/latest"><img src="https://img.shields.io/github/v/release/cloudycotton/tilt?color=6366f1&label=release" alt="latest release"></a>
@@ -12,38 +12,42 @@
   <a href="https://github.com/cloudycotton/tilt/actions/workflows/ci.yml"><img src="https://github.com/cloudycotton/tilt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 <p align="center">
-  <img src="docs/demo.gif" width="860" alt="tilt streaming a Linux desktop to Chrome: typing in a terminal, dragging a window, scrolling a page">
+  <img src="docs/demo.webp" width="860" alt="A Linux desktop streamed by tilt into Chrome: typing in a terminal, dragging a window, scrolling a page"><br>
+  <sub><a href="docs/demo.mp4">Watch it at 60 fps</a></sub>
 </p>
 
-## Run it
+## Try it
 
 ```sh
 npx tilt-live
 ```
 
-or, without Node: `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh`, then `tilt-live`.
+Open the link it prints, click the cursor button, and the desktop is yours.
 
-It prints a link with a fresh access token: open it, press the cursor button, and the desktop is
-yours. Both always run the latest release, updating themselves on start. Flags pass through to
-tilt (`tilt-live --display :1`); the [guide](docs/guide.md) lists them all.
+<sub>No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh` then `tilt-live`.</sub>
 
 ## Why tilt
 
-- **Fast**: damage-driven capture, H.264 decoded by WebCodecs, every frame drawn the moment it arrives.
-- **Light**: ~0.03% of a core and 14 MB while nobody watches; typing costs ~3% of a core.
-- **Anywhere**: one HTTP/1.1 port, happy behind HTTPS gateways and path prefixes (`https://gw/vm1/`).
-- **Complete**: mouse, keyboard, touch, paste-as-typing, view-only links and several viewers.
+- **Fast.** 60 fps, about 20 ms from key press to pixel.
+- **Tiny.** One static binary. Almost no CPU while nobody watches.
+- **Goes anywhere.** One HTTPS port. Happy behind proxies and gateways.
+- **Any device.** Mouse, keyboard, touch, paste, view-only links.
 
-## Docs
+## Next
 
-[Guide](docs/guide.md) · [Remote VM behind a gateway](docs/guide.md#a-remote-linux-vm-behind-a-proxied-url) · [Wire protocol](docs/protocol.md)
+- **Docker, servers, E2B, Sail, flags:** [the guide](docs/guide.md)
+- **Writing your own client:** [the protocol](docs/protocol.md)
 
-## Develop
+<details>
+<summary><b>Develop</b></summary>
 
 ```sh
-cargo test                                   # unit tests; -- --include-ignored with Xvfb
-(cd e2e/mock && npm ci && npx playwright test)
-scripts/demo.sh                              # re-records docs/demo.gif
+cargo test                                      # add -- --include-ignored with Xvfb
+(cd e2e/mock && npm ci && npx playwright test)  # web client
+scripts/demo.sh                                 # re-records docs/demo.webp
 ```
 
-A release is cut on every push to `main` that raises the version in `Cargo.toml`. MIT licensed.
+A release ships on every push to `main` that bumps the version in `Cargo.toml`.
+</details>
+
+MIT licensed.

@@ -1,7 +1,7 @@
 {
   "name": "tilt-live",
   "version": "0.1.0",
-  "description": "Extremely fast live view and control of any Linux desktop, right in your browser (runs the latest tilt release)",
+  "description": "See and control any Linux desktop, right in your browser (runs the latest tilt release)",
   "keywords": [
     "vnc",
     "remote-desktop",

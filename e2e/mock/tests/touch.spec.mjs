@@ -1,7 +1,7 @@
 // Touch gestures, driven by synthetic touch PointerEvents on the viewer (both engines), plus a
 // real touchscreen tap where the browser supports one.
 import {
-  canvasRect, collect, controlling, expect, from, INPUT_TYPES, norm, open, sessionOf, tapToolbar, test, waitDrawn,
+  canvasRect, collect, controlling, expect, from, INPUT_TYPES, norm, open, sessionOf, tapMenu, tapToolbar, test, waitDrawn,
 } from './fixtures.mjs';
 
 /**
@@ -333,7 +333,7 @@ test.describe('on a phone', () => {
     expect((await collect(mock, id, 'TEXT', since, 1))[0].text).toBe('hi');
 
     // Toolbar and extra keys keep the keyboard open.
-    await tapToolbar(page, page.getByRole('button', { name: 'Keys' }));
+    await tapMenu(page, page.getByRole('button', { name: 'Keys' }));
     await expect(page.locator('#keys')).toBeVisible();
     since = mock.messages.length;
     await page.locator('#keys').getByRole('button', { name: 'Esc' }).tap();
@@ -368,8 +368,8 @@ test.describe('on a phone', () => {
     await page.touchscreen.tap(195, 12);
     await expect(page.locator('#toolbar')).not.toHaveClass(/away/);
     // Taps click in order, so a click from the edge tap would come before this one.
-    await tapToolbar(page, page.getByRole('button', { name: 'Scale' }));
-    await expect.poll(() => page.evaluate(() => window.clicked)).toEqual(['btn-scale']);
+    await tapToolbar(page, page.getByRole('button', { name: 'Settings' }));
+    await expect.poll(() => page.evaluate(() => window.clicked)).toEqual(['btn-menu']);
     await expect(page.locator('#typer')).toBeHidden();
     // The soft keyboard stays open.
     expect(await active()).toBe('kbd');

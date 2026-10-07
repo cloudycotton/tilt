@@ -26,7 +26,8 @@
     --line: rgba(255, 255, 255, 0.1);
     --fg: #e8eaef;
     --muted: #9aa1ad;
-    --accent: #4f8cff;
+    --accent: #fff;
+    --on-accent: #0b0c0e;
     --ok: #34c759;
     --wait: #ffb020;
     --bad: #ff453a;
@@ -193,9 +194,8 @@
   }
   #toolbar button[aria-pressed="true"], #toolbar button[aria-expanded="true"] {
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
   }
-  #btn-scale { font-variant-numeric: tabular-nums; min-width: calc(var(--tap) + 6px); }
   #dot {
     flex: none;
     width: 10px;
@@ -245,8 +245,8 @@
     background: rgba(255, 255, 255, 0.08);
     font-weight: 600;
   }
-  #keys button[data-state="1"] { box-shadow: inset 0 0 0 2px var(--accent); color: #cfe0ff; }
-  #keys button[data-state="2"] { background: var(--accent); color: #fff; }
+  #keys button[data-state="1"] { box-shadow: inset 0 0 0 2px var(--accent); }
+  #keys button[data-state="2"] { background: var(--accent); color: var(--on-accent); }
 
   #menu {
     position: fixed;
@@ -258,10 +258,34 @@
     display: grid;
     gap: 12px;
   }
+  #menu .actions-list { display: grid; gap: 2px; }
+  #menu .item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 0 10px;
+    text-align: left;
+  }
+  #menu .item svg {
+    width: 18px;
+    height: 18px;
+    flex: none;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.8;
+  }
+  #menu .item[aria-pressed="true"] { background: rgba(255, 255, 255, 0.1); }
+  #menu .item[aria-pressed="true"]::after { content: "On"; margin-left: auto; color: var(--muted); font-size: 12px; }
+  #menu .scale { justify-content: space-between; padding-right: 3px; cursor: default; }
+  #btn-scale { min-width: 52px; background: rgba(255, 255, 255, 0.08); font-variant-numeric: tabular-nums; }
   #menu h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .seg { display: flex; gap: 4px; padding: 3px; border-radius: 10px; background: rgba(255, 255, 255, 0.06); }
   .seg button { flex: 1; }
-  .seg button[aria-checked="true"] { background: var(--accent); color: #fff; }
+  .seg button[aria-checked="true"] { background: var(--accent); color: var(--on-accent); }
   .check { display: flex; align-items: center; gap: 10px; min-height: var(--tap); cursor: pointer; }
   .check input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
   #menu-info { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
@@ -289,10 +313,10 @@
     resize: vertical;
   }
   .actions { display: flex; justify-content: flex-end; gap: 8px; }
-  .primary { background: var(--accent); color: #fff; font-weight: 600; padding: 0 18px; min-height: 44px; }
+  .primary { background: var(--accent); color: var(--on-accent); font-weight: 600; padding: 0 18px; min-height: 44px; }
   .secondary { background: rgba(255, 255, 255, 0.1); padding: 0 16px; min-height: 44px; }
   @media (hover: hover) {
-    .primary:not(:disabled):hover { background: #6a9dff; }
+    .primary:not(:disabled):hover { background: #e4e5e9; }
   }
 
   #stats {
@@ -389,13 +413,6 @@
   <button id="btn-keyboard" type="button" aria-label="Keyboard" title="Show or hide the on-screen keyboard" hidden disabled>
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7.5 14h9"/></svg>
   </button>
-  <button id="btn-keys" type="button" aria-label="Keys" title="Extra keys: Esc, Tab, Ctrl, Alt, Super, arrows" aria-pressed="false" disabled>
-    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="7" width="8.5" height="10" rx="1.5"/><rect x="13" y="7" width="8.5" height="10" rx="1.5"/></svg>
-  </button>
-  <button id="btn-type" type="button" aria-label="Type text" title="Type text into the remote desktop" disabled>
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V5h16v2M12 5v14M9 19h6"/></svg>
-  </button>
-  <button id="btn-scale" type="button" aria-label="Scale" title="Scaled to fit; switch to 1:1 pixels">Fit</button>
   <button id="btn-fullscreen" type="button" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
   </button>
@@ -421,6 +438,15 @@
 </div>
 
 <div id="menu" class="panel" role="dialog" aria-label="Settings" hidden>
+  <div class="actions-list">
+    <button id="btn-type" type="button" class="item" title="Type text into the remote desktop" disabled>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V5h16v2M12 5v14M9 19h6"/></svg>Type text
+    </button>
+    <button id="btn-keys" type="button" class="item" title="Esc, Tab, Ctrl, Alt, Super, arrows" aria-pressed="false" disabled>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="7" width="8.5" height="10" rx="1.5"/><rect x="13" y="7" width="8.5" height="10" rx="1.5"/></svg>Extra keys
+    </button>
+    <div class="item scale"><span>Scale</span><button id="btn-scale" type="button" aria-label="Scale" title="Scaled to fit; switch to 1:1 pixels">Fit</button></div>
+  </div>
   <div id="touch-row">
     <h2>Touch input</h2>
     <div class="seg" role="radiogroup" aria-label="Touch input">

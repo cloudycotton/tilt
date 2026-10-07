@@ -1418,12 +1418,20 @@ function wireUi() {
     else input.focusKeyboard();
     keyboardWasOpen = false;
   });
+  // Type text, Extra keys and Scale live in the settings menu, which closes once one is picked.
   ui.keys.addEventListener('click', () => {
     ui.strip.hidden = !ui.strip.hidden;
     ui.keys.setAttribute('aria-pressed', String(!ui.strip.hidden));
+    setMenu(false);
   });
-  ui.type.addEventListener('click', openTyper);
-  ui.scale.addEventListener('click', () => setScaleMode(view.mode === 'fit' ? '1' : 'fit'));
+  ui.type.addEventListener('click', () => {
+    setMenu(false);
+    openTyper();
+  });
+  ui.scale.addEventListener('click', () => {
+    setScaleMode(view.mode === 'fit' ? '1' : 'fit');
+    setMenu(false);
+  });
   ui.fullscreen.hidden = !requestFs;
   ui.fullscreen.addEventListener('click', toggleFullscreen);
   document.addEventListener('fullscreenchange', onFullscreenChange);
