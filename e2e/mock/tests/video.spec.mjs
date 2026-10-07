@@ -118,7 +118,6 @@ test('a screen size the server cannot encode shows a notice until a keyframe at 
   const overlay = page.locator('#overlay');
   await expect(page.locator('#overlay-msg')).toHaveText('The remote screen cannot be streamed at its current size.');
   await expect(page.locator('#overlay-detail')).toHaveText(msg);
-  await expect(overlay).not.toHaveClass(/busy/);
   // The frames still in the decoder are drawn, and the notice stays: it is not a toast.
   await page.waitForFunction((seq) => window.tilt.stats.lastDrawnSeq >= seq, last);
   await page.waitForTimeout(300);

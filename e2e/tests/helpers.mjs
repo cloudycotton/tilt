@@ -39,7 +39,8 @@ function installPageHelpers({ colors, marker, maxDistance }) {
 /** Opens the client with the given fragment options and waits for its first drawn frame. */
 export async function openTilt(page, hash) {
   await page.addInitScript(installPageHelpers, { colors: COLORS, marker: MARKER, maxDistance: MAX_MATCH_DISTANCE });
-  await page.goto(`/#${hash}`);
+  // Relative, so that a TILT_URL with a path prefix (a gateway, e2e/proxy.mjs) keeps it.
+  await page.goto(`./#${hash}`);
   try {
     await page.waitForFunction(() => window.tilt?.stats.framesDrawn > 0, null, { timeout: FIRST_FRAME_TIMEOUT_MS });
   } catch {

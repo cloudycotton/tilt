@@ -136,7 +136,7 @@ const TAIL_SETTLE: Duration = Duration::from_millis(100);
 const FLOW_TICK: Duration = Duration::from_millis(100);
 const STATS_EVERY: Duration = Duration::from_secs(1);
 /// Longest sleep with nothing scheduled.
-const IDLE_WAIT: Duration = Duration::from_millis(250);
+const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// After the encoder fails (a frame, or creating one), the next attempt waits a frame interval,
 /// doubling with every further failure in a row up to this.
 const ENCODER_RETRY_MAX: Duration = Duration::from_secs(2);
@@ -275,6 +275,11 @@ impl Schedule {
         self.last_encode = Some(now);
     }
 
+    /// The encoder has nothing left to refine (see Worker::encode). Ends the tail.
+    fn converged(&mut self) {
+        self.tail_left = 0;
+    }
+
     /// Rate control skipped the frame: try again a frame interval later, same frame.
     fn rc_skipped(&mut self, now: Instant) {
         self.last_encode = Some(now);
@@ -367,6 +372,8 @@ struct Worker {
     trouble: EncoderTrouble,
     /// A frame was due but credit was out, since the last encode.
     was_blocked: bool,
+    /// Size and quantizer of the last access unit, to tell when the tail has converged.
+    last_au: Option<(usize, u8)>,
     /// Waiting for capture to replace this stale capture seq, until the instant (see
     /// `fresh_enough`).
     fresh_wait: Option<(u64, Instant)>,
@@ -378,6 +385,7 @@ struct Worker {
     frames: u32,
     bytes: u64,
     encode_us: u64,
+    qp_sum: u64,
     skipped: u64,
 }
 
@@ -415,12 +423,14 @@ impl Worker {
             next_stats: now + STATS_EVERY,
             trouble: EncoderTrouble::default(),
             was_blocked: false,
+            last_au: None,
             fresh_wait: None,
             unsupported: None,
             window_start: now,
             frames: 0,
             bytes: 0,
             encode_us: 0,
+            qp_sum: 0,
             skipped: 0,
         }
     }
@@ -428,9 +438,11 @@ impl Worker {
     fn run(&mut self) {
         loop {
             let now = Instant::now();
-            let mut deadline = (now + IDLE_WAIT)
-                .min(self.next_flow_tick)
-                .min(self.next_stats);
+            let mut deadline = (now + IDLE_WAIT).min(self.next_stats);
+            // A quiet link (a still screen) needs no bitrate control until frames flow again.
+            if !self.flow.quiet() {
+                deadline = deadline.min(self.next_flow_tick);
+            }
             if let Some(t) = self.next_tick {
                 deadline = deadline.min(t);
             }
@@ -476,7 +488,7 @@ impl Worker {
             );
             self.flow.reset(now);
         }
-        if now >= self.next_flow_tick {
+        if now >= self.next_flow_tick && !self.flow.quiet() {
             self.next_flow_tick = now + FLOW_TICK;
             self.retarget(now);
         }
@@ -605,13 +617,23 @@ impl Worker {
                 }
                 let sent = Instant::now();
                 self.flow.on_sent(self.seq, f.data.len(), sent);
+                let tail = frame.seq == self.sched.last_capture_seq;
                 self.sched.encoded(frame.seq, f.keyframe, now, sent);
+                // At the lowest quantizer, new content needs no refinement, and a tail is done
+                // once a re-encode comes out as the one before: what further re-encodes would
+                // add is invisible (encoder::tests::the_tail_stops_only_where_it_adds_nothing).
+                let au = (f.data.len(), f.qp);
+                if f.qp <= self.cfg.qp_min && (!tail || self.last_au == Some(au)) {
+                    self.sched.converged();
+                }
+                self.last_au = Some(au);
                 // Decide again straight away: that asks capture for the next frame (or notes
                 // that credit ran out) instead of waiting for the next event or tick.
                 self.next_tick = Some(sent);
                 self.frames += 1;
                 self.bytes += f.data.len() as u64;
                 self.encode_us += u64::from(f.encode_us);
+                self.qp_sum += u64::from(f.qp);
                 debug!(
                     session = self.sid,
                     seq = self.seq,
@@ -666,7 +688,7 @@ impl Worker {
             return Ok(true);
         }
         self.enc = None;
-        let profile = self.cfg.resolved_profile(&self.state.governor.capacity());
+        let profile = self.cfg.resolved_profile(self.state.cpus);
         let settings = self.cfg.encoder_settings(w, h, self.bitrate, profile);
         match H264Encoder::with_max_bitrate(&settings, self.max_bitrate) {
             Ok(enc) => {
@@ -690,6 +712,7 @@ impl Worker {
                     "encoder ready"
                 );
                 self.enc = Some(enc);
+                self.last_au = None;
                 self.sched.force_idr = true;
                 Ok(true)
             }
@@ -765,11 +788,15 @@ impl Worker {
                 } else {
                     0.0
                 },
+                qp: if self.frames > 0 {
+                    round(self.qp_sum as f32 / self.frames as f32)
+                } else {
+                    0.0
+                },
                 inflight: flow.inflight_frames,
                 skipped: self.skipped,
                 viewers: self.state.sessions.count() as u32,
-                gov_fps: self.state.governor.snapshot().fps_cap,
-                qp: 0.0,
+                gov_fps: self.cfg.max_fps,
             };
             self.send(OutMsg::Text(ServerText::Stats(stats).to_json()))?;
         }
@@ -777,6 +804,7 @@ impl Worker {
         self.frames = 0;
         self.bytes = 0;
         self.encode_us = 0;
+        self.qp_sum = 0;
         Ok(())
     }
 
@@ -1238,6 +1266,52 @@ mod tests {
         w.step().unwrap();
         assert!(sent(&mut rx).0.is_empty(), "no refinement frame yet");
         assert!(w.state.hub.demand(), "capture is asked for the next frame");
+    }
+
+    /// Runs the worker as `run` does, acking every frame at once, until it rests with nothing
+    /// scheduled or `limit` passes; returns the VIDEO it sent.
+    fn run_acking(
+        w: &mut Worker,
+        rx: &mut mpsc::Receiver<OutMsg>,
+        limit: Duration,
+    ) -> Vec<VideoHeader> {
+        let (end, mut all) = (Instant::now() + limit, Vec::new());
+        while Instant::now() < end {
+            w.step().unwrap();
+            for h in sent(rx).0 {
+                assert!(w.inbox.ack(h.seq, 1, Instant::now()));
+                all.push(h);
+            }
+            let pending = w.inbox.take();
+            w.apply(pending);
+            let Some(tick) = w.next_tick else {
+                return all;
+            };
+            std::thread::sleep(tick.saturating_duration_since(Instant::now()).min(50 * MS));
+        }
+        all
+    }
+
+    #[test]
+    fn the_tail_ends_once_the_encoder_has_converged() {
+        let (mut w, mut rx, pool) = worker(&["--tail-frames", "30"]);
+        publish(&w, &pool, 1, SIZE);
+        let frames = run_acking(&mut w, &mut rx, Duration::from_secs(3));
+        // A keyframe, then re-encodes of the still screen only until the quantizer is at its
+        // lowest: a handful at most, not the 30 allowed.
+        assert!(frames[0].flags & FLAG_KEY != 0);
+        assert!(
+            (1..10).contains(&frames.len()),
+            "{} frames: {frames:?}",
+            frames.len()
+        );
+        assert_eq!(w.sched.tail_left, 0);
+        assert_eq!(w.next_tick, None, "resting");
+        // New content brings a new tail, which converges again.
+        publish(&w, &pool, 2, SIZE);
+        let more = run_acking(&mut w, &mut rx, Duration::from_secs(3));
+        assert!((1..10).contains(&more.len()), "{more:?}");
+        assert!(more.iter().all(|h| h.flags & FLAG_KEY == 0));
     }
 
     #[test]

@@ -83,8 +83,8 @@ impl VideoHeader {
     }
 
     /// Splits a VIDEO message into its header and payload; None if it is not a well-formed VIDEO message.
-    /// The reference parser for clients and tests; the server itself never parses VIDEO.
-    #[allow(dead_code)]
+    /// The reference parser for tests; the server itself never parses VIDEO.
+    #[cfg(test)]
     pub fn parse(msg: &[u8]) -> Option<(VideoHeader, &[u8])> {
         if msg.len() < VIDEO_HEADER_LEN || msg[0] != MSG_VIDEO {
             return None;
@@ -166,7 +166,6 @@ pub fn pong_msg(t: u32) -> Bytes {
 
 /// Maps a normalized coordinate (0 = first pixel, 65535 = last) onto `extent` pixels:
 /// `round(v * (extent - 1) / 65535)`. For the input thread, which owns the root size.
-#[allow(dead_code)]
 pub fn denormalize(v: u16, extent: u32) -> u32 {
     let last = u64::from(extent.saturating_sub(1));
     ((u64::from(v) * last + 32_767) / 65_535) as u32
@@ -402,9 +401,9 @@ pub struct Stats {
     pub inflight: u32,
     pub skipped: u64,
     pub viewers: u32,
-    /// The frame rate cap in force: `--max-fps` unless the CPU governor lowered it.
+    /// The frame rate cap in force: `--max-fps`.
     pub gov_fps: u32,
-    /// Mean quantizer of the frames in the window; 0 when none was reported.
+    /// Mean quantizer of the frames in the window; 0 when there were none.
     pub qp: f32,
 }
 

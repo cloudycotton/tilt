@@ -38,15 +38,18 @@ test('stats overlay shows client and server numbers and remembers the toggle', a
   await expect(panel).toContainText(/server +\d+ fps/);
   await expect(panel).toContainText(/viewers 1/);
   await expect(panel).toContainText(/queue \d+/);
-  const stats = page.getByRole('button', { name: 'Stats' });
-  await expect(stats).toHaveAttribute('aria-pressed', 'true');
-  await stats.click();
+  // The switch lives in the settings menu.
+  const stats = page.getByRole('checkbox', { name: 'Stream statistics' });
+  await clickToolbar(page, page.getByRole('button', { name: 'Settings' }));
+  await expect(stats).toBeChecked();
+  await stats.uncheck();
   await expect(panel).toBeHidden();
   // Without stats= in the URL the stored choice applies; the token comes from sessionStorage.
   await page.goto(mock.url);
   await waitDrawn(page, 1);
   await expect(panel).toBeHidden();
-  await stats.click();
+  await clickToolbar(page, page.getByRole('button', { name: 'Settings' }));
+  await stats.check();
   await expect(panel).toBeVisible();
   await page.reload();
   await waitDrawn(page, 1);
@@ -85,6 +88,51 @@ test.describe('in an 800x600 window', () => {
     await expect(scale).toHaveText('Fit');
     expect(await canvasRect(page)).toEqual({ left: 0, top: 75, width: 800, height: 450 });
   });
+});
+
+test('clicks map onto the remote screen after every window resize', async ({ page, mock }) => {
+  // The client keeps the canvas rect between pointer events until the layout changes.
+  await page.setViewportSize({ width: 800, height: 600 });
+  await open(page, mock, 'token=devtoken&control=1');
+  const id = await controlling(page);
+  for (const [w, h] of [[800, 600], [1000, 400], [500, 700], [1280, 720]]) {
+    await page.setViewportSize({ width: w, height: h });
+    // Fitted 16:9, centred: the canvas follows the viewport a frame later.
+    const fit = Math.min(w / 1280, h / 720);
+    await expect.poll(async () => (await canvasRect(page)).width).toBeCloseTo(1280 * fit, 1);
+    const r = await canvasRect(page);
+    // Whole pixels: WebKit rounds synthetic mouse positions.
+    const [x, y] = [Math.round(r.left + r.width * 0.25), Math.round(r.top + r.height * 0.75)];
+    await page.mouse.move(x - 5, y - 5);
+    const since = mock.messages.length;
+    await page.mouse.click(x, y);
+    const [down] = await collect(mock, id, 'BUTTON', since, 2);
+    expect([down.x, down.y], `${w}x${h}`).toEqual(norm(r, x, y));
+  }
+});
+
+test.describe('with no token file yet', () => {
+  test.use({ mockOptions: { tokenFile: '/nonexistent/tilt-token' } });
+
+  test('runs no endless animations, connecting or connected', async ({ page, mock }) => {
+    // An endless CSS animation makes the browser composite every display frame, at 120 Hz on
+    // some screens, for as long as it runs; the page must stay quiet between video frames.
+    const endless = () => page.evaluate(() => document.getAnimations()
+      .filter((a) => a.effect && a.effect.getComputedTiming().iterations === Infinity).length);
+    await open(page, mock, 'token=devtoken');
+    // Retrying a server that is not ready yet: the "Connecting…" state.
+    await expect(page.locator('#overlay')).toBeVisible();
+    await expect(page.locator('#overlay-detail')).toContainText('not ready');
+    expect(await endless()).toBe(0);
+  });
+});
+
+test('runs no endless animations while streaming', async ({ page, mock }) => {
+  await open(page, mock, 'token=devtoken&control=1');
+  await controlling(page);
+  await expect(page.locator('#overlay')).toBeHidden();
+  expect(await page.evaluate(() => document.getAnimations()
+    .filter((a) => a.effect && a.effect.getComputedTiming().iterations === Infinity).length)).toBe(0);
 });
 
 test('scale=1 starts in 1:1 mode', async ({ page, mock }) => {
@@ -301,7 +349,7 @@ test.describe('on a narrow touch phone', () => {
     });
     expect(m.pageScroll).toBeLessThanOrEqual(m.width);
     expect(m.barOverflow).toBe(0);
-    expect(m.buttons.map((b) => b.name)).toEqual(expect.arrayContaining(['Control', 'Keyboard', 'Keys', 'Type text', 'Scale', 'Stats', 'Settings']));
+    expect(m.buttons.map((b) => b.name)).toEqual(expect.arrayContaining(['Control', 'Keyboard', 'Keys', 'Type text', 'Scale', 'Settings']));
     for (const b of m.buttons) {
       expect(b.left, b.name).toBeGreaterThanOrEqual(0);
       expect(b.right, b.name).toBeLessThanOrEqual(m.width);

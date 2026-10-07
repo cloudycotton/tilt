@@ -7,15 +7,12 @@ mod capture;
 mod clock;
 mod config;
 mod control;
-mod events;
 mod flow;
-mod governor;
 mod hub;
 mod input;
 mod protocol;
 mod server;
 mod session;
-mod sysres;
 mod video;
 mod worker;
 mod x11;
@@ -34,7 +31,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::auth::TokenSource;
 use crate::config::Config;
-use crate::governor::Governor;
 use crate::hub::FrameHub;
 use crate::server::{AppParts, AppState};
 use crate::session::Sessions;
@@ -42,6 +38,18 @@ use crate::session::Sessions;
 // musl's allocator serialises on one lock; mimalloc keeps the static binary fast.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+extern "C" {
+    // libmimalloc, linked in by the mimalloc crate.
+    fn mi_collect(force: bool);
+}
+
+/// Hands memory that tilt freed back to the system (mimalloc otherwise keeps it for reuse):
+/// called when the server goes idle, so that it holds next to nothing between viewers.
+pub fn release_memory() {
+    // SAFETY: mi_collect only frees memory mimalloc no longer hands out; it is thread-safe.
+    unsafe { mi_collect(true) };
+}
 
 /// How long shutdown waits for each permanent thread.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -91,6 +99,8 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
         );
     }
     assets::init();
+    // Compressing the assets used some memory that is free again now.
+    release_memory();
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Input first: capture needs its handle for the pull-forward after injected input.
@@ -107,13 +117,12 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
     )
     .context("starting screen capture")?;
     let sessions = Sessions::new(cfg.max_viewers);
-    let (cursor, cursor_waker, cursor_thread) = x11::cursor::spawn_cursor_thread(
+    let (cursor, cursor_thread) = x11::cursor::spawn_cursor_thread(
         cfg.display.clone(),
-        sessions.watching_counter(),
+        sessions.viewer_counter(),
         Arc::clone(&shutdown),
     )
     .context("starting cursor tracking")?;
-    let governor = Governor::new(&cfg, sysres::cpu_capacity());
     let (w, h) = hub.screen_size();
     info!(
         bind = %cfg.bind,
@@ -130,9 +139,8 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
         hub,
         input,
         cursor,
-        cursor_waker,
         sessions,
-        governor,
+        cpus: config::available_cpus(),
     });
     let mut threads: Vec<(&'static str, JoinHandle<()>)> = vec![("tilt-cursor", cursor_thread)];
     threads.extend(
@@ -177,6 +185,8 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
     // Sessions are closed and their input released; now the threads, input last so that it
     // can restore autorepeat and unbind spare keycodes.
     shutdown.store(true, Ordering::Relaxed);
+    // Capture sleeps until something is due; this gets it to see the flag.
+    state.hub.wake_capture();
     let deadline = Instant::now() + JOIN_TIMEOUT;
     for (name, handle) in threads {
         join_by(name, handle, deadline);
@@ -256,7 +266,7 @@ async fn wait_for_stop(
         Ok(s) => s,
         Err(e) => return Stop::Fatal(format!("cannot handle signals: {e}")),
     };
-    let mut check = tokio::time::interval(Duration::from_millis(250));
+    let mut check = tokio::time::interval(Duration::from_secs(1));
     loop {
         #[cfg(unix)]
         tokio::select! {

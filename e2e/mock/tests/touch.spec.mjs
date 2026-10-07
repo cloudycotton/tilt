@@ -356,8 +356,8 @@ test.describe('on a phone', () => {
     await page.touchscreen.tap(195, 12);
     await expect(page.locator('#toolbar')).not.toHaveClass(/away/);
     // Taps click in order, so a click from the edge tap would come before this one.
-    await tapToolbar(page, page.getByRole('button', { name: 'Stats' }));
-    await expect.poll(() => page.evaluate(() => window.clicked)).toEqual(['btn-stats']);
+    await tapToolbar(page, page.getByRole('button', { name: 'Scale' }));
+    await expect.poll(() => page.evaluate(() => window.clicked)).toEqual(['btn-scale']);
     await expect(page.locator('#typer')).toBeHidden();
     // The soft keyboard stays open.
     expect(await active()).toBe('kbd');

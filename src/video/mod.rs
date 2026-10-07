@@ -3,5 +3,5 @@
 pub mod convert;
 pub mod encoder;
 // Only the tests use it: the web client derives the codec string from the SPS itself.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub mod sps;

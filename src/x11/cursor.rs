@@ -4,13 +4,16 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use std::os::fd::AsRawFd;
 use tokio::sync::watch;
-use tracing::error;
+use tracing::{error, warn};
 use x11rb::connection::Connection;
+
 use x11rb::protocol::xfixes::{ConnectionExt as _, CursorNotifyMask, GetCursorImageReply};
+use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{ConnectionExt as _, Window};
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -19,8 +22,21 @@ use super::conn::connect;
 
 /// Browsers ignore CSS cursor images larger than this.
 const MAX_SIDE: u16 = 128;
+/// The pointer position is read at most this often (125 Hz) while it moves.
 const ACTIVE_POLL: Duration = Duration::from_millis(8);
+/// With XInput 2, moves and button presses of real and XTest pointers are events. Warps
+/// (XWarpPointer, as xdotool moves the pointer) raise none: while viewers watch, a resting
+/// pointer is also read this often, and a moving one at ACTIVE_POLL for MOVING_FOR after it
+/// last moved. A click right after a warp is an event, so it shows where it happened.
+const WARP_POLL: Duration = Duration::from_millis(250);
+/// Without XInput 2: polling while viewers watch a pointer that has been still for MOVING_FOR
+/// (the first move after a rest shows up at most this late, the rest at ACTIVE_POLL), and
+/// with no viewers.
+const RESTING_POLL: Duration = Duration::from_millis(50);
+const MOVING_FOR: Duration = Duration::from_millis(500);
 const IDLE_POLL: Duration = Duration::from_millis(250);
+/// How long the thread sleeps at most, so that it sees the shutdown flag.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorShape {
@@ -42,33 +58,15 @@ pub struct CursorState {
     pub y: i32,
 }
 
-/// Wakes the cursor thread, so that it re-reads how many sessions watch video, or sees the
-/// shutdown flag. (Phase 0 stub: the thread still polls, so ringing does nothing yet.)
-#[derive(Debug, Clone)]
-pub struct CursorWaker(());
-
-impl CursorWaker {
-    #[expect(
-        dead_code,
-        reason = "phase 0 stub: rung by sessions and at shutdown (G3, G4)"
-    )]
-    pub fn ring(&self) {}
-
-    /// A waker with no thread behind it, for other modules' tests.
-    #[cfg(test)]
-    pub fn detached() -> CursorWaker {
-        CursorWaker(())
-    }
-}
-
-/// Connects to `display` and starts `tilt-cursor`. The position is polled every 8 ms while
-/// `watching > 0` and every 250 ms otherwise; the returned receiver sees only changes. Ring the
-/// returned waker when `watching` changes, and at shutdown.
+/// Connects to `display` and starts `tilt-cursor`; the returned receiver sees only changes.
+/// With XInput 2 the thread sleeps until the pointer moves (and reads it every 0.5 s while
+/// `watching > 0`, for warps); without, it polls every 8 ms while `watching > 0` and the
+/// pointer moves, every 50 ms while it rests, and every 250 ms with nobody watching.
 pub fn spawn_cursor_thread(
     display: String,
     watching: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
-) -> anyhow::Result<(watch::Receiver<CursorState>, CursorWaker, JoinHandle<()>)> {
+) -> anyhow::Result<(watch::Receiver<CursorState>, JoinHandle<()>)> {
     let (tx, rx) = watch::channel(CursorState::default());
     let (conn, screen) = connect(&display)?;
     let root = conn.setup().roots[screen].root;
@@ -77,17 +75,124 @@ pub fn spawn_cursor_thread(
     conn.xfixes_select_cursor_input(root, CursorNotifyMask::DISPLAY_CURSOR)?
         .check()
         .context("XFixesSelectCursorInput")?;
+    let raw_motion = select_raw_motion(&conn, root);
+    if !raw_motion {
+        warn!("XInput 2 is unavailable: polling the pointer position");
+    }
     let thread = std::thread::Builder::new()
         .name("tilt-cursor".into())
         .spawn(move || {
-            if let Err(e) = track(&conn, root, &tx, &watching, &shutdown) {
+            let tracked = if raw_motion {
+                follow(&conn, root, &tx, &watching, &shutdown)
+            } else {
+                track(&conn, root, &tx, &watching, &shutdown)
+            };
+            if let Err(e) = tracked {
                 error!("cursor tracking stopped: {e:#}");
             }
         })
         .context("cannot start tilt-cursor")?;
-    Ok((rx, CursorWaker(()), thread))
+    Ok((rx, thread))
 }
 
+/// Asks for XInput 2 RawMotion and RawButtonPress events on `root`, which come for every move
+/// and press of every pointer, XTest's included, whatever window it is over. False when the
+/// server cannot.
+fn select_raw_motion(conn: &RustConnection, root: Window) -> bool {
+    let supported = conn
+        .xinput_xi_query_version(2, 0)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .is_some_and(|v| v.major_version >= 2);
+    let mask = xinput::EventMask {
+        // XIAllMasterDevices
+        deviceid: 1,
+        mask: vec![xinput::XIEventMask::RAW_MOTION | xinput::XIEventMask::RAW_BUTTON_PRESS],
+    };
+    supported
+        && conn
+            .xinput_xi_select_events(root, &[mask])
+            .ok()
+            .is_some_and(|c| c.check().is_ok())
+}
+
+/// Event-driven tracking: sleeps until X reports a move or a new cursor and reads the position
+/// at most every ACTIVE_POLL while moves come; while viewers watch, also polls for warps.
+fn follow(
+    conn: &RustConnection,
+    root: Window,
+    tx: &watch::Sender<CursorState>,
+    watching: &AtomicUsize,
+    shutdown: &AtomicBool,
+) -> anyhow::Result<()> {
+    // Read after selecting CursorNotify and RawMotion, so no change can fall in between.
+    let mut shape = Some(read_shape(conn)?);
+    let mut moved = true;
+    let mut last_read: Option<Instant> = None;
+    // When a read last found the pointer somewhere new.
+    let mut changed_at = Instant::now();
+    while !shutdown.load(Ordering::Relaxed) {
+        let mut cursor_changed = false;
+        while let Some(event) = conn.poll_for_event()? {
+            match event {
+                Event::XfixesCursorNotify(_) => cursor_changed = true,
+                Event::XinputRawMotion(_) | Event::XinputRawButtonPress(_) => moved = true,
+                _ => {}
+            }
+        }
+        if cursor_changed {
+            shape = Some(read_shape(conn)?);
+        }
+        let now = Instant::now();
+        let watched = watching.load(Ordering::Relaxed) > 0;
+        let warping = now.saturating_duration_since(changed_at) < MOVING_FOR;
+        let due = match (moved || shape.is_some(), last_read) {
+            (_, None) => now,
+            (true, Some(t)) => t + ACTIVE_POLL,
+            (false, Some(t)) if watched && warping => t + ACTIVE_POLL,
+            (false, Some(t)) if watched => t + WARP_POLL,
+            (false, Some(_)) => now + SHUTDOWN_POLL,
+        };
+        if now >= due {
+            let pointer = conn.query_pointer(root)?.reply()?;
+            if publish(
+                tx,
+                shape.take(),
+                pointer.root_x.into(),
+                pointer.root_y.into(),
+            ) {
+                changed_at = now;
+            }
+            moved = false;
+            last_read = Some(now);
+            continue;
+        }
+        wait_readable(conn, (due - now).min(SHUTDOWN_POLL))?;
+    }
+    Ok(())
+}
+
+/// Sleeps until the connection has data to read or `timeout` passes. Events x11rb already
+/// buffered are not seen here: callers drain poll_for_event first.
+fn wait_readable(conn: &RustConnection, timeout: Duration) -> anyhow::Result<()> {
+    let mut fd = libc::pollfd {
+        fd: conn.stream().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one valid pollfd for the duration of the call.
+    let rv = unsafe { libc::poll(&mut fd, 1, ms) };
+    if rv < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(anyhow::Error::new(e).context("poll on the X connection"));
+        }
+    }
+    Ok(())
+}
+
+/// Polling, for servers without XInput 2.
 fn track(
     conn: &RustConnection,
     root: Window,
@@ -97,6 +202,7 @@ fn track(
 ) -> anyhow::Result<()> {
     // Read after selecting CursorNotify, so no change can fall in between.
     let mut shape = Some(read_shape(conn)?);
+    let mut moved_at = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         let mut cursor_changed = false;
         while let Some(event) = conn.poll_for_event()? {
@@ -106,23 +212,29 @@ fn track(
             shape = Some(read_shape(conn)?);
         }
         let pointer = conn.query_pointer(root)?.reply()?;
-        publish(
+        let now = Instant::now();
+        if publish(
             tx,
             shape.take(),
             pointer.root_x.into(),
             pointer.root_y.into(),
-        );
-        std::thread::sleep(if watching.load(Ordering::Relaxed) > 0 {
+        ) {
+            moved_at = now;
+        }
+        std::thread::sleep(if watching.load(Ordering::Relaxed) == 0 {
+            IDLE_POLL
+        } else if now.saturating_duration_since(moved_at) < MOVING_FOR {
             ACTIVE_POLL
         } else {
-            IDLE_POLL
+            RESTING_POLL
         });
     }
     Ok(())
 }
 
-/// Stores a newly read shape and the position, waking receivers only if either changed.
-fn publish(tx: &watch::Sender<CursorState>, shape: Option<CursorShape>, x: i32, y: i32) {
+/// Stores a newly read shape and the position, waking receivers only if either changed;
+/// returns whether one did.
+fn publish(tx: &watch::Sender<CursorState>, shape: Option<CursorShape>, x: i32, y: i32) -> bool {
     tx.send_if_modified(|state| {
         let mut changed = false;
         if let Some(shape) = shape {
@@ -136,7 +248,7 @@ fn publish(tx: &watch::Sender<CursorState>, shape: Option<CursorShape>, x: i32, 
             changed = true;
         }
         changed
-    });
+    })
 }
 
 fn read_shape(conn: &RustConnection) -> anyhow::Result<CursorShape> {
@@ -291,18 +403,18 @@ mod tests {
     #[test]
     fn publishes_only_changes() {
         let (tx, mut rx) = watch::channel(CursorState::default());
-        publish(&tx, None, 0, 0);
+        assert!(!publish(&tx, None, 0, 0));
         assert!(!rx.has_changed().unwrap());
-        publish(&tx, None, 3, 4);
+        assert!(publish(&tx, None, 3, 4));
         assert!(rx.has_changed().unwrap());
         assert_eq!(position(&mut rx), (3, 4));
 
         let shape = cursor_shape(&image(1, 1, 0, 0, vec![0xff00_0000]));
-        publish(&tx, Some(shape.clone()), 3, 4);
+        assert!(publish(&tx, Some(shape.clone()), 3, 4));
         assert!(rx.has_changed().unwrap());
         assert_eq!(rx.borrow_and_update().shape.as_ref(), Some(&shape));
         // CursorNotify fires on every cursor switch, including back to the shape last sent.
-        publish(&tx, Some(shape), 3, 4);
+        assert!(!publish(&tx, Some(shape), 3, 4));
         assert!(!rx.has_changed().unwrap());
     }
 }
@@ -312,6 +424,7 @@ mod x_tests {
     use std::time::Instant;
 
     use x11rb::protocol::xproto::{ChangeWindowAttributesAux, CreateGCAux, Rectangle};
+    use x11rb::protocol::xtest::ConnectionExt as _;
 
     use super::*;
     use crate::x11::testutil::{eventually, Xvfb};
@@ -345,7 +458,7 @@ mod x_tests {
         let x = Xvfb::start("640x480x24", &[]);
         let viewers = Arc::new(AtomicUsize::new(1));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (mut rx, _waker, thread) = spawn_cursor_thread(
+        let (mut rx, thread) = spawn_cursor_thread(
             x.display.clone(),
             Arc::clone(&viewers),
             Arc::clone(&shutdown),
@@ -421,12 +534,34 @@ mod x_tests {
         assert_eq!((hidden.width, hidden.height), (0, 0), "{hidden:?}");
         assert!(hidden.rgba.is_empty());
 
-        // Polling every 8 ms with a viewer and every 250 ms without; as each move follows a
-        // publish, its lag is close to a whole interval. Compared rather than held to fixed
-        // bounds, as a loaded machine slows both alike.
+        // Warps (xdotool) while a viewer watches: once one is seen, the pointer is read every
+        // 8 ms while it keeps moving, so moves that follow each other show up quickly.
+        assert!(active < Duration::from_millis(100), "active {active:?}");
+
+        // With nobody watching, X reports moves made through XTest (tilt's own input, real
+        // devices) and nothing is polled: a warp is seen once someone watches again.
         viewers.store(0, Ordering::Relaxed);
-        let idle = median_lag(&x, &rx, 200);
-        assert!(active * 2 < idle, "active {active:?}, idle {idle:?}");
+        let (client, screen) = connect(&x.display).unwrap();
+        let root = client.setup().roots[screen].root;
+        client.xtest_get_version(2, 2).unwrap().reply().unwrap();
+        let motion = x11rb::protocol::xproto::MOTION_NOTIFY_EVENT;
+        client
+            .xtest_fake_input(motion, 0, x11rb::CURRENT_TIME, root, 300, 200, 0)
+            .unwrap();
+        client.get_input_focus().unwrap().reply().unwrap();
+        assert!(
+            eventually(wait, || position(&rx) == (300, 200)),
+            "XTest move"
+        );
+        std::thread::sleep(Duration::from_millis(600));
+        x.run("xdotool", &["mousemove", "50", "60"]);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(position(&rx), (300, 200), "warps are not polled for nobody");
+        viewers.store(1, Ordering::Relaxed);
+        assert!(
+            eventually(wait, || position(&rx) == (50, 60)),
+            "warp once watched"
+        );
 
         shutdown.store(true, Ordering::Relaxed);
         let stopping = Instant::now();

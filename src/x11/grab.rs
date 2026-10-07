@@ -123,48 +123,86 @@ impl Grabber {
 
     /// Grabs the whole root into `pixels()`.
     pub fn grab(&mut self, conn: &RustConnection) -> Result<(), GrabError> {
-        let len = self.stride * self.height as usize;
+        self.grab_rows(conn, &[(0, self.height)])
+    }
+
+    /// Grabs the full-width row bands `[top, bottom)` of the root into their place in
+    /// `pixels()`; the other rows keep what earlier grabs left there. Every request is sent
+    /// before the first reply is awaited, so several bands cost one round trip.
+    pub fn grab_rows(
+        &mut self,
+        conn: &RustConnection,
+        bands: &[(u32, u32)],
+    ) -> Result<(), GrabError> {
         // Lossless: the size came from GetGeometry's u16 fields.
-        let (width, height) = (self.width as u16, self.height as u16);
+        let width = self.width as u16;
+        let stride = self.stride;
         let send_failed = |e: x11rb::errors::ConnectionError| GrabError::Other(e.into());
+        let in_range = |&(top, bottom): &(u32, u32)| top < bottom && bottom <= self.height;
+        if !bands.iter().all(in_range) {
+            return Err(GrabError::Other(anyhow!(
+                "row bands {bands:?} are not within the screen's {} rows",
+                self.height
+            )));
+        }
         match &mut self.buf {
             Buffer::Shm(segment) => {
-                let reply = conn
-                    .shm_get_image(
-                        self.root,
-                        0,
-                        0,
-                        width,
-                        height,
-                        !0,
-                        ImageFormat::Z_PIXMAP.into(),
-                        segment.id(),
-                        0,
-                    )
-                    .map_err(send_failed)?
-                    .reply()
-                    .map_err(grab_error)?;
-                if reply.size as usize != len {
-                    return Err(GrabError::Other(anyhow!(
-                        "ShmGetImage wrote {} bytes, expected {len}",
-                        reply.size
-                    )));
+                let mut cookies = Vec::with_capacity(bands.len());
+                for &(top, bottom) in bands {
+                    let offset = u32::try_from(top as usize * stride)
+                        .map_err(|_| GrabError::Other(anyhow!("segment offset out of range")))?;
+                    let cookie = conn
+                        .shm_get_image(
+                            self.root,
+                            0,
+                            top as i16,
+                            width,
+                            (bottom - top) as u16,
+                            !0,
+                            ImageFormat::Z_PIXMAP.into(),
+                            segment.id(),
+                            offset,
+                        )
+                        .map_err(send_failed)?;
+                    cookies.push((cookie, (bottom - top) as usize * stride));
+                }
+                for (cookie, len) in cookies {
+                    let reply = cookie.reply().map_err(grab_error)?;
+                    if reply.size as usize != len {
+                        return Err(GrabError::Other(anyhow!(
+                            "ShmGetImage wrote {} bytes, expected {len}",
+                            reply.size
+                        )));
+                    }
                 }
             }
             Buffer::Image(data) => {
-                let reply = conn
-                    .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, width, height, !0)
-                    .map_err(send_failed)?
-                    .reply()
-                    .map_err(grab_error)?;
-                if reply.data.len() < len {
-                    return Err(GrabError::Other(anyhow!(
-                        "GetImage returned {} bytes, expected {len}",
-                        reply.data.len()
-                    )));
+                // Empty after release_pages.
+                data.resize(stride * self.height as usize, 0);
+                for &(top, bottom) in bands {
+                    let len = (bottom - top) as usize * stride;
+                    let reply = conn
+                        .get_image(
+                            ImageFormat::Z_PIXMAP,
+                            self.root,
+                            0,
+                            top as i16,
+                            width,
+                            (bottom - top) as u16,
+                            !0,
+                        )
+                        .map_err(send_failed)?
+                        .reply()
+                        .map_err(grab_error)?;
+                    if reply.data.len() < len {
+                        return Err(GrabError::Other(anyhow!(
+                            "GetImage returned {} bytes, expected {len}",
+                            reply.data.len()
+                        )));
+                    }
+                    let at = top as usize * stride;
+                    data[at..at + len].copy_from_slice(&reply.data[..len]);
                 }
-                *data = reply.data;
-                data.truncate(len);
             }
         }
         Ok(())
@@ -190,6 +228,15 @@ impl Grabber {
     /// The grab path in use, for logs.
     pub fn method(&self) -> &'static str {
         self.method.name()
+    }
+
+    /// Gives the memory the grabs land in back to the system while nobody watches; the next
+    /// grab must be a full one.
+    pub fn release_pages(&mut self) {
+        match &mut self.buf {
+            Buffer::Shm(segment) => segment.release_pages(),
+            Buffer::Image(data) => *data = Vec::new(),
+        }
     }
 
     /// Re-reads the root geometry; when it changed, re-creates the buffers and returns true.
@@ -358,6 +405,8 @@ mod shm {
         len: usize,
         /// Mapped with shmat rather than mmap.
         sysv: bool,
+        /// The memfd behind the segment, to give its pages back while nobody watches.
+        fd: Option<OwnedFd>,
     }
 
     // SAFETY: the mapping belongs to this value alone and is not tied to the creating thread.
@@ -418,6 +467,7 @@ mod shm {
                 ptr: map(&fd, len)?,
                 len,
                 sysv: false,
+                fd: Some(fd.try_clone().context("dup of the memfd")?),
             };
             // x11rb sends the fd and then closes it; both mappings outlive it.
             conn.shm_attach_fd(id, fd, false)?
@@ -440,6 +490,7 @@ mod shm {
                     ptr,
                     len,
                     sysv: false,
+                    fd: Some(reply.shm_fd),
                 }),
                 Err(e) => {
                     detach(conn, id);
@@ -479,6 +530,7 @@ mod shm {
                 ptr: addr.cast(),
                 len,
                 sysv: true,
+                fd: None,
             };
             // Non-negative: shmget succeeded.
             conn.shm_attach(id, shmid as u32, false)?
@@ -505,6 +557,24 @@ mod shm {
         /// Also drops the server's attachment; dropping alone unmaps only our side.
         pub(super) fn release(self, conn: &RustConnection) {
             detach(conn, self.id);
+        }
+
+        /// Frees the memory behind a memfd segment (on both sides) until the next grab writes
+        /// it again; the mappings stay valid. Does nothing for SysV segments.
+        pub(super) fn release_pages(&self) {
+            if let Some(fd) = &self.fd {
+                let len = libc::off_t::try_from(self.len).unwrap_or(libc::off_t::MAX);
+                // SAFETY: punches a hole in a memfd we hold; the size stays, so both mappings
+                // stay valid and read zeros until the server writes again.
+                unsafe {
+                    libc::fallocate(
+                        fd.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        0,
+                        len,
+                    )
+                };
+            }
         }
     }
 
@@ -533,7 +603,8 @@ mod shm {
         Ok(())
     }
 
-    /// Maps `len` bytes of `fd` read-only; MAP_POPULATE spares the first grabs the page faults.
+    /// Maps `len` bytes of `fd` read-only. Pages are faulted in as grabs fill them: an idle
+    /// server keeps none.
     fn map(fd: &OwnedFd, len: usize) -> anyhow::Result<*const u8> {
         // SAFETY: a new shared mapping of an fd we hold, checked against MAP_FAILED.
         let ptr = unsafe {
@@ -541,7 +612,7 @@ mod shm {
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
+                libc::MAP_SHARED,
                 fd.as_raw_fd(),
                 0,
             )
@@ -595,6 +666,10 @@ mod shm {
 
         pub(super) fn release(self, _conn: &RustConnection) {
             match self {}
+        }
+
+        pub(super) fn release_pages(&self) {
+            match *self {}
         }
     }
 }

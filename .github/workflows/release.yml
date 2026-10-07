@@ -1,0 +1,77 @@
+name: Release
+
+# Every push to main whose Cargo.toml version has no tag yet becomes a release: static binaries
+# for x86_64 and arm64 and the tilt-live launcher on GitHub, then the tilt-live npm package.
+# npm needs the NPM_TOKEN secret, or trusted publishing set up for this workflow on npmjs.com.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      new: ${{ steps.v.outputs.new }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already released"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  github:
+    needs: version
+    if: needs.version.outputs.new == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Static binaries (cross-compiled with zig, no emulation)
+        run: scripts/build-static.sh amd64 arm64
+      - name: Release v${{ needs.version.outputs.version }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cp scripts/tilt-live dist/tilt-live
+          (cd dist && sha256sum tilt-* > SHA256SUMS && cat SHA256SUMS)
+          gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" \
+            --title "tilt $VERSION" --generate-notes
+
+  npm:
+    needs: [version, github]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish tilt-live ${{ needs.version.outputs.version }}
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          npm install -g npm@latest
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          cp ../LICENSE .
+          npm publish --provenance --access public

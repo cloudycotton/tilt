@@ -10,8 +10,9 @@ use anyhow::{ensure, Context};
 use openh264_sys2::{
     cmMallocMemeError, videoFormatI420, videoFrameTypeIDR, videoFrameTypeInvalid,
     videoFrameTypeSkip, DynamicAPI, ISVCEncoder, ISVCEncoderVtbl, SBitrateInfo, SEncParamExt,
-    SFrameBSInfo, SSourcePicture, WelsTraceCallback, API, CAMERA_VIDEO_REAL_TIME, CM_BT709,
-    CONSTANT_ID, CP_BT709, ENCODER_OPTION, ENCODER_OPTION_BITRATE, ENCODER_OPTION_DATAFORMAT,
+    SEncoderStatistics, SFrameBSInfo, SSourcePicture, WelsTraceCallback, API,
+    CAMERA_VIDEO_REAL_TIME, CM_BT709, CONSTANT_ID, CP_BT709, ENCODER_OPTION,
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_DATAFORMAT, ENCODER_OPTION_GET_STATISTICS,
     ENCODER_OPTION_TRACE_CALLBACK, LOW_COMPLEXITY, PRO_BASELINE, PRO_HIGH, RC_BITRATE_MODE,
     SM_SINGLE_SLICE, SPATIAL_LAYER_ALL, TRC_BT709, UNSPECIFIED_BIT_RATE, VF_UNDEF, WELS_LOG_ERROR,
 };
@@ -62,6 +63,8 @@ pub struct EncodedFrame {
     /// The encoder produced an IDR, so SPS and PPS are included.
     pub keyframe: bool,
     pub encode_us: u32,
+    /// The frame's mean quantizer.
+    pub qp: u8,
 }
 
 /// One OpenH264 encoder. Dropping it must Uninitialize and WelsDestroySVCEncoder.
@@ -195,10 +198,12 @@ impl H264Encoder {
         if data.is_empty() {
             return Ok(None);
         }
+        let encode_us = u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX);
         Ok(Some(EncodedFrame {
             data,
             keyframe: frame_type == videoFrameTypeIDR,
-            encode_us: u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX),
+            encode_us,
+            qp: self.last_qp(),
         }))
     }
 
@@ -221,6 +226,27 @@ impl H264Encoder {
 
     pub fn settings(&self) -> &EncoderSettings {
         &self.settings
+    }
+
+    /// The mean quantizer of the last frame encoded; MAX_QP when OpenH264 cannot say.
+    fn last_qp(&self) -> u8 {
+        let Some(get_option) = self.vtable().GetOption else {
+            return MAX_QP;
+        };
+        let mut stats = SEncoderStatistics::default();
+        // SAFETY: ENCODER_OPTION_GET_STATISTICS fills an SEncoderStatistics, which outlives
+        // the call.
+        let rv = unsafe {
+            get_option(
+                self.raw,
+                ENCODER_OPTION_GET_STATISTICS,
+                ptr::from_mut(&mut stats).cast::<c_void>(),
+            )
+        };
+        if rv != 0 {
+            return MAX_QP;
+        }
+        u8::try_from(stats.uiAverageFrameQP).map_or(MAX_QP, |qp| qp.min(MAX_QP))
     }
 
     fn initialize(&mut self) -> anyhow::Result<()> {
@@ -420,7 +446,7 @@ fn fill_params(p: &mut SEncParamExt, s: &EncoderSettings) {
     p.bEnableLongTermReference = false;
     p.bEnableBackgroundDetection = true;
     // OpenH264 2.6 turns adaptive quantisation off in validation whatever this says.
-    p.bEnableAdaptiveQuant = true;
+    p.bEnableAdaptiveQuant = false;
     p.bEnableDenoise = false;
     p.iLoopFilterDisableIdc = 0;
     p.iMultipleThreadIdc = 1;
@@ -824,6 +850,71 @@ mod tests {
             "re-encodes did not shrink"
         );
         assert_refines(&quality, 0.5);
+    }
+
+    /// When the worker skips or ends the refinement tail, and why that loses nothing visible:
+    /// - new content coded at the lowest quantizer gets no tail: re-encodes of it add well
+    ///   under a tenth of a dB;
+    /// - a tail ends at a re-encode that came out like the one before, at the lowest
+    ///   quantizer: later ones add under a hundredth of a dB (before that, on a slow link, the
+    ///   quantizer can touch the floor and rise again, still sharpening).
+    ///
+    /// Above the floor, on a slow link, the tail is what sharpens the picture.
+    #[test]
+    fn the_tail_stops_only_where_it_adds_nothing() {
+        for (w, h) in [(640, 360), (1280, 720)] {
+            for (bitrate, scene) in [
+                (8_000_000, Scene::Text),
+                (8_000_000, Scene::Scroll),
+                (8_000_000, Scene::Drag),
+                (300_000, Scene::Text),
+                (300_000, Scene::Drag),
+            ] {
+                let s = settings(w, h, bitrate, true);
+                let mut enc = H264Encoder::new(&s).unwrap();
+                let mut dec = Decoder::new();
+                let mut desktop = Desktop::new(w as usize, h as usize, 7);
+                let mut screen = vec![0; w as usize * h as usize * 4];
+                // (size, qp, PSNR) of the last frame with new content, then of re-encodes.
+                let mut frames = Vec::new();
+                for i in 0..60 {
+                    if i < 20 {
+                        desktop.step(scene, i, &mut screen);
+                    }
+                    let f = to_i420(&screen, w, h);
+                    let out = encode(&mut enc, &f, i, false);
+                    assert!(out.qp >= s.min_qp && out.qp <= s.max_qp, "qp {}", out.qp);
+                    let (_, _, y) = dec.decode(&out.data).unwrap();
+                    if i >= 19 {
+                        frames.push((out.data.len(), out.qp, psnr(&y, &f.y)));
+                    }
+                }
+                let what = format!("{w}x{h} {bitrate} bps {scene:?}: {frames:.3?}");
+                let best_from =
+                    |at: usize| frames[at..].iter().map(|f| f.2).fold(f64::MIN, f64::max);
+                let at_floor = |f: &(usize, u8, f64)| f.1 <= s.min_qp;
+                if at_floor(&frames[0]) {
+                    assert!(best_from(0) - frames[0].2 < 0.05, "new content; {what}");
+                }
+                let end = (1..frames.len()).find(|&i| {
+                    at_floor(&frames[i])
+                        && (frames[i].0, frames[i].1) == (frames[i - 1].0, frames[i - 1].1)
+                });
+                if let Some(at) = end {
+                    assert!(best_from(at) - frames[at].2 < 0.01, "tail end {at}; {what}");
+                }
+                if bitrate == 8_000_000 {
+                    let stop = if at_floor(&frames[0]) { Some(0) } else { end };
+                    assert!(stop.is_some_and(|at| at <= 3), "no early stop; {what}");
+                } else {
+                    assert!(!at_floor(&frames[0]), "{what}");
+                    assert!(
+                        best_from(0) - frames[0].2 > 0.2,
+                        "the tail should sharpen; {what}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -17,6 +17,10 @@ pub enum Role {
     View,
 }
 
+/// Every failed authentication (handshake or /api/status) waits this long first, so tokens
+/// cannot be guessed quickly.
+pub const AUTH_FAIL_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthError {
     /// Wrong or missing token.

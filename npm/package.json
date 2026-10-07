@@ -1,0 +1,41 @@
+{
+  "name": "tilt-live",
+  "version": "0.1.0",
+  "description": "Extremely fast live view and control of any Linux desktop, right in your browser (runs the latest tilt release)",
+  "keywords": [
+    "vnc",
+    "remote-desktop",
+    "x11",
+    "xvfb",
+    "webcodecs",
+    "h264",
+    "screen-sharing",
+    "e2b"
+  ],
+  "homepage": "https://github.com/cloudycotton/tilt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudycotton/tilt.git",
+    "directory": "npm"
+  },
+  "license": "MIT",
+  "bin": {
+    "tilt-live": "bin/tilt-live.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/launcher.test.mjs"
+  }
+}

@@ -14,7 +14,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::auth::{AuthError, Role};
+use crate::auth::{AuthError, Role, AUTH_FAIL_DELAY};
 use crate::clock::{self, LogEvery};
 use crate::control::ControlStatus;
 use crate::input::InputCmd;
@@ -115,26 +115,10 @@ impl Sessions {
         }
     }
 
-    /// The live session count.
-    #[cfg(test)]
+    /// The live session count, shared with the cursor thread.
     pub fn viewer_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.viewers)
     }
-
-    /// The count of sessions with video on, for the cursor thread. (Phase 0 stub: counts every
-    /// live session until `set_video` is recorded.)
-    pub fn watching_counter(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.viewers)
-    }
-
-    /// Records whether `sid`'s client wants video. (Phase 0 stub: does nothing yet.)
-    #[expect(dead_code, reason = "phase 0 stub: called by the session reader (G4)")]
-    pub fn set_video(&self, _sid: SessionId, _on: bool) {}
-
-    /// Records whether `sid`'s worker holds an encoder, for /api/status. (Phase 0 stub: does
-    /// nothing yet.)
-    #[expect(dead_code, reason = "phase 0 stub: called by the worker (G1 A5)")]
-    pub fn set_encoder(&self, _sid: SessionId, _on: bool) {}
 
     pub fn count(&self) -> usize {
         self.viewers.load(Ordering::Relaxed)
@@ -252,8 +236,6 @@ impl Sessions {
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-/// Every failed handshake waits this long first, so tokens cannot be guessed quickly.
-const AUTH_FAIL_DELAY: Duration = Duration::from_millis(500);
 const IDLE_CLOSE: Duration = Duration::from_secs(30);
 const HELD_RELEASE: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -366,6 +348,10 @@ pub async fn run(socket: WebSocket, state: Arc<AppState>) {
         }
     }
     state.sessions.unregister(sid);
+    if state.sessions.count() == 0 {
+        // The last encoder is gone: give its memory back while nobody watches.
+        crate::release_memory();
+    }
     info!(session = sid, "disconnected: {why}");
 }
 
