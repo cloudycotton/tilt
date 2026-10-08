@@ -453,7 +453,11 @@ mod tests {
         };
         assert_eq!(
             welcome.to_json(),
-            r#"{"t":"welcome","v":1,"session":"s7","role":"control","screen":{"w":1920,"h":1080},"server":"tilt/0.1.0"}"#
+            concat!(
+                r#"{"t":"welcome","v":1,"session":"s7","role":"control","screen":{"w":1920,"h":1080},"server":"tilt/"#,
+                env!("CARGO_PKG_VERSION"),
+                r#""}"#
+            )
         );
         assert_eq!(
             ServerText::Control {
