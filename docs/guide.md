@@ -19,6 +19,10 @@ npx tilt-live
 
 Open the link it prints, then click the cursor button to take control.
 
+- Run it on the Linux machine whose screen you want to see; the link works from any browser.
+- On a Mac or Windows PC there is no X display to stream, so it runs a demo Linux desktop
+  (Xvfb + xfce) in [Docker](https://docs.docker.com/desktop/) and streams that. `TILT_DOCKER=1`
+  does the same on Linux. `SCREEN=1280x720x24` sizes it; `DESKTOP=none` leaves out xfce.
 - No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh`, then `tilt-live`.
 - Another display: `tilt-live --display :1`. Every [flag](#flags) works.
 - It always runs the latest release and updates itself on start.
@@ -27,6 +31,7 @@ Open the link it prints, then click the cursor button to take control.
 <summary>More about tilt-live</summary>
 
 - Downloads static binaries (x86_64, arm64) from [GitHub releases](https://github.com/cloudycotton/tilt/releases), checksum-verified.
+- In Docker it runs `ghcr.io/cloudycotton/tilt-desktop:<version>`, the same image as `docker compose up` below, with the port published at `--bind` (default 6090) and tilt's `TILT_*` variables passed in.
 - `TILT_VERSION=0.2.0` pins a release. `TILT_NO_UPDATE=1` skips the update check.
 - Without `--token`, `--token-file` or `--no-auth`, it keeps a token in `~/.config/tilt-live/token`.
 - Want the bare binary? Download `tilt-<arch>-unknown-linux-musl` from a release.

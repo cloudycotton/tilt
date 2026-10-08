@@ -159,6 +159,60 @@ for (const [name, [interpreter, launcher]] of Object.entries(LAUNCHERS)) describ
     assert.equal(r.code, 1);
     assert.match(r.err, /cannot find the latest tilt release/);
   });
+
+  describe('in Docker (TILT_DOCKER=1, or not on Linux)', () => {
+    // A fake docker on PATH: prints its arguments, then the token it was given, and exits with
+    // 7 (`docker version` with 0).
+    let bin;
+    beforeEach(() => {
+      bin = path.join(home, 'fakebin');
+      fs.mkdirSync(bin);
+      fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\necho "docker $*"\necho "TILT_TOKEN=${TILT_TOKEN:-}"\n[ "$1" = version ] && exit 0\nexit 7\n', { mode: 0o755 });
+    });
+    const docker = (args = [], env = {}) => run(args, { TILT_DOCKER: '1', PATH: `${bin}:${process.env.PATH}`, ...env });
+    const token = () => fs.readFileSync(path.join(home, 'config', 'tilt-live', 'token'), 'utf8').trim();
+
+    test('runs the latest release image with the token, publishing the port', async () => {
+      const r = await docker(['--max-fps', '30']);
+      assert.equal(r.code, 7);
+      assert.match(r.err, new RegExp(`open http://localhost:6090/#token=${token()}`));
+      assert.match(r.err, /starting the demo desktop ghcr\.io\/cloudycotton\/tilt-desktop:0\.1\.0 in Docker/);
+      const [line, env] = r.out.split('\n');
+      assert.match(line, /^docker run --rm --init --shm-size 1g -p 6090:6090 /);
+      assert.match(line, / -e TESTPATTERN=0 /);
+      assert.match(line, / -e TILT_TOKEN /);
+      assert.equal(env, `TILT_TOKEN=${token()}`);
+      assert.match(line, / ghcr\.io\/cloudycotton\/tilt-desktop:0\.1\.0 --max-fps 30$/);
+      assert.doesNotMatch(line, /--token-file/);
+      assert.deepEqual(hits, ['/releases/latest']);
+      assert.ok(!fs.existsSync(path.join(home, 'cache', 'tilt-live')));
+    });
+
+    test('maps --bind to the published port, pins a version, and mounts a token file', async () => {
+      const r = await docker(['--bind', '127.0.0.1:7000', '--token-file', path.join(home, 't')], { TILT_VERSION: '0.3.0', TILT_IMAGE: 'tilt-desktop', SCREEN: '800x600x24' });
+      const [line] = r.out.split('\n');
+      assert.match(line, / -p 127\.0\.0\.1:7000:6090 /);
+      assert.match(line, new RegExp(` -v ${home}/t:/run/tilt-live/token1?:ro `));
+      assert.match(line, / -e SCREEN /);
+      assert.match(line, / tilt-desktop:0\.3\.0 --token-file \/run\/tilt-live\/token1?$/);
+      assert.doesNotMatch(line, /--bind/);
+      assert.doesNotMatch(r.err, /open http/);
+      assert.doesNotMatch(line, /TILT_VERSION|TILT_DOCKER|TILT_IMAGE/);
+    });
+
+    test('uses the latest image when offline, and just the binary for --version', async () => {
+      const r = await docker(['--version'], { TILT_RELEASES: 'http://127.0.0.1:9/releases' });
+      const [line] = r.out.split('\n');
+      assert.match(line, / --entrypoint tilt .*tilt-desktop:latest --version$/);
+    });
+
+    test('says what to install when docker is missing', async () => {
+      const r = await run([], { TILT_DOCKER: '1', PATH: path.join(home, 'nothing') });
+      assert.equal(r.code, 1);
+      assert.match(r.err, /docker is not running\./);
+      assert.match(r.err, /Docker Desktop/);
+    });
+  });
 });
 
 test('install.sh installs tilt-live, which then runs the latest tilt', async () => {

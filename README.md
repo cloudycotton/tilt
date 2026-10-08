@@ -24,7 +24,8 @@ npx tilt-live
 
 Open the link it prints, click the cursor button, and the desktop is yours.
 
-<sub>No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh` then `tilt-live`.</sub>
+<sub>Run it on the Linux machine whose screen you want. On a Mac or Windows PC it runs a demo Linux desktop in Docker instead.
+No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh` then `tilt-live`.</sub>
 
 ## Why tilt
 
