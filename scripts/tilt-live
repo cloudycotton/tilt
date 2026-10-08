@@ -1,10 +1,16 @@
 #!/bin/sh
 # tilt-live: runs the latest tilt release (https://github.com/cloudycotton/tilt), downloading or
 # updating it first when a newer one is out, and passes every argument through to it. The sh
-# twin of npm/bin/tilt-live.js, installed by install.sh; needs curl and sha256sum.
+# twin of npm/bin/tilt-live.js, installed by install.sh; needs curl and sha256sum (or shasum).
+#
+# On Linux it streams this machine's X display. Anywhere else (macOS), or with TILT_DOCKER=1, it
+# runs the release's demo desktop image (Xvfb + xfce + tilt) in Docker and streams that,
+# publishing tilt's port on this machine.
 #
 #   TILT_VERSION=0.2.0   run that release instead of the latest
 #   TILT_NO_UPDATE=1     do not look for updates (run the newest one already downloaded)
+#   TILT_DOCKER=1        run the demo desktop in Docker, even on Linux
+#   SCREEN, DESKTOP      the Docker desktop's screen (1920x1080x24) and session (xfce or none)
 #
 # With no --token, --token-file or --no-auth (nor their TILT_* variables), it makes a token,
 # keeps it in ~/.config/tilt-live/token and prints the link to open.
@@ -12,13 +18,21 @@ set -u
 releases=${TILT_RELEASES:-https://github.com/cloudycotton/tilt/releases}
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/tilt-live
 config=${XDG_CONFIG_HOME:-$HOME/.config}/tilt-live
+image=${TILT_IMAGE:-ghcr.io/cloudycotton/tilt-desktop}
 say() { echo "tilt-live: $*" >&2; }
 
+docker=${TILT_DOCKER:-}
 case "$(uname -s)/$(uname -m)" in
   Linux/x86_64 | Linux/amd64) triple=x86_64-unknown-linux-musl ;;
   Linux/aarch64 | Linux/arm64) triple=aarch64-unknown-linux-musl ;;
-  *) say "tilt runs on Linux, on x86_64 or arm64"; exit 1 ;;
+  Linux/*) say "tilt runs on x86_64 or arm64 (set TILT_DOCKER=1 for the demo desktop in Docker)"; exit 1 ;;
+  *) docker=1 ;;
 esac
+
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
 
 # Downloaded versions, newest first.
 cached() {
@@ -40,7 +54,7 @@ download() {
   if curl -fsSL --max-time 120 -o "$tmp/tilt" "$releases/download/v$1/tilt-$triple" &&
     curl -fsSL --max-time 30 -o "$tmp/sums" "$releases/download/v$1/SHA256SUMS"; then
     want=$(awk -v n="tilt-$triple" '$2 == n { print $1 }' "$tmp/sums")
-    got=$(sha256sum "$tmp/tilt" | cut -d' ' -f1)
+    got=$(sha256 "$tmp/tilt")
     if [ -n "$want" ] && [ "$want" = "$got" ]; then
       mkdir -p "$cache/$1" && chmod 755 "$tmp/tilt" && mv "$tmp/tilt" "$cache/$1/tilt"
       rm -rf "$tmp"
@@ -55,28 +69,40 @@ download() {
   return 1
 }
 
-have=$(cached | head -n 1)
 version=${TILT_VERSION:-}
 [ -n "$version" ] || [ -n "${TILT_NO_UPDATE:-}" ] || version=$(latest)
-[ -n "$version" ] || version=$have
-[ -n "$version" ] || { say "cannot find the latest tilt release (check the network, or set TILT_VERSION)"; exit 1; }
-if [ ! -x "$cache/$version/tilt" ]; then
-  say "downloading tilt $version..."
-  error=""
-  if ! download "$version"; then
-    [ -n "$have" ] || { say "download failed: $error"; exit 1; }
-    say "download failed ($error); running $have"
-    version=$have
+if [ -n "$docker" ]; then
+  if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+    if [ -n "${TILT_DOCKER:-}" ]; then say "TILT_DOCKER is set, but docker is not running."
+    else say "tilt streams a Linux desktop; on $(uname -s) it runs one in Docker, but docker is not running."; fi
+    say "Install Docker Desktop (https://docs.docker.com/desktop/) and start it, then run this again."
+    exit 1
+  fi
+  image="$image:${version:-latest}"
+else
+  have=$(cached | head -n 1)
+  [ -n "$version" ] || version=$have
+  [ -n "$version" ] || { say "cannot find the latest tilt release (check the network, or set TILT_VERSION)"; exit 1; }
+  if [ ! -x "$cache/$version/tilt" ]; then
+    say "downloading tilt $version..."
+    error=""
+    if ! download "$version"; then
+      [ -n "$have" ] || { say "download failed: $error"; exit 1; }
+      say "download failed ($error); running $have"
+      version=$have
+    fi
   fi
 fi
 
 # Access control: a kept token unless the caller chose one, and the link to open.
 given=""
+info=""
 bind=${TILT_BIND:-0.0.0.0:6090}
 prev=""
 for a in "$@"; do
   case "$a" in
-    --token | --token=* | --token-file | --token-file=* | --no-auth | --no-auth=* | -h | --help | -V | --version) given=1 ;;
+    --token | --token=* | --token-file | --token-file=* | --no-auth | --no-auth=*) given=1 ;;
+    -h | --help | -V | --version) given=1; info=1 ;;
     --bind=*) bind=${a#--bind=} ;;
   esac
   [ "$prev" = --bind ] && bind=$a
@@ -103,6 +129,58 @@ if [ -z "$given" ]; then
     say "$sep http://$h:$port/#token=$token"
     sep="  or"
   done
-  set -- "$@" --token-file "$file"
+  [ -n "$docker" ] && export TILT_TOKEN=$token || set -- "$@" --token-file "$file"
 fi
-exec "$cache/$version/tilt" "$@"
+[ -n "$docker" ] || exec "$cache/$version/tilt" "$@"
+
+# The demo desktop in Docker: tilt's port published at the bind address. Inside, tilt listens on
+# 0.0.0.0:6090, so --bind only chooses the published port; token files are mounted read-only.
+host=${bind%:*}
+port=${bind##*:}
+case "$host" in
+  0.0.0.0 | "[::]" | ::) publish=$port:6090 ;;
+  *:*) publish="[${host#[}"; publish="${publish%]}]:$port:6090" ;;
+  *) publish=$host:$port:6090 ;;
+esac
+set -- "$@" --end-of-tilt-live-args
+run="run --rm --init --shm-size 1g -p $publish"
+[ -t 0 ] && [ -t 1 ] && run="$run -it"
+[ -n "$info" ] && run="$run --entrypoint tilt"
+# The desktop's settings and tilt's own TILT_* variables go in, except the launcher's and those
+# that mean something else inside: the bind address, the display, the token file.
+mounts=0
+mount_file() {
+  mounts=$((mounts + 1))
+  inside=/run/tilt-live/token$mounts
+  run="$run -v $(cd "$(dirname "$1")" && pwd)/$(basename "$1"):$inside:ro"
+}
+for v in SCREEN DESKTOP; do
+  eval "val=\${$v:-}"
+  [ -n "$val" ] && run="$run -e $v"
+done
+for v in $(env | sed -n 's/^\(TILT_[A-Z0-9_]*\)=.*/\1/p'); do
+  case "$v" in
+    TILT_VERSION | TILT_NO_UPDATE | TILT_RELEASES | TILT_DOCKER | TILT_IMAGE | TILT_BIND | TILT_DISPLAY) ;;
+    TILT_TOKEN_FILE) mount_file "$TILT_TOKEN_FILE"; run="$run -e TILT_TOKEN_FILE=$inside" ;;
+    *) run="$run -e $v" ;;
+  esac
+done
+run="$run -e TESTPATTERN=0"
+# tilt's arguments again, without --bind and with token files mounted.
+skip=""
+while [ "$1" != --end-of-tilt-live-args ]; do
+  a=$1
+  shift
+  [ -n "$skip" ] && { skip=""; continue; }
+  case "$a" in
+    --bind) skip=1; continue ;;
+    --bind=*) continue ;;
+    --token-file) mount_file "$1"; shift; set -- "$@" --token-file "$inside" ;;
+    --token-file=*) mount_file "${a#--token-file=}"; set -- "$@" "--token-file=$inside" ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+shift
+say "starting the demo desktop $image in Docker..."
+# shellcheck disable=SC2086
+exec docker $run "$image" "$@"
