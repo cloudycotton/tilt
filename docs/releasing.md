@@ -2,7 +2,8 @@
 
 The Release workflow (`.github/workflows/release.yml`) builds static Linux binaries for
 x86_64 and arm64, checks their size and linkage, and runs both with `--version` and `--help`
-before creating a GitHub release. It then verifies the downloadable assets and checksums,
+(arm64 under QEMU). It pushes the demo desktop image `ghcr.io/cloudycotton/tilt-desktop`
+(`:<version>` and `:latest`) and creates the GitHub release. It then verifies the downloadable assets and checksums,
 tests the launchers, publishes `tilt-live` to npm with provenance, and installs the published
 package to verify that it can download and start the released binary.
 
@@ -34,8 +35,9 @@ npx --yes tilt-live --version
 npx --yes tilt-live --help
 ```
 
-Tilt requires Linux on x86_64 or arm64; npm installation on macOS or Windows is rejected.
-Running the server also requires an X11 display (for example Xvfb).
+Tilt itself runs on Linux (x86_64 or arm64) with an X11 display, for example Xvfb. On macOS
+and Windows, `tilt-live` runs the release's demo desktop image in Docker instead, so a release
+is complete only once that image is on GHCR as well.
 
 If npm publishing fails after the GitHub release succeeds, fix the npm settings and use
 Actions → Release → Run workflow. It skips an existing GitHub tag and npm version, so retrying

@@ -112,6 +112,8 @@ jobs:
           mkdir -p dist
           gh release download "v$VERSION" --dir dist
           (cd dist && sha256sum -c SHA256SUMS)
+          # Release downloads carry no mode bits.
+          chmod +x dist/tilt-x86_64-unknown-linux-musl
           test "$(dist/tilt-x86_64-unknown-linux-musl --version)" = "tilt $VERSION"
       - name: Test launchers
         run: node --test npm/test/launcher.test.mjs
