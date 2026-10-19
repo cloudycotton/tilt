@@ -68,6 +68,9 @@ function hexBytes(hex) {
 }
 
 function hostForUrl(host) {
+  // Chrome dials `localhost` over QUIC on ::1 only, which fails where IPv6 is off (some
+  // microVMs) or tilt listens on IPv4; 127.0.0.1 reaches both a 0.0.0.0 and a [::] listener.
+  if (host === 'localhost') return '127.0.0.1';
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
 }
 
