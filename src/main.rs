@@ -13,8 +13,10 @@ mod input;
 mod protocol;
 mod server;
 mod session;
+mod transport;
 mod video;
 mod worker;
+mod wt;
 mod x11;
 
 use std::io::IsTerminal;

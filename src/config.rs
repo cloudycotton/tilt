@@ -124,6 +124,20 @@ pub struct Config {
     #[arg(long, env = "TILT_NOTSENT_LOWAT", default_value_t = 32_768)]
     pub notsent_lowat: u32,
 
+    /// UDP address for the WebTransport (QUIC) fast path, such as 0.0.0.0:6091; off when unset.
+    /// Browsers that cannot reach it use the WebSocket
+    #[arg(long, env = "TILT_WT_BIND", value_name = "ADDR")]
+    pub wt_bind: Option<SocketAddr>,
+
+    /// UDP port browsers dial for WebTransport, when it is forwarded from another port
+    /// [default: the --wt-bind port]
+    #[arg(long, env = "TILT_WT_PUBLIC_PORT", value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub wt_public_port: Option<u16>,
+
+    /// Host browsers dial for WebTransport [default: the host the page was loaded from]
+    #[arg(long, env = "TILT_WT_PUBLIC_HOST", value_name = "HOST")]
+    pub wt_public_host: Option<String>,
+
     /// Safety full-frame compare interval while viewers wait, in ms, 0 = off
     #[arg(long, env = "TILT_POLL_MS", default_value_t = 1000)]
     pub poll_ms: u64,
@@ -188,6 +202,23 @@ impl Config {
                      it. Use --qp-min {MIN_CABAC_QP} or more, or --profile baseline"
                 ),
             ));
+        }
+        if self.wt_bind.is_none()
+            && (self.wt_public_port.is_some() || self.wt_public_host.is_some())
+        {
+            return Err((
+                ErrorKind::MissingRequiredArgument,
+                "--wt-public-port and --wt-public-host need --wt-bind (TILT_WT_BIND)".into(),
+            ));
+        }
+        if let Some(host) = &self.wt_public_host {
+            let bad = |c: char| c.is_whitespace() || "/?#@".contains(c);
+            if host.is_empty() || host.contains(bad) {
+                return Err((
+                    ErrorKind::InvalidValue,
+                    format!("--wt-public-host {host:?} is not a host name or address"),
+                ));
+            }
         }
         if self.min_bitrate_kbps > self.bitrate_kbps || self.bitrate_kbps > self.max_bitrate_kbps {
             return Err((

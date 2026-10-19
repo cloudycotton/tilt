@@ -2,7 +2,7 @@
 //! (brief section 5.11).
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::WebSocketUpgrade;
@@ -26,6 +26,7 @@ use crate::hub::FrameHub;
 use crate::input::InputHandle;
 use crate::protocol::ScreenSize;
 use crate::session::{self, SessionStatus, Sessions};
+use crate::wt;
 use crate::x11::cursor::CursorState;
 
 /// Everything the handlers, sessions and encoder workers share.
@@ -39,6 +40,8 @@ pub struct AppState {
     pub sessions: Sessions,
     /// The CPUs tilt may use, for `--profile auto`.
     pub cpus: usize,
+    /// What GET /transport offers, once the WebTransport endpoint is up.
+    wt: Mutex<Option<wt::Advert>>,
 }
 
 /// What main builds before the server: the parts of AppState that are not made here.
@@ -63,7 +66,12 @@ impl AppState {
             cursor: p.cursor,
             sessions: p.sessions,
             cpus: p.cpus,
+            wt: Mutex::new(None),
         })
+    }
+
+    pub fn wt_advert(&self) -> MutexGuard<'_, Option<wt::Advert>> {
+        self.wt.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -89,6 +97,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/status", get(status))
+        .route("/transport", get(transport))
         .route("/stream", get(stream));
     for (i, asset) in assets::ASSETS.iter().enumerate() {
         router = router.route(
@@ -141,6 +150,20 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         viewers: state.sessions.count(),
         controller: holder.is_some(),
         sessions: state.sessions.snapshot(holder),
+    };
+    (
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(body),
+    )
+        .into_response()
+}
+
+/// GET /transport: `{"wt":{..}}` (see wt::Advert) when the WebTransport fast path is on,
+/// else `{}`. No auth: it holds nothing secret, and other sites' pages cannot read it.
+async fn transport(State(state): State<Arc<AppState>>) -> Response {
+    let body = match state.wt_advert().clone() {
+        Some(advert) => serde_json::json!({ "wt": advert }),
+        None => serde_json::json!({}),
     };
     (
         [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
@@ -258,7 +281,12 @@ fn forwarded_hosts(headers: &HeaderMap) -> impl Iterator<Item = &str> {
 /// without an X-Forwarded-Host (E2B's edge drops one set in front of it, so a custom domain
 /// arrives as the sandbox's own host).
 fn allowed_origin(allowed: &[String], headers: &HeaderMap) -> bool {
-    let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok()) else {
+    origin_allowed(allowed, headers.get(ORIGIN).and_then(|v| v.to_str().ok()))
+}
+
+/// Like `allowed_origin`, for an Origin taken from elsewhere (a WebTransport request).
+pub fn origin_allowed(allowed: &[String], origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
         return false;
     };
     let origin = origin_key(origin);
@@ -304,6 +332,8 @@ fn host_port(authority: &str) -> Option<(String, Option<u16>)> {
 ///
 /// Upgraded WebSockets outlive axum's graceful shutdown, so on `shutdown` every session is
 /// told to close (1001) and this waits up to 3 s for them before returning.
+///
+/// With `--wt-bind`, also serves WebTransport sessions on that UDP address until then.
 pub async fn serve(
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -315,6 +345,14 @@ pub async fn serve(
         .map_err(|e| anyhow::anyhow!("cannot listen on {bind}: {e}"))?;
     info!("listening on http://{}", listener.local_addr()?);
     let listener = listener.tap_io(move |tcp| tune_socket(tcp, lowat));
+    let wt = match state.cfg.wt_bind {
+        Some(_) => {
+            let endpoint = wt::bind(&state)?;
+            let accepting = tokio::spawn(wt::run(Arc::clone(&endpoint), Arc::clone(&state)));
+            Some((endpoint, accepting))
+        }
+        None => None,
+    };
 
     let closing = Arc::clone(&state);
     axum::serve(listener, router(Arc::clone(&state)))
@@ -332,6 +370,10 @@ pub async fn serve(
             state.sessions.count(),
             SESSION_DRAIN
         );
+    }
+    if let Some((endpoint, accepting)) = wt {
+        accepting.abort();
+        endpoint.close(wtransport::VarInt::from_u32(0), b"shutting down");
     }
     Ok(())
 }
