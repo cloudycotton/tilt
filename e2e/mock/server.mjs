@@ -618,6 +618,12 @@ export async function startMockServer(options = {}) {
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache' }).end('ok');
       return;
     }
+    if (url.pathname === '/transport') {
+      // The tests' fake WebTransport (tests/fixtures.mjs) carries the stream over /stream below.
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+        .end(JSON.stringify({ wt: { port: 4433, hashes: ['ab'.repeat(32)], ticket: 't1' } }));
+      return;
+    }
     const asset = ASSETS[url.pathname];
     if (!asset) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found');

@@ -8,8 +8,129 @@ import { startMockServer } from '../server.mjs';
 
 export { expect };
 
+/**
+ * Runs in the page: window.WebTransport carried over the mock's WebSocket (/stream next to the
+ * page) in the WebTransport framing (docs/protocol.md): control messages on one bidirectional
+ * stream, each VIDEO message on a unidirectional stream of its own. `mode` 'shuffle' delivers
+ * every other video stream late, 'lose' fails the 10th, 'never' never connects.
+ */
+function installFakeWebTransport({ mode }) {
+  const wsUrl = (() => {
+    const u = new URL('stream', location.href);
+    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    u.hash = '';
+    return u.href;
+  })();
+  const log = { created: 0, url: null, hashes: null, lost: 0 };
+  window.fakeWt = log;
+  const frame = (kind, bytes) => {
+    const out = new Uint8Array(5 + bytes.length);
+    new DataView(out.buffer).setUint32(0, bytes.length + 1, true);
+    out[4] = kind;
+    out.set(bytes, 5);
+    return out;
+  };
+  const once = (bytes) => new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } });
+  window.WebTransport = class {
+    constructor(url, options) {
+      log.created++;
+      log.url = url;
+      log.hashes = options.serverCertificateHashes.map((h) => [h.algorithm, [...h.value]]);
+      let resolveReady;
+      let resolveClosed;
+      this.ready = new Promise((r) => { resolveReady = r; });
+      this.closed = new Promise((r) => { resolveClosed = r; });
+      let control;
+      let uni;
+      this.controlReadable = new ReadableStream({ start(c) { control = c; } });
+      this.incomingUnidirectionalStreams = new ReadableStream({ start(c) { uni = c; } });
+      // As if UDP were blocked: no handshake ever completes.
+      if (mode === 'never') return;
+      const ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+      this.ws = ws;
+      let videos = 0;
+      let held = null;
+      const flushHeld = () => {
+        if (held) uni.enqueue(held);
+        held = null;
+      };
+      ws.onopen = () => resolveReady();
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          control.enqueue(frame(0, new TextEncoder().encode(ev.data)));
+          return;
+        }
+        const b = new Uint8Array(ev.data);
+        if (b[0] !== 0x01) {
+          control.enqueue(frame(1, b));
+          return;
+        }
+        videos++;
+        const key = (b[1] & 1) !== 0;
+        if (mode === 'lose' && videos === 10 && !key) {
+          log.lost++;
+          uni.enqueue(new ReadableStream({ start(c) { c.error(new Error('stream reset')); } }));
+          return;
+        }
+        if (mode === 'shuffle') {
+          // Every other frame waits for the next one and arrives after it.
+          if (held) {
+            uni.enqueue(once(b));
+            flushHeld();
+          } else {
+            held = once(b);
+            setTimeout(flushHeld, 50);
+          }
+          return;
+        }
+        uni.enqueue(once(b));
+      };
+      ws.onclose = (ev) => {
+        try {
+          control.enqueue(frame(2, new Uint8Array([ev.code & 0xff, ev.code >> 8])));
+          control.close();
+        } catch { /* closed */ }
+        resolveClosed({ closeCode: ev.code });
+      };
+    }
+
+    async createBidirectionalStream() {
+      const ws = this.ws;
+      const writable = new WritableStream({
+        write(chunk) {
+          // transport.js writes one whole frame per write.
+          const kind = chunk[4];
+          const payload = chunk.slice(5);
+          if (kind === 0) ws.send(new TextDecoder().decode(payload));
+          else if (kind === 1) ws.send(payload);
+        },
+      });
+      return { readable: this.controlReadable, writable };
+    }
+
+    close() {
+      if (this.ws) this.ws.close();
+    }
+  };
+}
+
 export const test = base.extend({
   mockOptions: [{}, { option: true }],
+  // How the fake WebTransport behaves (see installFakeWebTransport).
+  wtMode: ['plain', { option: true }],
+  // Every page, in this context or a new one, gets the fake WebTransport before it loads.
+  fakeWt: [async ({ context, browser, wtMode }, use) => {
+    await context.addInitScript(installFakeWebTransport, { mode: wtMode });
+    const newPage = browser.newPage.bind(browser);
+    browser.newPage = async (...args) => {
+      const p = await newPage(...args);
+      await p.addInitScript(installFakeWebTransport, { mode: wtMode });
+      return p;
+    };
+    await use();
+    browser.newPage = newPage;
+  }, { auto: true }],
   mock: async ({ mockOptions }, use) => {
     const mock = await startMockServer({ quiet: true, ...mockOptions });
     await use(mock);

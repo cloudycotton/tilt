@@ -1,12 +1,10 @@
-// The WebTransport (QUIC/UDP) fast path to /stream, behind the part of the WebSocket interface
+// The stream: tilt's protocol over WebTransport (QUIC, UDP), behind the small socket interface
 // app.js and the tests use: readyState, send(), close(), and open, message and close events (as
-// on* handlers or listeners). Wire format in docs/protocol.md section 7.
+// on* handlers or listeners). Wire format in docs/protocol.md.
 //
-// It finds the server's UDP port and certificate at GET transport. If that says no, or the
-// session cannot be set up and answered within TRY_MS (UDP blocked, a gateway in the way), it
-// calls onfallback() and the page uses the WebSocket instead. Two failures to connect in a row
-// are remembered for a day, so such pages do not pay the wait on every reconnect, while one
-// slow handshake on a lossy link does not give up on UDP.
+// It finds the server's UDP port, certificate and ticket at GET transport, next to the page.
+// Anything that keeps the session from coming up ends it with a close event (1006), and the
+// page reconnects as after any lost connection.
 
 const VIDEO = 0x01;
 const VIDEO_HEADER = 18;
@@ -14,48 +12,9 @@ const KIND_TEXT = 0;
 const KIND_BINARY = 1;
 const KIND_CLOSE = 2;
 const ADVERT_TIMEOUT_MS = 2000;
-// From opening the session to the server's first message (welcome, or a refusal).
-const TRY_MS = 1500;
-// {"n": failures in a row, "at": ms of the last}.
-const FAILED_KEY = 'tilt.wtFailed';
-const GIVE_UP_AFTER = 2;
-const FAILED_FOR_MS = 24 * 3600 * 1000;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-// This server said it has no fast path: not asked again until the page reloads.
-let noAdvert = false;
-
-function load(key) {
-  try { return localStorage.getItem(key); } catch { return null; }
-}
-
-function store(key, value) {
-  try {
-    if (value === null) localStorage.removeItem(key);
-    else localStorage.setItem(key, value);
-  } catch { /* unavailable */ }
-}
-
-/**
- * Whether to try WebTransport: the browser has it, the server may offer it, and it did not fail
- * to connect lately. `mode` is the page's #transport option: 'ws' never, 'udp' despite a
- * remembered failure.
- */
-export function wtCandidate(mode) {
-  if (typeof WebTransport !== 'function' || mode === 'ws' || noAdvert) return false;
-  if (mode === 'udp') return true;
-  const f = failures();
-  return !(f.n >= GIVE_UP_AFTER && Date.now() - f.at < FAILED_FOR_MS);
-}
-
-function failures() {
-  try {
-    const f = JSON.parse(load(FAILED_KEY));
-    if (Number.isFinite(f.n) && Number.isFinite(f.at)) return f;
-  } catch { /* none, or not ours */ }
-  return { n: 0, at: 0 };
-}
 
 const nextSeq = (s) => (s >= 0xffffffff ? 1 : s + 1);
 // Distance from a to b going forward through the u32 seq space (which skips 0).
@@ -75,11 +34,11 @@ function hostForUrl(host) {
 }
 
 export class WtSocket extends EventTarget {
-  /** `pageUrl` resolves `transport`, as `stream` is resolved for the WebSocket. */
+  /** `pageUrl` resolves `transport`, so a path prefix in front of tilt is kept. */
   constructor(pageUrl) {
     super();
     this.readyState = 0;
-    this.onopen = this.onmessage = this.onclose = this.onfallback = this.onskip = null;
+    this.onopen = this.onmessage = this.onclose = this.onskip = null;
     this.wt = null;
     this.writer = null;
     // Video waits until the first control message (welcome) is out: the page acks only then.
@@ -87,31 +46,25 @@ export class WtSocket extends EventTarget {
     this.expect = 1; // the next VIDEO seq to deliver
     this.early = new Map(); // seq -> VIDEO message that came before `expect`'s
     this.lost = 0; // video streams that failed before giving their seq
-    this.timer = 0;
     this.start(pageUrl);
   }
 
   async start(pageUrl) {
     let advert = null;
-    // Only an answer counts: an unreachable server (restarting, say) may offer it again.
-    let answered = false;
     try {
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), ADVERT_TIMEOUT_MS);
-      const r = await fetch(new URL('transport', pageUrl), { cache: 'no-store', signal: ctl.signal });
-      answered = r.ok || r.status === 404;
+      const r = await fetch(new URL('transport', pageUrl), {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(ADVERT_TIMEOUT_MS),
+      });
       if (r.ok) advert = (await r.json()).wt ?? null;
-      clearTimeout(t);
     } catch { /* unreachable, or not JSON */ }
     if (this.readyState === 3) return;
     if (!advert || !advert.port || !Array.isArray(advert.hashes)) {
-      if (answered) noAdvert = true;
-      this.fallback(false);
+      this.ended(1006);
       return;
     }
     const host = hostForUrl(new URL(pageUrl).hostname);
     const url = `https://${host}:${advert.port}/stream?ticket=${encodeURIComponent(advert.ticket || '')}`;
-    this.timer = setTimeout(() => this.fallback(true), TRY_MS);
     try {
       this.wt = new WebTransport(url, {
         serverCertificateHashes: advert.hashes.map((h) => ({ algorithm: 'sha-256', value: hexBytes(h) })),
@@ -127,16 +80,8 @@ export class WtSocket extends EventTarget {
       this.readVideo();
       this.emit(new Event('open'));
     } catch {
-      this.fallback(true);
+      this.ended(1006);
     }
-  }
-
-  /** Gives up before the server answered: the page should use the WebSocket. */
-  fallback(remember) {
-    if (this.readyState === 3 || this.heard) return;
-    if (remember) store(FAILED_KEY, JSON.stringify({ n: failures().n + 1, at: Date.now() }));
-    this.shut();
-    if (this.onfallback) this.onfallback();
   }
 
   send(data) {
@@ -166,20 +111,15 @@ export class WtSocket extends EventTarget {
   }
 
   shut() {
-    clearTimeout(this.timer);
     this.readyState = 3;
     if (this.wt) {
       try { this.wt.close(); } catch { /* closed already */ }
     }
   }
 
-  /** The session ended: a close event once, after the server's first message. */
+  /** The session ended (or never came up): one close event. */
   ended(code) {
     if (this.readyState === 3) return;
-    if (!this.heard) {
-      this.fallback(true);
-      return;
-    }
     this.shut();
     this.emit(new CloseEvent('close', { code }));
   }
@@ -232,8 +172,6 @@ export class WtSocket extends EventTarget {
     else return;
     if (!this.heard) {
       this.heard = true;
-      clearTimeout(this.timer);
-      store(FAILED_KEY, null);
       this.drainVideo();
     }
   }

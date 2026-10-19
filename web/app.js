@@ -1,6 +1,6 @@
 // tilt web client: connection, decoder, renderer, UI, stats and debug hooks (brief 6).
 import { createInput, message } from './input.js';
-import { WtSocket, wtCandidate } from './transport.js';
+import { WtSocket } from './transport.js';
 
 const VIDEO = 0x01;
 const CURSOR_SHAPE = 0x02;
@@ -9,7 +9,6 @@ const PONG = 0x04;
 const ACK = 0x10;
 const PING = 0x11;
 const FLAG_KEY = 1;
-const FLAG_MORE = 2;
 const VIDEO_HEADER = 18;
 
 const CLIENT = 'tilt-web/0.1';
@@ -153,8 +152,6 @@ function readOptions() {
     probe: probe.length === 2 && probe.every((v) => Number.isInteger(v) && v >= 0) ? probe : null,
     scale: get('scale') === '1' ? '1' : 'fit',
     framing: get('framing') === 'avcc' ? 'avcc' : 'annexb',
-    // 'ws' never tries the WebTransport fast path; 'udp' tries it despite a remembered failure.
-    transport: ['ws', 'udp'].includes(get('transport')) ? get('transport') : '',
   };
 }
 
@@ -189,8 +186,6 @@ const stats = {
   // Beyond the brief's list: the server's session id and the H.264 framing in use (annexb | avcc).
   session: '',
   framing: opts.framing,
-  // 'udp' (WebTransport) or 'ws', for the stats overlay and tests.
-  transport: '',
 };
 const probeEvents = [];
 
@@ -230,7 +225,6 @@ const video = {
   lastOutputAt: 0,
   flush: null, // a watchdog flush in progress: { at, seq, decoded }
   needKey: true,
-  frag: null,
   pending: new Map(), // seq -> receive time, in seq order, until acked
   frame: null, // a decoded frame waiting for the next refresh
   raf: 0, // the next refresh is booked: frames until then wait for it
@@ -261,7 +255,7 @@ const ctx = context2d();
 
 function wsSend(data) {
   const ws = conn.ws;
-  if (!ws || ws.readyState !== WebSocket.OPEN || !conn.welcomed) return false;
+  if (!ws || ws.readyState !== 1 || !conn.welcomed) return false;
   ws.send(data);
   return true;
 }
@@ -270,54 +264,19 @@ const sendJson = (obj) => wsSend(JSON.stringify(obj));
 
 // ---- connection
 
-function streamUrl() {
-  const url = new URL('stream', location.href);
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  url.hash = '';
-  return url.href;
-}
-
 function connect() {
   clearTimeout(conn.timer);
   conn.timer = 0;
   detach();
   conn.openedAt = performance.now();
   setDot('wait', 'Connecting');
-  if (!wtCandidate(opts.transport)) {
-    openWebSocket();
-    return;
-  }
-  // The UDP fast path, if the server offers it and the network lets it through; otherwise it
-  // hands over to the WebSocket within a couple of seconds (transport.js).
-  const wt = new WtSocket(location.href);
-  wt.onfallback = () => {
-    if (wt === conn.ws) openWebSocket();
-  };
-  // A video stream that never arrived: ack past it and resync on a keyframe.
-  wt.onskip = (seq) => {
-    if (wt === conn.ws && conn.welcomed) skipFrame(seq);
-  };
-  attach(wt, 'udp');
-}
-
-function openWebSocket() {
-  let ws;
-  try {
-    ws = new WebSocket(streamUrl());
-  } catch (e) {
-    conn.ws = null;
-    conn.fatal = `Cannot open the stream: ${e.message}`;
+  if (typeof WebTransport !== 'function') {
+    conn.fatal = 'This browser cannot open the stream: tilt needs WebTransport (Chrome or Edge).';
     showFatal();
     return;
   }
-  ws.binaryType = 'arraybuffer';
-  attach(ws, 'ws');
-}
-
-/** Makes `ws` (a WebSocket or a WtSocket) the session's connection. */
-function attach(ws, transport) {
+  const ws = new WtSocket(location.href);
   conn.ws = ws;
-  stats.transport = transport;
   ws.onopen = () => {
     if (ws !== conn.ws) return;
     const hello = { t: 'hello', v: 1 };
@@ -332,6 +291,10 @@ function attach(ws, transport) {
   ws.onclose = (ev) => {
     if (ws === conn.ws) onClosed(ev.code);
   };
+  // A video stream that never arrived: ack past it and resync on a keyframe.
+  ws.onskip = (seq) => {
+    if (ws === conn.ws && conn.welcomed) skipFrame(seq);
+  };
 }
 
 /** Drops the current socket without running its close handling. */
@@ -339,7 +302,7 @@ function detach() {
   const ws = conn.ws;
   conn.ws = null;
   if (!ws) return;
-  ws.onopen = ws.onmessage = ws.onclose = ws.onfallback = ws.onskip = null;
+  ws.onopen = ws.onmessage = ws.onclose = ws.onskip = null;
   try { ws.close(); } catch { /* already closing */ }
 }
 
@@ -402,7 +365,6 @@ function endSession() {
   stats.control = false;
   // A fresh session restarts seq at 1: frames still inside the old decoder must never ack into it.
   closeDecoder(false);
-  video.frag = null;
   clearTimeout(video.idrTimer);
   video.idrTimer = 0;
   video.lastIdrAt = -Infinity;
@@ -596,32 +558,8 @@ function onVideo(buf) {
   const seq = dv.getUint32(2, true);
   const width = dv.getUint16(14, true);
   const height = dv.getUint16(16, true);
-  const part = new Uint8Array(buf, VIDEO_HEADER);
   stats.bytes += buf.byteLength;
-  let f = video.frag;
-  if (f && f.seq !== seq) {
-    // Fragments of a seq are contiguous on the socket; never wedge on a server that breaks that.
-    video.frag = null;
-    skipFrame(f.seq);
-    f = null;
-  }
-  if (flags & FLAG_MORE) {
-    if (!f) f = video.frag = { seq, parts: [], len: 0 };
-    f.parts.push(part);
-    f.len += part.length;
-    return;
-  }
-  let data = part;
-  if (f) {
-    video.frag = null;
-    data = new Uint8Array(f.len + part.length);
-    let o = 0;
-    for (const p of [...f.parts, part]) {
-      data.set(p, o);
-      o += p.length;
-    }
-  }
-  onAccessUnit(seq, (flags & FLAG_KEY) !== 0, width, height, data);
+  onAccessUnit(seq, (flags & FLAG_KEY) !== 0, width, height, new Uint8Array(buf, VIDEO_HEADER));
 }
 
 /** Acks a frame that will not be decoded (decode_ms 0) and asks for a keyframe. */
@@ -1398,7 +1336,7 @@ function updateStats(now) {
   const s = serverStats || {};
   ui.stats.textContent = [
     `fps    ${n(rates.fpsDecoded)} decoded  ${n(rates.fpsDrawn)} drawn`,
-    `recv   ${n(rates.kbps, 0)} kbps   ping ${stats.rttMs ?? '-'} ms   ${stats.transport || '-'}`,
+    `recv   ${n(rates.kbps, 0)} kbps   ping ${stats.rttMs ?? '-'} ms`,
     `video  ${stats.width}x${stats.height} ${stats.codec || '-'} ${video.framing}${video.hw === 'prefer-software' ? ' software' : ''}  queue ${video.decoder ? video.decoder.decodeQueueSize : 0}`,
     `you    ${stats.role ? `${stats.role} role` : '-'}${stats.control ? ', in control' : ''}  errors ${stats.decodeErrors}  stalls ${stats.decoderStalls}`,
     `server ${n(s.fps)} fps  ${n(s.kbps, 0)} kbps  target ${n(s.bitrate_kbps, 0)} kbps`,
