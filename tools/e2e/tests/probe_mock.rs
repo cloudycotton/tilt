@@ -1,91 +1,29 @@
-//! Runs the tilt-probe binary against an in-process mock of tilt's stream (docs/protocol.md):
-//! GET /transport over HTTP, then a WebTransport session. The mock encodes the test pattern
-//! with OpenH264, sends every access unit on a stream of its own, and advances the marker on KEY
-//! and button-1 input the way tilt plus tilt-testpattern do. Its framing is written
-//! independently of the probe's, straight from the protocol.
+//! Runs the tilt-probe binary against an in-process mock of tilt's /stream (brief section 4).
+//! The mock encodes the test pattern with OpenH264, fragments every access unit, and advances
+//! the marker on KEY and button-1 input the way tilt plus tilt-testpattern do. Its framing is
+//! written independently of the probe's, straight from the brief.
 
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::{Sink, SinkExt, StreamExt};
 use openh264::encoder::{Encoder, EncoderConfig, FrameRate, FrameType, QpRange, RateControlMode};
 use openh264::formats::YUVBuffer;
 use openh264::OpenH264API;
 use serde_json::{json, Value};
 use tilt_e2e::{BACKGROUND, COLORS, MARKER_ORIGIN, MARKER_SIZE};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::Message;
 
 const W: usize = 640;
 const H: usize = 480;
+/// Small, so that keyframes arrive in several fragments.
+const MAX_MSG: usize = 1500;
 const TAIL_FRAMES: u32 = 5;
 const TOKEN: &str = "secret";
-const TICKET: &str = "mock-ticket";
-
-/// One protocol message.
-#[derive(Debug)]
-enum Message {
-    Text(String),
-    Binary(Vec<u8>),
-    Close,
-}
-
-/// A control-stream frame: u32 length (LE, kind byte included), kind, payload.
-fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
-    let len = (payload.len() as u32 + 1).to_le_bytes();
-    [&len[..], &[kind], payload].concat()
-}
-
-async fn send(tx: &mut SendStream, msg: Message) -> anyhow::Result<()> {
-    let bytes = match msg {
-        Message::Text(t) => frame(0, t.as_bytes()),
-        Message::Binary(b) => frame(1, &b),
-        Message::Close => unreachable!("the mock closes with close_with"),
-    };
-    Ok(tx.write_all(&bytes).await?)
-}
-
-async fn close_with(tx: &mut SendStream, code: u16, reason: &str) {
-    let payload = [&code.to_le_bytes()[..], reason.as_bytes()].concat();
-    let _ = tx.write_all(&frame(2, &payload)).await;
-    let _ = tokio::time::timeout(Duration::from_secs(1), tx.finish()).await;
-}
-
-/// Reads the client's control-stream messages into a channel; it ends with the stream.
-fn read_control(mut rx: RecvStream) -> mpsc::UnboundedReceiver<Message> {
-    let (tx, out) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            while buf.len() >= 5 {
-                let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
-                if buf.len() < 4 + len {
-                    break;
-                }
-                let kind = buf[4];
-                let payload = buf[5..4 + len].to_vec();
-                buf.drain(..4 + len);
-                let msg = match kind {
-                    0 => Message::Text(String::from_utf8(payload).expect("utf-8")),
-                    1 => Message::Binary(payload),
-                    2 => Message::Close,
-                    k => panic!("unknown kind {k}"),
-                };
-                if tx.send(msg).is_err() {
-                    return;
-                }
-            }
-            match rx.read(&mut chunk).await {
-                Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
-                _ => return,
-            }
-        }
-    });
-    out
-}
 
 #[derive(Clone, Copy, Default)]
 struct Mock {
@@ -166,22 +104,33 @@ fn encoder() -> Encoder {
     Encoder::with_api_config(OpenH264API::from_source(), config).expect("encoder")
 }
 
-/// The VIDEO message for one access unit: 18-byte header, then the whole unit.
-fn video_message(seq: u32, key: bool, au: &[u8]) -> Vec<u8> {
-    let mut m = vec![0x01, u8::from(key)];
-    m.extend_from_slice(&seq.to_le_bytes());
-    m.extend_from_slice(&123_456u64.to_le_bytes());
-    m.extend_from_slice(&(W as u16).to_le_bytes());
-    m.extend_from_slice(&(H as u16).to_le_bytes());
-    m.extend_from_slice(au);
-    m
+/// VIDEO messages for one access unit: 18-byte header, MORE on all but the last fragment.
+fn video_messages(seq: u32, key: bool, au: &[u8]) -> Vec<Vec<u8>> {
+    let chunks: Vec<&[u8]> = au.chunks(MAX_MSG - 18).collect();
+    let last = chunks.len() - 1;
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let flags = u8::from(key) | if i < last { 2 } else { 0 };
+            let mut m = vec![0x01, flags];
+            m.extend_from_slice(&seq.to_le_bytes());
+            m.extend_from_slice(&123_456u64.to_le_bytes());
+            m.extend_from_slice(&(W as u16).to_le_bytes());
+            m.extend_from_slice(&(H as u16).to_le_bytes());
+            m.extend_from_slice(part);
+            m
+        })
+        .collect()
 }
 
-/// Sends one access unit on a unidirectional stream of its own.
-async fn send_unit(conn: &Connection, seq: u32, key: bool, au: &[u8]) -> anyhow::Result<()> {
-    let mut stream = conn.open_uni().await?.await?;
-    stream.write_all(&video_message(seq, key, au)).await?;
-    let _ = stream.finish().await;
+async fn send_unit<S>(tx: &mut S, seq: u32, key: bool, au: &[u8]) -> Result<(), S::Error>
+where
+    S: Sink<Message> + Unpin,
+{
+    for m in video_messages(seq, key, au) {
+        tx.send(Message::binary(m)).await?;
+    }
     Ok(())
 }
 
@@ -189,63 +138,37 @@ fn denormalize(v: u16, extent: usize) -> u32 {
     (f64::from(v) * (extent - 1) as f64 / 65535.0).round() as u32
 }
 
-/// Answers GET /transport (any number of times) with the stream's address.
-async fn serve_http(listener: TcpListener, port: u16, hash: String) {
-    loop {
-        let Ok((mut tcp, _)) = listener.accept().await else {
-            return;
-        };
-        let mut req = [0u8; 2048];
-        let n = tcp.read(&mut req).await.unwrap_or(0);
-        let ok = String::from_utf8_lossy(&req[..n]).starts_with("GET /transport ");
-        let body = json!({"wt": {"port": port, "hashes": [hash], "ticket": TICKET}}).to_string();
-        let response = if ok {
-            format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            )
-        } else {
-            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into()
-        };
-        let _ = tcp.write_all(response.as_bytes()).await;
-    }
-}
+async fn serve(listener: TcpListener, mock: Mock, seen: Arc<Mutex<Seen>>) {
+    let (tcp, _) = listener.accept().await.expect("accept");
+    tcp.set_nodelay(true).expect("nodelay");
+    let ws = tokio_tungstenite::accept_async(tcp)
+        .await
+        .expect("ws accept");
+    let (mut tx, mut rx) = ws.split();
+    let text = |v: Value| Message::text(v.to_string());
 
-async fn serve(
-    endpoint: Endpoint<wtransport::endpoint::endpoint_side::Server>,
-    mock: Mock,
-    seen: Arc<Mutex<Seen>>,
-) {
-    let request = endpoint.accept().await.await.expect("session request");
-    assert_eq!(request.path(), format!("/stream?ticket={TICKET}"));
-    let conn = request.accept().await.expect("accept");
-    let (mut tx, rx) = conn.accept_bi().await.expect("control stream");
-    let mut rx = read_control(rx);
-    let text = |v: Value| Message::Text(v.to_string());
-
-    let hello: Value = match rx.recv().await {
-        Some(Message::Text(t)) => serde_json::from_str(&t).expect("hello json"),
+    let hello: Value = match rx.next().await {
+        Some(Ok(Message::Text(t))) => serde_json::from_str(&t).expect("hello json"),
         other => panic!("expected hello, got {other:?}"),
     };
     seen.lock().unwrap().hello = hello.clone();
     if hello["token"] != TOKEN {
-        send(&mut tx, text(json!({"t": "error", "code": "auth"})))
+        tx.send(text(json!({"t": "error", "code": "auth"})))
             .await
             .unwrap();
-        close_with(&mut tx, 4001, "auth").await;
-        // Until the probe hangs up, so the close reaches it.
-        let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
+        let close = CloseFrame {
+            code: CloseCode::from(4001),
+            reason: "auth".into(),
+        };
+        let _ = tx.send(Message::Close(Some(close))).await;
         return;
     }
     let welcome = json!({"t": "welcome", "v": 1, "session": "s1", "role": "control",
                          "screen": {"w": W, "h": H}, "server": "mock"});
-    send(&mut tx, text(welcome)).await.unwrap();
-    send(
-        &mut tx,
-        text(json!({"t": "control", "you": false, "held": false})),
-    )
-    .await
-    .unwrap();
+    tx.send(text(welcome)).await.unwrap();
+    tx.send(text(json!({"t": "control", "you": false, "held": false})))
+        .await
+        .unwrap();
 
     let mut enc = encoder();
     let mut state = State {
@@ -264,7 +187,7 @@ async fn serve(
             delta.to_vec()
         };
         seq += 1;
-        send_unit(&conn, seq, false, &delta).await.unwrap();
+        send_unit(&mut tx, seq, false, &delta).await.unwrap();
         seen.lock().unwrap().sent.push(seq);
     }
 
@@ -273,15 +196,11 @@ async fn serve(
     let mut tick = tokio::time::interval(Duration::from_micros(16_667));
     loop {
         tokio::select! {
-            msg = rx.recv() => {
-                let Some(msg) = msg else { break };
-                if matches!(msg, Message::Close) {
-                    close_with(&mut tx, 1000, "").await;
-                    break;
-                }
+            msg = rx.next() => {
+                let Some(Ok(msg)) = msg else { break };
                 let reply = state.handle(msg, &mut seen.lock().unwrap());
                 if let Some(reply) = reply {
-                    if send(&mut tx, reply).await.is_err() {
+                    if tx.send(reply).await.is_err() {
                         break;
                     }
                 }
@@ -307,7 +226,7 @@ async fn serve(
                     // A non-IDR slice header followed by noise.
                     au = [&[0, 0, 0, 1, 0x41][..], &[0x9a; 600]].concat();
                 }
-                if send_unit(&conn, seq, key, &au).await.is_err() {
+                if send_unit(&mut tx, seq, key, &au).await.is_err() {
                     break;
                 }
                 seen.lock().unwrap().sent.push(seq);
@@ -340,7 +259,7 @@ impl State {
                 match v["t"].as_str() {
                     Some("control") if v["take"] == true => {
                         seen.took_control = true;
-                        return Some(Message::Text(
+                        return Some(Message::text(
                             json!({"t": "control", "you": true, "held": true}).to_string(),
                         ));
                     }
@@ -358,7 +277,7 @@ impl State {
                     (0x10, 7) => seen.acks.push((u32_at(1), u16_at(5))),
                     (0x11, 5) => {
                         seen.pings += 1;
-                        return Some(Message::Binary([&[0x04][..], &b[1..5]].concat()));
+                        return Some(Message::binary([&[0x04][..], &b[1..5]].concat()));
                     }
                     (0x20, 5) => seen
                         .moves
@@ -381,7 +300,8 @@ impl State {
                     _ => panic!("unexpected client message {b:?}"),
                 }
             }
-            Message::Close => {}
+            // Close: keep reading, the next poll sends tungstenite's close reply.
+            _ => {}
         }
         None
     }
@@ -402,24 +322,10 @@ struct Run {
 }
 
 async fn probe(mock: Mock, args: &[&str]) -> Run {
-    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let hash: String = identity.certificate_chain().as_slice()[0]
-        .hash()
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let config = ServerConfig::builder()
-        .with_bind_address("127.0.0.1:0".parse().unwrap())
-        .with_identity(identity)
-        .build();
-    let endpoint = Endpoint::server(config).unwrap();
-    let udp_port = endpoint.local_addr().unwrap().port();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/", listener.local_addr().unwrap());
-    let http = tokio::spawn(serve_http(listener, udp_port, hash));
+    let url = format!("ws://{}/stream", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Seen::default()));
-    let server = tokio::spawn(serve(endpoint, mock, seen.clone()));
+    let server = tokio::spawn(serve(listener, mock, seen.clone()));
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tilt-probe"));
     cmd.args(["--url", &url, "--json"])
@@ -433,7 +339,6 @@ async fn probe(mock: Mock, args: &[&str]) -> Run {
         .await
         .expect("mock did not finish")
         .expect("mock panicked");
-    http.abort();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let report =

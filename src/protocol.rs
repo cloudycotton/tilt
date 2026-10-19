@@ -31,6 +31,8 @@ pub const MSG_RELEASE_ALL: u8 = 0x32;
 
 /// VIDEO flags bit0: an IDR with SPS+PPS in the payload.
 pub const FLAG_KEY: u8 = 1 << 0;
+/// VIDEO flags bit1: another fragment of the same seq follows.
+pub const FLAG_MORE: u8 = 1 << 1;
 /// VIDEO header length, type byte included.
 pub const VIDEO_HEADER_LEN: usize = 18;
 /// The most UTF-8 one TEXT message types; the rest is dropped. Typing is slow (a character
@@ -98,12 +100,33 @@ impl VideoHeader {
     }
 }
 
-/// One Annex B access unit as a VIDEO message: header, then the whole access unit.
-pub fn video_message(header: VideoHeader, access_unit: &[u8]) -> Bytes {
-    let mut msg = BytesMut::with_capacity(VIDEO_HEADER_LEN + access_unit.len());
-    msg.put_slice(&header.to_bytes());
-    msg.put_slice(access_unit);
-    msg.freeze()
+/// Frames one Annex B access unit as VIDEO messages of at most `max_msg_bytes` each, header
+/// included. Every fragment repeats `header`; FLAG_MORE is set on all but the last.
+pub fn video_messages(header: VideoHeader, access_unit: &[u8], max_msg_bytes: usize) -> Vec<Bytes> {
+    let room = max_msg_bytes.saturating_sub(VIDEO_HEADER_LEN).max(1);
+    let base = header.flags & !FLAG_MORE;
+    // An empty access unit still yields one (header-only) message, so every seq reaches the client.
+    let count = access_unit.len().div_ceil(room).max(1);
+    (0..count)
+        .map(|i| {
+            let chunk = &access_unit
+                [(i * room).min(access_unit.len())..((i + 1) * room).min(access_unit.len())];
+            let flags = if i + 1 < count {
+                base | FLAG_MORE
+            } else {
+                base
+            };
+            let mut msg = BytesMut::with_capacity(VIDEO_HEADER_LEN + chunk.len());
+            msg.put_slice(&VideoHeader { flags, ..header }.to_bytes());
+            msg.put_slice(chunk);
+            msg.freeze()
+        })
+        .collect()
+}
+
+/// Whether `msg` is a VIDEO fragment that another fragment of the same seq follows.
+pub fn video_has_more(msg: &[u8]) -> bool {
+    matches!(msg, [MSG_VIDEO, flags, ..] if flags & FLAG_MORE != 0)
 }
 
 /// CURSOR_SHAPE: serial, size, hotspot, then w*h*4 bytes of straight-alpha RGBA (w=h=0 means hidden).
@@ -547,8 +570,7 @@ mod tests {
         assert_eq!(VideoHeader::parse(&wrong_type), None);
     }
 
-    #[test]
-    fn a_video_message_is_the_header_and_the_whole_access_unit() {
+    fn fragments(len: usize, max: usize) -> Vec<Bytes> {
         let header = VideoHeader {
             flags: FLAG_KEY,
             seq: 7,
@@ -556,11 +578,59 @@ mod tests {
             width: 64,
             height: 48,
         };
-        let au: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
-        let msg = video_message(header, &au);
-        assert_eq!(VideoHeader::parse(&msg), Some((header, &au[..])));
-        let empty = video_message(header, &[]);
-        assert_eq!(empty.len(), VIDEO_HEADER_LEN);
+        let au: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let msgs = video_messages(header, &au, max);
+        // Every fragment fits, repeats the header, and only the last lacks MORE.
+        let mut joined = Vec::new();
+        for (i, m) in msgs.iter().enumerate() {
+            assert!(m.len() <= max, "fragment {i} is {} > {max}", m.len());
+            let (h, payload) = VideoHeader::parse(m).unwrap();
+            let more = i + 1 < msgs.len();
+            assert_eq!(
+                h,
+                VideoHeader {
+                    flags: if more { FLAG_KEY | FLAG_MORE } else { FLAG_KEY },
+                    ..header
+                }
+            );
+            joined.extend_from_slice(payload);
+        }
+        assert_eq!(joined, au);
+        msgs
+    }
+
+    #[test]
+    fn fragmentation_boundaries() {
+        let max = 1024;
+        let room = max - VIDEO_HEADER_LEN;
+        assert_eq!(fragments(0, max).len(), 1);
+        assert_eq!(fragments(1, max).len(), 1);
+        assert_eq!(fragments(room - 1, max).len(), 1);
+        let exact = fragments(room, max);
+        assert_eq!((exact.len(), exact[0].len()), (1, max));
+        let over = fragments(room + 1, max);
+        assert_eq!(over.len(), 2);
+        assert_eq!((over[0].len(), over[1].len()), (max, VIDEO_HEADER_LEN + 1));
+        let two = fragments(2 * room, max);
+        assert_eq!((two.len(), two[1].len()), (2, max));
+        // The writer keeps fragments together by this flag.
+        assert!(video_has_more(&two[0]) && !video_has_more(&two[1]));
+        assert!(!video_has_more(&[]) && !video_has_more(&[MSG_VIDEO]));
+        assert!(!video_has_more(&pong_msg(0x0202_0202)));
+        assert_eq!(fragments(2 * room + 1, max).len(), 3);
+        assert_eq!(fragments(262_144 * 3, 262_144).len(), 4);
+        // A caller's stray MORE bit never leaks onto the last fragment.
+        let h = VideoHeader {
+            flags: FLAG_MORE,
+            seq: 1,
+            capture_us: 0,
+            width: 2,
+            height: 2,
+        };
+        let msgs = video_messages(h, &[1, 2, 3], max);
+        assert_eq!(VideoHeader::parse(&msgs[0]).unwrap().0.flags, 0);
+        // Degenerate limits still make progress.
+        assert_eq!(video_messages(h, &[1, 2, 3], 0).len(), 3);
     }
 
     #[test]

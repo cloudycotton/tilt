@@ -3,71 +3,55 @@
 This is the contract between the tilt server and any client: the bundled web page, a native
 WebView or a test probe. The server's implementation is `src/protocol.rs` and `src/session.rs`.
 
-**In short:** fetch `transport` next to the page, open the WebTransport session it names, send
-`{"t":"hello","v":1,"token":"…"}` on a bidirectional stream, then receive H.264 frames (one per
-unidirectional stream; decode them with WebCodecs) and send ACKs, a PING every second, and mouse
-and key events back. The rest of this page is the exact contract.
+**In short:** open a WebSocket at `stream` next to the page, send
+`{"t":"hello","v":1,"token":"…"}`, then receive H.264 frames (decode them with WebCodecs) and
+send ACKs, a PING every second, and mouse and key events back. The rest of this page is the
+exact contract.
 
-All binary integers are little-endian. Every message is either:
+All binary integers are little-endian. Every WebSocket message is either:
 - binary: the first byte is the message type;
 - text: a JSON object with a string field `t`.
 
-## 1. Connecting
+## 1. Handshake
 
-1. **Discovery.** `GET transport` next to the page (`/transport`, or `/<prefix>/transport`)
-   returns `{"wt":{"port":N,"hashes":["<sha-256 hex>"],"ticket":"…"}}`: the UDP port of the
-   stream (by default the HTTP port), the certificate's hash, and a ticket.
-2. **Session.** Open `https://<host>:<port>/stream?ticket=<ticket>` with WebTransport, where
-   `host` is the page's host (`127.0.0.1` for `localhost`: Chrome dials `localhost` over QUIC on
-   `::1` only), with `serverCertificateHashes: [{algorithm: 'sha-256', value: <hash bytes>}]`
-   for each of `hashes`. The certificate is self-signed ECDSA P-256, valid for 14 days (from a
-   day before it was made) and replaced every 6 days, so fetch `transport` before each
-   connection. A request without the right ticket gets HTTP 403: other sites' pages cannot read
-   `transport`, so a session with the ticket comes from a page this server served. Unknown
-   paths get 404.
-3. **Control stream.** The client opens one bidirectional stream. Every message except VIDEO
-   travels on it, in both directions, as `u32 length (LE) | u8 kind | payload`, `length`
-   counting the kind byte and the payload:
+1. The client opens `ws(s)://<host>/<base>/stream` with no subprotocol: `stream` resolved
+   against the page's URL (a native client: against the base URL it was given), with the
+   scheme switched, as the web client does:
+   ```js
+   const url = new URL('stream', location.href);
+   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+   url.hash = '';
+   ```
+   This keeps any path prefix (`https://host/desktop/` → `wss://host/desktop/stream`) and uses
+   `ws:` for a plain-HTTP server such as `http://localhost:6090`.
 
-   | kind | payload |
-   |---|---|
-   | 0 | a JSON (text) message, UTF-8 |
-   | 1 | a binary message (type byte first) |
-   | 2 | close: `u16 code (LE)`, then the UTF-8 reason; the codes of 1.10 |
-
-   The server sends a kind-2 close before it ends a session, then finishes the stream and closes
-   the QUIC connection once the client has acknowledged it. A client that reads the end of the
-   stream or loses the connection without a close treats it as an abnormal close (1006) and
-   reconnects. Messages longer than 64 KiB + 1 end the session.
-4. **Video.** Each access unit arrives on its own server-opened unidirectional stream: one VIDEO
-   message (section 2), then the end of the stream. Streams may complete out of order: decode in
-   `seq` order, starting at 1. If a stream fails before its header was read, skip to the oldest
-   seq that did arrive, ACK the last skipped seq (ACKs are cumulative) and request an IDR. VIDEO
-   may arrive before the `welcome` on the control stream: hold it until then. A lost packet
-   delays only the frame it belongs to, never cursor updates, PONGs, input or the frames after
-   it. The server uses BBR congestion control; the ACK credit of section 3 decides how much
-   video is in flight.
-5. Within 5 s the client sends, on the control stream, the text message
+   With `--no-auth` the upgrade is refused (HTTP 403) when the request has an `Origin` header
+   whose host and port are not those of its `Host` header (or of an `X-Forwarded-Host` or
+   `Forwarded: host=` added by a proxy that rewrites `Host`) and that is not listed in
+   `--allow-origin` (`*` allows any): everyone who connects gets control, and browsers do not
+   stop other sites' pages from opening WebSockets. Clients that send no `Origin` (probes,
+   native apps) are unaffected, and token modes do not check `Origin`.
+2. Within 5 s the client sends the text message
    `{"t":"hello","v":1,"token":"<token>","client":"tilt-web/0.1"}`.
-   The `token` field may be omitted only in no-auth mode. Tokens never go in a URL; the web
-   client reads them from the page's URL fragment (`#token=`).
-6. If `v != 1`, the server replies `{"t":"error","code":"version","msg":...}` and closes.
-7. If the token is wrong, the server sleeps 500 ms, then sends `{"t":"error","code":"auth"}` and
+   The `token` field may be omitted only in no-auth mode. Tokens never go in the query string;
+   the web client reads them from the URL fragment (`#token=`).
+3. If `v != 1`, the server replies `{"t":"error","code":"version","msg":...}` and closes.
+4. If the token is wrong, the server sleeps 500 ms, then sends `{"t":"error","code":"auth"}` and
    closes.
-8. If viewers already number `--max-viewers`, the server sends `{"t":"error","code":"busy"}` and
+5. If viewers already number `--max-viewers`, the server sends `{"t":"error","code":"busy"}` and
    closes, unless one of those sessions has sent nothing for over 5 s: then the longest-silent
    one is closed (1000) and the new one admitted. If the token file is missing or holds no
    token yet, it sends `{"t":"error","code":"not_ready"}` and closes.
-9. On success the server sends, in this order:
+6. On success the server sends, in this order:
    - `{"t":"welcome","v":1,"session":"s7","role":"control"|"view","screen":{"w":W,"h":H},"server":"tilt/0.1.0"}`
    - `{"t":"control","you":bool,"held":bool,"holder":"s3"}` (see section 4)
    - CURSOR_SHAPE and CURSOR_POS, if known
    - then video, starting with a KEY frame.
-10. Close codes:
+7. Close codes:
 
 | code | meaning |
 |---|---|
-| 1000 | normal; also sent after 30 s without any client message (reason `idle`), and to a session silent for over 5 s whose place a new client takes (see 1.8) |
+| 1000 | normal; also sent after 30 s without any client message (reason `idle`), and to a session silent for over 5 s whose place a new client takes (see 1.5) |
 | 1001 | the server is shutting down |
 | 1008 | more than 100 malformed messages |
 | 1011 | server-side failure (the session's encoder thread could not start or stopped) |
@@ -77,7 +61,8 @@ All binary integers are little-endian. Every message is either:
 | 4004 | not_ready: the token file is missing or holds no token yet |
 | 4005 | hello timeout: no `hello` within 5 s |
 
-Codes 1000, 1001, 1008 and 1011 follow their WebSocket meanings; clients should treat any close as "reconnect with backoff", except 4001 and 4003, which will
+Codes 1001, 1008 and 1011 are standard WebSocket codes the server uses beyond the 4xxx set;
+clients should treat any close as "reconnect with backoff", except 4001 and 4003, which will
 not succeed on retry. A 4004 means the token file has not been written yet: retrying later is
 expected to work.
 
@@ -91,9 +76,11 @@ expected to work.
 | 0x04 | PONG | `u32 t` (echo of PING.t) |
 
 VIDEO fields:
-- **flags:** bit0 KEY: an IDR, with SPS+PPS present in the payload.
-- **seq:** a per-session counter, starting at 1 and incremented once per access unit. It is a
-  u32 and wraps (skipping 0).
+- **flags:**
+  - bit0 KEY: an IDR, with SPS+PPS present in the payload.
+  - bit1 MORE: another fragment of the same seq follows.
+- **seq:** a per-session counter, starting at 1 and incremented once per access unit, not per
+  fragment. It is a u32 and wraps (skipping 0).
 - **capture_us:** the server's monotonic µs at capture. It is informational.
 - **width, height:** the coded size, which is the even-cropped screen size.
 - **payload:** Annex B (00 00 00 01 start codes), one access unit per seq.
@@ -105,6 +92,11 @@ VIDEO fields:
   constraint flags, level_idc): `avc1.640C2A` for 1920×1080 with High, `avc1.42C02A` with
   Baseline. The level follows the screen size, so take it from every KEY frame's SPS rather
   than from the first.
+- **Fragmentation:** an access unit larger than `--max-msg-bytes` (default 65536, header
+  included) is split into several VIDEO messages with identical headers. MORE is set on every
+  fragment but the last. Fragments of one seq are always contiguous on the socket: no other
+  message (cursor, PONG, JSON) is sent between them. Reassemble by concatenating payloads until
+  a fragment without MORE arrives.
 
 Cursor messages: CURSOR_SHAPE is sent when the cursor image changes (new serial), CURSOR_POS
 when the pointer moves. Captured frames never contain the cursor; draw it from these.
@@ -114,7 +106,7 @@ The shape is at most 128×128.
 
 | type | name | layout after the type byte |
 |---|---|---|
-| 0x10 | ACK | `u32 seq, u16 decode_ms` — sent once per VIDEO seq when the decoder outputs it (or discards it); decode_ms = ms from receipt to output, saturating. Acks are cumulative: ACK(n) acks every seq ≤ n. |
+| 0x10 | ACK | `u32 seq, u16 decode_ms` — sent once per VIDEO seq when the decoder outputs it (or discards it); decode_ms = ms from last-fragment receipt to output, saturating. Acks are cumulative: ACK(n) acks every seq ≤ n. |
 | 0x11 | PING | `u32 t` (client ms clock, wraps) — every 1 s while connected; doubles as the heartbeat |
 | 0x20 | MOVE | `u16 x, u16 y` — normalized: 0 = left/top edge pixel, 65535 = right/bottom edge pixel |
 | 0x21 | BUTTON | `u8 button, u8 down, u16 x, u16 y` — X button numbers 1 left, 2 middle, 3 right, 8 back, 9 forward |
@@ -137,9 +129,9 @@ view-role session. ACK and PING are always processed.
 Flow control depends on ACKs: the server only has a few frames in flight per session (3 to 32,
 scaled with the round trip) and encodes nothing more until they are acknowledged. A client that
 stops acking stops receiving video. When nothing has moved for 5 s, neither an ACK arrived nor
-VIDEO was written, the server forgets the frames in flight and goes on; after each such reset
-with no ACK since, the next wait doubles, up to 20 s. It sends no KEY frame for this (streams
-lose nothing): a client that needs one asks with `{"t":"idr"}`. A late ACK for a
+VIDEO was written to the socket, the server forgets the frames in flight and goes on; after
+each such reset with no ACK since, the next wait doubles, up to 20 s. It sends no KEY frame for
+this (TCP lost nothing): a client that needs one asks with `{"t":"idr"}`. A late ACK for a
 forgotten frame is harmless. Never drop a VIDEO seq without acking it. An ACK for a seq the
 server has not sent yet counts as malformed.
 
@@ -191,15 +183,16 @@ Unknown fields in client JSON are ignored. A repeated `hello` after the handshak
   - If a session sends nothing for 30 s, close it (1000, `idle`).
   - When `--max-viewers` sessions are open and a new client's `hello` succeeds, close the one
     that has sent nothing for longest, if that is over 5 s (1000), and admit the new client.
-  - Close a session whose write blocks for more than 10 s.
-  - QUIC keep-alive every 5 s; a peer silent for 25 s (vanished without closing) is dropped.
+  - Close a session whose WebSocket write blocks for more than 10 s.
+  - TCP keepalive: first probe after 10 s without traffic, then 3 probes 5 s apart, so a peer
+    that vanished without closing is dropped after about 25 s.
   - More than 100 malformed messages in one session close it (1008).
 
-## 6. HTTP endpoints (TCP, same port)
+## 6. HTTP endpoints on the same port
 
 | path | |
 |---|---|
-| `GET /` | the web client (`index.html`); `/app.js`, `/input.js`, `/transport.js`, `/keysyms.js` alongside. Strong ETag, `Cache-Control: no-cache`, `If-None-Match` answered with 304. |
+| `GET /` | the web client (`index.html`); `/app.js`, `/input.js`, `/keysyms.js` alongside. Strong ETag, `Cache-Control: no-cache`, `If-None-Match` answered with 304. |
 | `GET /healthz` | `ok`, no auth |
 | `GET /api/status` | `{"version","screen":{"w","h"},"viewers","controller":bool,"sessions":[{"id","role","control","fps","kbps","rtt_ms"}]}`; needs `Authorization: Bearer <control token>` unless `--no-auth` (401 wrong token, 403 view token, 503 token file missing or empty) |
-| `GET /transport` | `{"wt":{"port":N,"hashes":["<sha-256 hex>"],"ticket":"…"}}` (1.1); no auth, `Cache-Control: no-store` |
+| `GET /stream` | the WebSocket above; incoming messages are limited to 64 KiB; with `--no-auth`, 403 for another site's `Origin` (see 1.1) |

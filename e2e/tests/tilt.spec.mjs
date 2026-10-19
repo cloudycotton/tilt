@@ -145,7 +145,7 @@ test('view-only session cannot take control or send input', async ({ page }) => 
   expect(await markerColor(page), 'marker colour 1 s after the input').toBe(before);
   const after = await page.evaluate(() => ({
     control: window.tilt.stats.control,
-    sameSocket: window.tilt.ws === window.e2e.viewWs && window.tilt.ws.readyState === 1,
+    sameSocket: window.tilt.ws === window.e2e.viewWs && window.tilt.ws.readyState === WebSocket.OPEN,
   }));
   expect(after.control, 'tilt.stats.control').toBe(false);
   // A refused take answers {"t":"error","code":"forbidden"} and keeps the session open.
@@ -175,7 +175,7 @@ test('stream resumes after the socket drops', async ({ page }, testInfo) => {
           framesAtClose !== null &&
           ws !== null &&
           ws !== dropped &&
-          ws.readyState === 1 &&
+          ws.readyState === WebSocket.OPEN &&
           window.tilt.stats.framesDecoded > framesAtClose
         );
       },

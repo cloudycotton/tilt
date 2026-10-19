@@ -10,7 +10,6 @@ services:
     image: tilt-desktop
     ports:
       - "6090:6090"
-      - "6090:6090/udp"
     environment:
       TILT_TOKEN: devtoken
       TILT_VIEW_TOKEN: viewtoken

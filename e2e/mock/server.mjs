@@ -26,7 +26,6 @@ const ASSETS = {
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/input.js': ['input.js', 'text/javascript; charset=utf-8'],
   '/keysyms.js': ['keysyms.js', 'text/javascript; charset=utf-8'],
-  '/transport.js': ['transport.js', 'text/javascript; charset=utf-8'],
   '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
 
@@ -616,12 +615,6 @@ export async function startMockServer(options = {}) {
     }
     if (url.pathname === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache' }).end('ok');
-      return;
-    }
-    if (url.pathname === '/transport') {
-      // The tests' fake WebTransport (tests/fixtures.mjs) carries the stream over /stream below.
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
-        .end(JSON.stringify({ wt: { port: 4433, hashes: ['ab'.repeat(32)], ticket: 't1' } }));
       return;
     }
     const asset = ASSETS[url.pathname];

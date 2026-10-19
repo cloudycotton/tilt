@@ -1,12 +1,15 @@
-//! One WebTransport session (src/transport.rs): handshake,
-//! reader and writer tasks, and its encoder worker (brief section 5.5).
+//! One /stream connection: handshake, reader and writer tasks, and its encoder worker
+//! (brief section 5.5).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use bytes::Bytes;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -17,7 +20,6 @@ use crate::control::ControlStatus;
 use crate::input::InputCmd;
 use crate::protocol::{self, ClientMsg, ClientText, ErrorCode, ScreenSize, ServerText};
 use crate::server::AppState;
-use crate::transport::{CloseFrame, Message, Sink, Stream};
 use crate::worker::{self, Inbox};
 use crate::x11::cursor::CursorState;
 
@@ -35,7 +37,7 @@ impl OutMsg {
     fn into_message(self) -> Message {
         match self {
             OutMsg::Binary(b) => Message::Binary(b),
-            OutMsg::Text(t) => Message::Text(t),
+            OutMsg::Text(t) => Message::Text(t.into()),
         }
     }
 }
@@ -233,7 +235,7 @@ impl Sessions {
     }
 }
 
-pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_CLOSE: Duration = Duration::from_secs(30);
 const HELD_RELEASE: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -243,6 +245,9 @@ const REPLY_CAPACITY: usize = 32;
 /// How long teardown waits for the encoder thread before leaving it to finish on its own.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+type Sink = SplitSink<WebSocket, Message>;
+type Stream = SplitStream<WebSocket>;
+
 fn close_frame(code: u16, reason: &'static str) -> CloseFrame {
     CloseFrame {
         code,
@@ -250,12 +255,10 @@ fn close_frame(code: u16, reason: &'static str) -> CloseFrame {
     }
 }
 
-/// Runs one session until it closes.
-pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
+/// Runs one upgraded /stream connection until it closes.
+pub async fn run(socket: WebSocket, state: Arc<AppState>) {
+    let (mut sink, mut stream) = socket.split();
     let Some((sid, role, liveness)) = handshake(&mut sink, &mut stream, &state).await else {
-        // Delivers the refusal before the connection goes: over WebTransport, dropping the
-        // sink would discard what the client has not acknowledged yet.
-        let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
         return;
     };
     info!(session = sid, ?role, "connected");
@@ -421,11 +424,14 @@ async fn handshake(
     Some((sid, role, liveness))
 }
 
-/// The first message; None when the peer goes away first.
+/// The first data message, skipping WebSocket pings; None when the peer goes away first.
 async fn first_message(stream: &mut Stream) -> Option<Message> {
-    match stream.next().await? {
-        Ok(Message::Close(_)) | Err(_) => None,
-        Ok(m) => Some(m),
+    loop {
+        match stream.next().await? {
+            Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(m) => return Some(m),
+        }
     }
 }
 
@@ -438,7 +444,7 @@ async fn reject(sink: &mut Sink, code: ErrorCode, msg: &'static str) {
     };
     let close = close_frame(code.close_code().unwrap_or(protocol::CLOSE_POLICY), msg);
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        sink.send(Message::Text(error.to_json())).await?;
+        sink.send(Message::Text(error.to_json().into())).await?;
         sink.send(Message::Close(Some(close))).await
     })
     .await;
@@ -514,6 +520,7 @@ impl Reader<'_> {
                 }
                 Some(Ok(Message::Binary(b))) => self.binary(&b, last_heard),
                 Some(Ok(Message::Text(t))) => self.text(t.as_str()),
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
             }
             if self.malformed > MAX_MALFORMED {
                 return (
@@ -687,7 +694,7 @@ impl Writer<'_> {
     ) -> (Option<CloseFrame>, &'static str) {
         let dead = (None, "write failed");
         // Brief 4.1 step 6: welcome, control, cursor if known, then video.
-        if self.send(Message::Text(welcome)).await.is_err() {
+        if self.send(Message::Text(welcome.into())).await.is_err() {
             return dead;
         }
         let status = *control.borrow_and_update();
@@ -712,7 +719,7 @@ impl Writer<'_> {
                     self.send_control(status).await
                 }
                 m = out.recv() => match m {
-                    Some(m) => self.send_out(m).await,
+                    Some(m) => self.send_out(m, &mut out).await,
                     None => {
                         return (Some(close_frame(protocol::CLOSE_INTERNAL, "encoder stopped")), "encoder thread exited");
                     }
@@ -728,18 +735,31 @@ impl Writer<'_> {
         }
     }
 
-    /// Sends one worker message.
-    async fn send_out(&mut self, msg: OutMsg) -> Result<(), ()> {
-        let video = matches!(&msg, OutMsg::Binary(b) if b.first() == Some(&protocol::MSG_VIDEO));
-        self.send(msg.into_message()).await?;
-        if video {
-            self.inbox.written();
+    /// Sends one worker message. The fragments of an access unit go out back to back: the
+    /// worker queues them consecutively, so the rest are taken straight from `out`.
+    async fn send_out(
+        &mut self,
+        first: OutMsg,
+        out: &mut mpsc::Receiver<OutMsg>,
+    ) -> Result<(), ()> {
+        let mut msg = first;
+        loop {
+            let video =
+                matches!(&msg, OutMsg::Binary(b) if b.first() == Some(&protocol::MSG_VIDEO));
+            let more = matches!(&msg, OutMsg::Binary(b) if protocol::video_has_more(b));
+            self.send(msg.into_message()).await?;
+            if video {
+                self.inbox.written();
+            }
+            if !more {
+                return Ok(());
+            }
+            msg = out.recv().await.ok_or(())?;
         }
-        Ok(())
     }
 
     async fn send_control(&mut self, s: ControlStatus) -> Result<(), ()> {
-        self.send(Message::Text(s.message().to_json())).await
+        self.send(Message::Text(s.message().to_json().into())).await
     }
 
     /// CURSOR_SHAPE when the serial changed, CURSOR_POS when the position did.

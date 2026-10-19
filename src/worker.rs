@@ -608,7 +608,7 @@ impl Worker {
                     self.skipped += frame.seq - self.sched.last_capture_seq - 1;
                 }
                 self.seq = self.seq.wrapping_add(1).max(1);
-                // Before the frame goes out, so its ACK is never ahead of it.
+                // Before the first fragment goes out, so its ACK is never ahead of it.
                 self.inbox.sent_seq.store(self.seq, Ordering::Release);
                 let header = VideoHeader {
                     flags: if f.keyframe { FLAG_KEY } else { 0 },
@@ -617,7 +617,9 @@ impl Worker {
                     width: w as u16,
                     height: h as u16,
                 };
-                self.send(OutMsg::Binary(protocol::video_message(header, &f.data)))?;
+                for msg in protocol::video_messages(header, &f.data, self.cfg.max_msg_bytes) {
+                    self.send(OutMsg::Binary(msg))?;
+                }
                 let sent = Instant::now();
                 self.flow.on_sent(self.seq, f.data.len(), sent);
                 let tail = frame.seq == self.sched.last_capture_seq;

@@ -1,29 +1,31 @@
-//! HTTP: the embedded client, /healthz, /api/status and /transport, which tells the page how to
-//! reach the WebTransport stream (src/wt.rs).
+//! HTTP: the embedded client, /healthz, /api/status and the /stream WebSocket
+//! (brief section 5.11).
 
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
-use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, WWW_AUTHENTICATE};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, FORWARDED, HOST, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use axum::{Json, Router};
 use serde::Serialize;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::assets;
 use crate::auth::{AuthError, Role, TokenSource, AUTH_FAIL_DELAY};
+use crate::clock::LogEvery;
 use crate::config::Config;
 use crate::control::ControlState;
 use crate::hub::FrameHub;
 use crate::input::InputHandle;
 use crate::protocol::ScreenSize;
-use crate::session::{SessionStatus, Sessions};
-use crate::wt;
+use crate::session::{self, SessionStatus, Sessions};
 use crate::x11::cursor::CursorState;
 
 /// Everything the handlers, sessions and encoder workers share.
@@ -37,8 +39,6 @@ pub struct AppState {
     pub sessions: Sessions,
     /// The CPUs tilt may use, for `--profile auto`.
     pub cpus: usize,
-    /// What GET /transport offers, once the WebTransport endpoint is up.
-    wt: Mutex<Option<wt::Advert>>,
 }
 
 /// What main builds before the server: the parts of AppState that are not made here.
@@ -63,12 +63,7 @@ impl AppState {
             cursor: p.cursor,
             sessions: p.sessions,
             cpus: p.cpus,
-            wt: Mutex::new(None),
         })
-    }
-
-    pub fn wt_advert(&self) -> MutexGuard<'_, Option<wt::Advert>> {
-        self.wt.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -82,14 +77,19 @@ struct Status {
     sessions: Vec<SessionStatus>,
 }
 
+/// Incoming WebSocket messages are small: input, ACKs, and TEXT, which is cut at 4 KiB
+/// (protocol::MAX_TEXT_BYTES). The margin lets a client that sends longer TEXT keep its
+/// session.
+const MAX_INCOMING_MSG: usize = 64 * 1024;
 /// How long `serve` waits for sessions to close after the shutdown signal.
 const SESSION_DRAIN: Duration = Duration::from_secs(3);
+const X_FORWARDED_HOST: &str = "x-forwarded-host";
 
 pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/status", get(status))
-        .route("/transport", get(transport));
+        .route("/stream", get(stream));
     for (i, asset) in assets::ASSETS.iter().enumerate() {
         router = router.route(
             asset.path,
@@ -149,40 +149,174 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         .into_response()
 }
 
-/// GET /transport: `{"wt":{..}}` (see wt::Advert), how to reach the stream. No auth: other
-/// sites' pages cannot read it, so its ticket shows a session came from this page.
-async fn transport(State(state): State<Arc<AppState>>) -> Response {
-    let Some(advert) = state.wt_advert().clone() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "not listening yet\n").into_response();
-    };
-    let body = serde_json::json!({ "wt": advert });
-    (
-        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
-        Json(body),
-    )
-        .into_response()
-}
-
 /// The token of `Bearer <token>` (scheme case-insensitive, RFC 9110 11.1).
 fn bearer_token(value: &str) -> Option<&str> {
     let (scheme, token) = value.trim().split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
 
-/// Binds `cfg.bind` for HTTP (TCP) and WebTransport (UDP, same address) and serves until
-/// `shutdown` resolves; then tells every session to close (1001) and waits up to 3 s for them.
+async fn stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // With --no-auth, anyone who can reach the port gets control, and browsers apply no
+    // same-origin policy to WebSockets: any page the user visits could connect. So refuse
+    // browsers on other sites' pages. Clients that send no Origin (probes, native apps) are
+    // unaffected, and so are token modes: there the token is the secret, and other origins
+    // cannot read it. (Addition to brief 5.11.)
+    if state.tokens.no_auth()
+        && !same_origin(&headers)
+        && !allowed_origin(&state.cfg.allow_origin, &headers)
+    {
+        static REFUSALS: Mutex<LogEvery> = Mutex::new(LogEvery::new(Duration::from_secs(10)));
+        let log = REFUSALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ready(Instant::now());
+        if let Some(more) = log {
+            warn!(
+                origin = ?headers.get(ORIGIN),
+                host = ?headers.get(HOST),
+                forwarded_host = ?headers.get(X_FORWARDED_HOST),
+                forwarded = ?headers.get(FORWARDED),
+                "refused a /stream upgrade from another origin, as --no-auth gives everyone \
+                 control. If the page is yours (behind a proxy that rewrites Host, say), pass \
+                 --allow-origin with its origin, or use a token ({more} more since the last \
+                 warning)"
+            );
+        }
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-origin /stream refused with --no-auth\n",
+        )
+            .into_response();
+    }
+    ws.max_message_size(MAX_INCOMING_MSG)
+        .max_frame_size(MAX_INCOMING_MSG)
+        .on_failed_upgrade(|e| debug!("websocket upgrade failed: {e}"))
+        .on_upgrade(move |socket| session::run(socket, state))
+}
+
+/// True when the request has no Origin, or one whose host and port are those the request was
+/// sent to: the Host header, or the host a proxy that rewrites Host passed on in
+/// X-Forwarded-Host or Forwarded (`host=`). Browsers set Origin on every WebSocket handshake
+/// and scripts cannot set any of these headers on one. A Host without a port matches either
+/// default port, as a TLS proxy may sit in front.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(ORIGIN) else {
+        return true;
+    };
+    let Some((scheme, authority)) = origin.to_str().ok().and_then(|o| o.split_once("://")) else {
+        // "null" (a sandboxed frame, a file: page) or garbage.
+        return false;
+    };
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return false,
+    };
+    let Some((origin_host, origin_port)) = host_port(authority) else {
+        return false;
+    };
+    let origin_port = origin_port.unwrap_or(default_port);
+    let x_forwarded = headers
+        .get_all(X_FORWARDED_HOST)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','));
+    headers
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .into_iter()
+        .chain(x_forwarded)
+        .chain(forwarded_hosts(headers))
+        .filter_map(|v| host_port(v.trim()))
+        .any(|(host, port)| {
+            host == origin_host
+                && port.map_or(matches!(origin_port, 80 | 443), |p| p == origin_port)
+        })
+}
+
+/// The `host=` values of RFC 7239 Forwarded headers, such as
+/// `for=192.0.2.1;host="desk.example.com";proto=https, for=10.0.0.1`.
+fn forwarded_hosts(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+    headers
+        .get_all(FORWARDED)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split([',', ';']))
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            let host = value.trim().trim_matches('"');
+            name.trim().eq_ignore_ascii_case("host").then_some(host)
+        })
+}
+
+/// True when the request's Origin is one of `--allow-origin`, or that list has `*`: for pages
+/// whose origin the Host check cannot confirm, such as behind a proxy that rewrites Host
+/// without an X-Forwarded-Host (E2B's edge drops one set in front of it, so a custom domain
+/// arrives as the sandbox's own host).
+fn allowed_origin(allowed: &[String], headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let origin = origin_key(origin);
+    allowed
+        .iter()
+        .any(|a| a.trim() == "*" || origin_key(a) == origin)
+}
+
+/// An origin as browsers write it: lowercase, without a trailing slash or a default port.
+fn origin_key(origin: &str) -> String {
+    let o = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    for (scheme, port) in [("http://", ":80"), ("https://", ":443")] {
+        if o.starts_with(scheme) && o.ends_with(port) {
+            return o[..o.len() - port.len()].to_owned();
+        }
+    }
+    o
+}
+
+/// The lowercased host and the port, if any, of "host", "host:port", "[v6]" or "[v6]:port".
+fn host_port(authority: &str) -> Option<(String, Option<u16>)> {
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority.find(']')? + 1;
+        let port = match &authority[end..] {
+            "" => None,
+            rest => Some(rest.strip_prefix(':')?),
+        };
+        (&authority[..end], port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    let port = port.map(str::parse::<u16>).transpose().ok()?;
+    let valid =
+        !host.is_empty() && !host.contains(|c: char| c == '/' || c == '@' || c.is_whitespace());
+    valid.then(|| (host.to_ascii_lowercase(), port))
+}
+
+/// Binds `cfg.bind` and serves until `shutdown` resolves. Every accepted socket gets
+/// TCP_NODELAY, keepalive and, on Linux, TCP_NOTSENT_LOWAT unless `--notsent-lowat 0`.
+///
+/// Upgraded WebSockets outlive axum's graceful shutdown, so on `shutdown` every session is
+/// told to close (1001) and this waits up to 3 s for them before returning.
 pub async fn serve(
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let bind = state.cfg.bind;
+    let lowat = state.cfg.notsent_lowat;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|e| anyhow::anyhow!("cannot listen on {bind}: {e}"))?;
-    let local = listener.local_addr()?;
-    let endpoint = wt::bind(&state, local)?;
-    info!("listening on http://{local} and udp {local}");
-    let accepting = tokio::spawn(wt::run(Arc::clone(&endpoint), Arc::clone(&state)));
+    info!("listening on http://{}", listener.local_addr()?);
+    #[cfg(target_os = "linux")]
+    check_tcp_sysctls();
+    let listener = listener.tap_io(move |tcp| tune_socket(tcp, lowat));
 
     let closing = Arc::clone(&state);
     axum::serve(listener, router(Arc::clone(&state)))
@@ -201,9 +335,69 @@ pub async fn serve(
             SESSION_DRAIN
         );
     }
-    accepting.abort();
-    endpoint.close(wtransport::VarInt::from_u32(0), b"shutting down");
     Ok(())
+}
+
+/// Keepalive probes: the first after this long without traffic, then KEEPALIVE_INTERVAL apart.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const KEEPALIVE_PROBES: u32 = 3;
+
+fn tune_socket(tcp: &mut tokio::net::TcpStream, lowat: u32) {
+    if let Err(e) = tcp.set_nodelay(true) {
+        warn!("TCP_NODELAY: {e}");
+    }
+    // Clients PING every second, so a connection idle for 10 s has a peer that is frozen (a
+    // backgrounded page, whose kernel still answers) or gone without a FIN (a phone that
+    // lost its network): that one is closed after about 25 s, before the 30 s idle close,
+    // freeing its encoder and its --max-viewers place.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_PROBES);
+    if let Err(e) = socket2::SockRef::from(&*tcp).set_tcp_keepalive(&keepalive) {
+        warn!("TCP keepalive: {e}");
+    }
+    // Keeps unsent data in the kernel small, so a frame that is ready goes out next instead of
+    // queueing behind ones the receiver has not taken yet.
+    #[cfg(target_os = "linux")]
+    if lowat > 0 {
+        if let Err(e) = socket2::SockRef::from(&*tcp).set_tcp_notsent_lowat(lowat) {
+            warn!("TCP_NOTSENT_LOWAT: {e}");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = lowat;
+    // BBR paces to the measured bandwidth and does not halve its rate on every lost packet, as
+    // the default (CUBIC) does: on Wi-Fi and long paths that is the difference between a
+    // stream that keeps flowing and one that stalls after each loss.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = socket2::SockRef::from(&*tcp).set_tcp_congestion(b"bbr") {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            warn!(
+                "TCP BBR unavailable ({e}); using the kernel's default congestion control. \
+                 `modprobe tcp_bbr`, or a kernel with CONFIG_TCP_CONG_BBR, makes lossy links \
+                 much smoother"
+            )
+        });
+    }
+}
+
+/// Startup notes on kernel TCP settings that slow the stream down.
+#[cfg(target_os = "linux")]
+fn check_tcp_sysctls() {
+    // Desktop traffic is bursty: still, then a scroll. With this on, every pause longer than
+    // the retransmission timeout shrinks the congestion window back to its initial size, and the
+    // first frames after it trickle out over several round trips.
+    let path = "/proc/sys/net/ipv4/tcp_slow_start_after_idle";
+    if std::fs::read_to_string(path).is_ok_and(|v| v.trim() == "1") {
+        warn!(
+            "the kernel restarts TCP slow start after every pause, which delays the first \
+             frames after one by several round trips; run `sysctl -w \
+             net.ipv4.tcp_slow_start_after_idle=0` (persist it in /etc/sysctl.d/) on this machine"
+        );
+    }
 }
 
 /// An AppState for tests: `args` after `tilt`, no X server, input going nowhere.
@@ -228,6 +422,227 @@ pub fn test_state(args: &[&str]) -> Arc<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for &(name, value) in pairs {
+            h.append(name, HeaderValue::from_static(value));
+        }
+        h
+    }
+
+    #[test]
+    fn same_origin_compares_host_and_port() {
+        let ok = |pairs: &[(&'static str, &'static str)]| same_origin(&headers(pairs));
+        assert!(
+            ok(&[("host", "localhost:6090")]),
+            "no Origin: not a browser"
+        );
+        assert!(ok(&[
+            ("origin", "http://localhost:6090"),
+            ("host", "localhost:6090")
+        ]));
+        assert!(ok(&[
+            ("origin", "http://LocalHost:6090"),
+            ("host", "localhost:6090")
+        ]));
+        assert!(ok(&[
+            ("origin", "http://[::1]:6090"),
+            ("host", "[::1]:6090")
+        ]));
+        assert!(ok(&[
+            ("origin", "http://10.0.0.2"),
+            ("host", "10.0.0.2:80")
+        ]));
+        // Behind a TLS proxy (E2B): the Host has no port, the page is https.
+        assert!(ok(&[
+            ("origin", "https://6090-abc.e2b.app"),
+            ("host", "6090-abc.e2b.app")
+        ]));
+        // E2B with maskRequestHost: its proxy sets Host to the mask and X-Forwarded-Host to
+        // the public host (e2b-dev/infra, shared/pkg/proxy/pool/client.go).
+        assert!(ok(&[
+            ("origin", "https://6090-abc.e2b.app"),
+            ("host", "localhost:6090"),
+            ("x-forwarded-host", "6090-abc.e2b.app")
+        ]));
+        // A proxy that rewrites Host but says what it was.
+        assert!(ok(&[
+            ("origin", "https://desk.example.com"),
+            ("host", "127.0.0.1:6090"),
+            ("x-forwarded-host", "desk.example.com")
+        ]));
+        assert!(ok(&[
+            ("origin", "https://desk.example.com"),
+            ("host", "127.0.0.1:6090"),
+            ("x-forwarded-host", "a.internal, desk.example.com:443")
+        ]));
+        // The same in RFC 7239 form.
+        assert!(ok(&[
+            ("origin", "https://desk.example.com"),
+            ("host", "127.0.0.1:6090"),
+            (
+                "forwarded",
+                "for=192.0.2.1;Host=desk.example.com;proto=https"
+            )
+        ]));
+        assert!(ok(&[
+            ("origin", "https://desk.example.com"),
+            ("host", "127.0.0.1:6090"),
+            (
+                "forwarded",
+                "for=10.0.0.1, for=192.0.2.1; host=\"desk.example.com:443\""
+            )
+        ]));
+
+        assert!(!ok(&[
+            ("origin", "https://evil.example"),
+            ("host", "localhost:6090")
+        ]));
+        assert!(!ok(&[
+            ("origin", "http://localhost:3000"),
+            ("host", "localhost:6090")
+        ]));
+        assert!(!ok(&[
+            ("origin", "http://localhost"),
+            ("host", "localhost:6090")
+        ]));
+        assert!(!ok(&[
+            ("origin", "http://desk.example.com:8080"),
+            ("host", "desk.example.com")
+        ]));
+        assert!(!ok(&[("origin", "null"), ("host", "localhost:6090")]));
+        assert!(!ok(&[("origin", "file://"), ("host", "localhost:6090")]));
+        assert!(
+            !ok(&[("origin", "http://localhost:6090")]),
+            "no Host to compare with"
+        );
+        assert!(!ok(&[
+            ("origin", "http://[::1:6090"),
+            ("host", "[::1:6090")
+        ]));
+        assert!(!ok(&[
+            ("origin", "http://evil.example@localhost:6090"),
+            ("host", "localhost:6090")
+        ]));
+        // A custom domain in front of E2B: its proxy drops the X-Forwarded-Host set in front
+        // of it, so only --allow-origin can let this page in.
+        assert!(!ok(&[
+            ("origin", "https://desk.example.com"),
+            ("host", "6090-abc.e2b.app")
+        ]));
+        assert!(!ok(&[
+            ("origin", "https://evil.example"),
+            ("host", "127.0.0.1:6090"),
+            (
+                "forwarded",
+                "for=evil.example;proto=https;by=desk.example.com"
+            )
+        ]));
+    }
+
+    #[test]
+    fn allowed_origins_match_as_browsers_write_them() {
+        let allowed = |list: &[&str], origin: &'static str| {
+            let list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+            allowed_origin(&list, &headers(&[("origin", origin)]))
+        };
+        let desk = ["https://desk.example.com"];
+        assert!(allowed(&desk, "https://desk.example.com"));
+        assert!(allowed(&desk, "HTTPS://Desk.Example.com"));
+        assert!(allowed(
+            &["https://desk.example.com:443/"],
+            "https://desk.example.com"
+        ));
+        assert!(allowed(&["http://[::1]:80"], "http://[::1]"));
+        assert!(allowed(&["http://a.example:8080"], "http://a.example:8080"));
+        assert!(allowed(&["https://a.example", " null "], "null"));
+        assert!(allowed(&["*"], "null") && allowed(&["*"], "https://evil.example"));
+
+        assert!(!allowed(&desk, "https://desk.example.com:8443"));
+        assert!(!allowed(&desk, "http://desk.example.com"));
+        assert!(!allowed(&desk, "https://desk.example.com.evil.example"));
+        assert!(!allowed(&desk, "null"));
+        assert!(!allowed(&[], "https://desk.example.com"));
+        assert!(!allowed(&["http://a.example:80"], "http://a.example:8080"));
+        let list = vec!["*".to_owned()];
+        assert!(
+            !allowed_origin(&list, &HeaderMap::new()),
+            "no Origin to allow"
+        );
+    }
+
+    /// The status line of a WebSocket upgrade of /stream with these extra headers.
+    async fn upgrade_status(addr: std::net::SocketAddr, extra: &str) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /stream HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{extra}\r\n"
+        );
+        tcp.write_all(request.as_bytes()).await.unwrap();
+        let mut line = String::new();
+        BufReader::new(tcp).read_line(&mut line).await.unwrap();
+        line.trim_end().to_owned()
+    }
+
+    #[tokio::test]
+    async fn no_auth_refuses_browsers_on_other_origins() {
+        let switching = "HTTP/1.1 101 Switching Protocols";
+        for (args, evil_status) in [
+            (&["--no-auth"][..], "HTTP/1.1 403 Forbidden"),
+            (&["--token", "secret"][..], switching),
+            (
+                &[
+                    "--no-auth",
+                    "--allow-origin",
+                    "https://desk.example,https://evil.example",
+                ][..],
+                switching,
+            ),
+            (&["--no-auth", "--allow-origin", "*"][..], switching),
+            (
+                &["--no-auth", "--allow-origin", "https://desk.example"][..],
+                "HTTP/1.1 403 Forbidden",
+            ),
+        ] {
+            let state = test_state(args);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            });
+            assert_eq!(upgrade_status(addr, "").await, switching, "{args:?}");
+            let same = format!("Origin: http://{addr}\r\n");
+            assert_eq!(upgrade_status(addr, &same).await, switching, "{args:?}");
+            let evil = "Origin: https://evil.example\r\n";
+            assert_eq!(upgrade_status(addr, evil).await, evil_status, "{args:?}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_sockets_get_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        tune_socket(&mut tcp, 0);
+        let sock = socket2::SockRef::from(&tcp);
+        assert!(sock.keepalive().unwrap());
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(sock.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(sock.tcp_keepalive_retries().unwrap(), KEEPALIVE_PROBES);
+        assert!(tcp.nodelay().unwrap());
+        // BBR wherever the kernel has it.
+        let available =
+            std::fs::read_to_string("/proc/sys/net/ipv4/tcp_available_congestion_control")
+                .unwrap_or_default();
+        if available.split_whitespace().any(|c| c == "bbr") {
+            let name = sock.tcp_congestion().unwrap();
+            assert_eq!(name.split(|&b| b == 0).next(), Some(&b"bbr"[..]));
+        }
+    }
 
     #[test]
     fn bearer_tokens() {
