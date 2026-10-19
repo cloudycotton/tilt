@@ -1,4 +1,4 @@
-//! The WebTransport fast path (`--wt-bind`): the /stream protocol over QUIC on UDP, next to the
+//! The WebTransport fast path: the /stream protocol over QUIC on UDP, on the same port as the
 //! WebSocket (docs/protocol.md section 7). A session that arrives here runs exactly like a
 //! WebSocket one (src/session.rs); src/transport.rs carries its messages.
 //!
@@ -49,11 +49,8 @@ const MAX_INCOMING_MSG: usize = 64 * 1024;
 /// What GET /transport tells browsers about the fast path. None of it is secret.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Advert {
-    /// The UDP port to dial.
+    /// The UDP port to dial, on the page's own host.
     pub port: u16,
-    /// The host to dial; absent means the page's own host.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
     /// SHA-256 of the certificate, hex, for `serverCertificateHashes`.
     pub hashes: Vec<String>,
     /// Goes in the session URL (`/stream?ticket=`). With --no-auth it stands in for the
@@ -64,28 +61,20 @@ pub struct Advert {
 /// The running endpoint, for `run` and for closing it at shutdown.
 pub type WtEndpoint = Arc<Endpoint<Server>>;
 
-/// Binds `--wt-bind` and publishes the advert in `state`.
-pub fn bind(state: &AppState) -> anyhow::Result<WtEndpoint> {
-    let cfg = &state.cfg;
-    let addr = cfg.wt_bind.context("--wt-bind is not set")?;
+/// Binds UDP `addr` (the HTTP listener's address) and publishes the advert in `state`.
+pub fn bind(state: &AppState, addr: SocketAddr) -> anyhow::Result<WtEndpoint> {
     let (config, hash) = server_config(addr)?;
     let endpoint = Endpoint::server(config)
         .map_err(|e| anyhow::anyhow!("cannot listen for WebTransport on udp {addr}: {e}"))?;
     let local = endpoint.local_addr()?;
     let advert = Advert {
-        port: cfg.wt_public_port.unwrap_or(local.port()),
-        host: cfg.wt_public_host.clone(),
+        port: state.cfg.udp_public_port.unwrap_or(local.port()),
         hashes: vec![hash],
         ticket: ticket(),
     };
     info!(
-        "WebTransport on udp {local}, advertised as port {}{}",
-        advert.port,
-        advert
-            .host
-            .as_deref()
-            .map(|h| format!(" of {h}"))
-            .unwrap_or_default()
+        "WebTransport on udp {local}, advertised as port {}",
+        advert.port
     );
     *state.wt_advert() = Some(advert);
     Ok(Arc::new(endpoint))
@@ -229,17 +218,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_advert_names_the_certificate_and_the_public_port() {
-        let state = server::test_state(&[
-            "--no-auth",
-            "--wt-bind",
-            "127.0.0.1:0",
-            "--wt-public-port",
-            "4433",
-        ]);
-        let endpoint = bind(&state).unwrap();
+        let state = server::test_state(&["--no-auth", "--udp-public-port", "4433"]);
+        let endpoint = bind(&state, "127.0.0.1:0".parse().unwrap()).unwrap();
         let advert = state.wt_advert().clone().unwrap();
         assert_eq!(advert.port, 4433);
-        assert_eq!(advert.host, None);
         assert_eq!(advert.hashes.len(), 1);
         assert_eq!(advert.hashes[0].len(), 64);
         assert_eq!(advert.ticket.len(), 32);
@@ -268,8 +250,8 @@ mod tests {
 
     /// A server on a free UDP port with `args`, and its advert.
     async fn start(args: &[&str]) -> (Arc<AppState>, Advert, tokio::task::JoinHandle<()>) {
-        let state = server::test_state(&[args, &["--wt-bind", "127.0.0.1:0"]].concat());
-        let endpoint = bind(&state).unwrap();
+        let state = server::test_state(args);
+        let endpoint = bind(&state, "127.0.0.1:0".parse().unwrap()).unwrap();
         let advert = state.wt_advert().clone().unwrap();
         let task = tokio::spawn(run(endpoint, Arc::clone(&state)));
         (state, advert, task)

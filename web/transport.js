@@ -109,7 +109,7 @@ export class WtSocket extends EventTarget {
       this.fallback(false);
       return;
     }
-    const host = hostForUrl(advert.host || new URL(pageUrl).hostname);
+    const host = hostForUrl(new URL(pageUrl).hostname);
     const url = `https://${host}:${advert.port}/stream?ticket=${encodeURIComponent(advert.ticket || '')}`;
     this.timer = setTimeout(() => this.fallback(true), TRY_MS);
     try {

@@ -14,6 +14,7 @@ mod protocol;
 mod server;
 mod session;
 mod transport;
+mod update;
 mod video;
 mod worker;
 mod wt;
@@ -57,10 +58,30 @@ pub fn release_memory() {
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
+    // Runs the newest release, downloading it first when there is one (src/update.rs).
+    update::run();
     clock::init();
-    // Exits with code 2 on usage errors, including a missing token.
-    let cfg = Arc::new(Config::load());
+    // Exits with code 2 on usage errors.
+    let mut cfg = Config::load();
+    let kept = if cfg.uses_kept_token() {
+        match auth::kept_token() {
+            Ok((file, token)) => {
+                cfg.token_file = Some(file);
+                Some(token)
+            }
+            Err(e) => {
+                eprintln!("tilt: {e:#}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let cfg = Arc::new(cfg);
     init_tracing();
+    for link in kept.iter().flat_map(|t| auth::links(cfg.bind, t)) {
+        info!("open {link}");
+    }
     match run(cfg) {
         Ok(code) => code,
         Err(e) => {

@@ -333,7 +333,8 @@ fn host_port(authority: &str) -> Option<(String, Option<u16>)> {
 /// Upgraded WebSockets outlive axum's graceful shutdown, so on `shutdown` every session is
 /// told to close (1001) and this waits up to 3 s for them before returning.
 ///
-/// With `--wt-bind`, also serves WebTransport sessions on that UDP address until then.
+/// Also serves WebTransport sessions on the same address over UDP until then, unless that
+/// UDP port cannot be bound (then browsers use the WebSocket).
 pub async fn serve(
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -343,15 +344,18 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|e| anyhow::anyhow!("cannot listen on {bind}: {e}"))?;
-    info!("listening on http://{}", listener.local_addr()?);
+    let local = listener.local_addr()?;
+    info!("listening on http://{local}");
     let listener = listener.tap_io(move |tcp| tune_socket(tcp, lowat));
-    let wt = match state.cfg.wt_bind {
-        Some(_) => {
-            let endpoint = wt::bind(&state)?;
+    let wt = match wt::bind(&state, local) {
+        Ok(endpoint) => {
             let accepting = tokio::spawn(wt::run(Arc::clone(&endpoint), Arc::clone(&state)));
             Some((endpoint, accepting))
         }
-        None => None,
+        Err(e) => {
+            warn!("no WebTransport, browsers will use the WebSocket: {e:#}");
+            None
+        }
     };
 
     let closing = Arc::clone(&state);

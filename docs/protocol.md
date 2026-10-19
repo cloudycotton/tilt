@@ -155,15 +155,14 @@ Server to client:
   30 s) from another viewer: it may take control back at once from the former, never from the
   latter. A server run never reuses a session id, and each run starts numbering at a random point,
   so a restarted server is unlikely (one chance in a million) to give a new session the id of a
-  lost one. Older servers send no `holder`.
+  lost one.
 - `{"t":"screen","w":W,"h":H}`: sent when the screen size changed. A KEY frame at the new size
   follows. VIDEO width/height are the even-cropped values of W and H.
 - `{"t":"stats","fps":f,"kbps":f,"bitrate_kbps":n,"rtt_ms":f,"min_rtt_ms":f,"queue_ms":f,"enc_ms":f,"inflight":n,"skipped":n,"viewers":n,"gov_fps":n,"qp":f}`:
   sent every 1 s while video is on. `fps`, `kbps` and `enc_ms` cover the last second; `skipped`
   counts captures this session never encoded, over the whole session. `gov_fps` is the frame
   rate cap in force (`--max-fps`); `qp` is the mean quantizer of the last second's frames, 0
-  when there were none. Older servers
-  send neither.
+  when there were none.
 - `{"t":"error","code":"auth"|"busy"|"version"|"not_ready"|"forbidden"|"hello_timeout"|"unsupported_size","msg":"…"}`.
   `unsupported_size` means the encoder cannot take the screen's size (smaller than 16×16, or
   more than 36864 macroblocks, about 4096×2304). The session stays open without video; when the
@@ -197,9 +196,9 @@ Unknown fields in client JSON are ignored. A repeated `hello` after the handshak
 | `GET /healthz` | `ok`, no auth |
 | `GET /api/status` | `{"version","screen":{"w","h"},"viewers","controller":bool,"sessions":[{"id","role","control","fps","kbps","rtt_ms"}]}`; needs `Authorization: Bearer <control token>` unless `--no-auth` (401 wrong token, 403 view token, 503 token file missing or empty) |
 | `GET /stream` | the WebSocket above; incoming messages are limited to 64 KiB; with `--no-auth`, 403 for another site's `Origin` (see 1.1) |
-| `GET /transport` | `{"wt":{"port":N,"host":"…","hashes":["<sha-256 hex>"],"ticket":"…"}}` when the WebTransport fast path is on (section 7), else `{}`; no auth, `Cache-Control: no-store`. `host` is present only with `--wt-public-host`. |
+| `GET /transport` | `{"wt":{"port":N,"hashes":["<sha-256 hex>"],"ticket":"…"}}` (section 7), or `{}` when tilt could not listen on UDP; no auth, `Cache-Control: no-store` |
 
-## 7. WebTransport (optional, `--wt-bind`)
+## 7. WebTransport (UDP, same port as HTTP)
 
 The same protocol, carried by WebTransport over HTTP/3 (QUIC, UDP) instead of a WebSocket.
 Video frames each travel on a stream of their own, so a lost packet delays only the frame it
@@ -208,8 +207,8 @@ loss faster than TCP. Everything in sections 1 to 5 holds unchanged; only the fr
 
 1. **Discovery.** `GET transport` next to the page (`/transport`, or `/<prefix>/transport`). No
    `wt` means no fast path: use the WebSocket.
-2. **Session.** Open `https://<host>:<port>/stream?ticket=<ticket>`, where `host` is the
-   advert's `host` or else the page's host, with
+2. **Session.** Open `https://<host>:<port>/stream?ticket=<ticket>`, where `host` is the page's
+   host (`127.0.0.1` for `localhost`: Chrome dials `localhost` over QUIC on `::1` only), with
    `serverCertificateHashes: [{algorithm: 'sha-256', value: <hash bytes>}]` for each of
    `hashes`. The certificate is self-signed ECDSA P-256, valid for 14 days (from a day before it
    was made) and replaced every 6 days, so fetch `/transport` before each connection. With

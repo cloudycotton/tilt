@@ -1,31 +1,33 @@
 #!/bin/sh
-# Installs tilt-live, which runs the latest tilt release and updates it whenever it starts:
+# Installs tilt, which keeps itself up to date whenever it starts:
 #
 #   curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh
 #
-# Then `tilt-live` streams this machine's X display (flags pass through to tilt); on macOS it
-# streams the demo Linux desktop in Docker instead. It goes to TILT_INSTALL_DIR, by default
-# ~/.local/bin (/usr/local/bin as root). Needs curl and sha256sum (or shasum).
+# To TILT_INSTALL_DIR, by default ~/.local/bin (/usr/local/bin as root). Linux on x86_64 or
+# arm64; needs curl and sha256sum (or shasum).
 set -eu
 releases=${TILT_RELEASES:-https://github.com/cloudycotton/tilt/releases}
 dir=${TILT_INSTALL_DIR:-}
 if [ -z "$dir" ]; then
   if [ "$(id -u)" = 0 ]; then dir=/usr/local/bin; else dir=$HOME/.local/bin; fi
 fi
-command -v curl >/dev/null || { echo "install.sh: needs curl" >&2; exit 1; }
-command -v sha256sum >/dev/null || command -v shasum >/dev/null || { echo "install.sh: needs sha256sum or shasum" >&2; exit 1; }
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64 | Linux/amd64) triple=x86_64-unknown-linux-musl ;;
+  Linux/aarch64 | Linux/arm64) triple=aarch64-unknown-linux-musl ;;
+  *) echo "install.sh: tilt runs on Linux, x86_64 or arm64" >&2; exit 1 ;;
+esac
+sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 mkdir -p "$dir"
-curl -fsSL "$releases/latest/download/tilt-live" -o "$dir/tilt-live.part"
-chmod 755 "$dir/tilt-live.part"
-mv "$dir/tilt-live.part" "$dir/tilt-live"
-if [ "$(uname -s)" = Linux ] && [ -z "${TILT_DOCKER:-}" ]; then
-  # The first run downloads tilt itself.
-  "$dir/tilt-live" --version
-else
-  echo "tilt streams a Linux desktop; here, tilt-live runs the demo desktop in Docker (https://docs.docker.com/desktop/)"
-fi
-echo "installed $dir/tilt-live"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL "$releases/latest/download/tilt-$triple" -o "$tmp/tilt"
+curl -fsSL "$releases/latest/download/SHA256SUMS" -o "$tmp/sums"
+want=$(awk -v n="tilt-$triple" '$2 == n { print $1 }' "$tmp/sums")
+[ -n "$want" ] && [ "$want" = "$(sha256 "$tmp/tilt")" ] || { echo "install.sh: checksum mismatch" >&2; exit 1; }
+chmod 755 "$tmp/tilt"
+mv "$tmp/tilt" "$dir/tilt"
+echo "installed $dir/tilt"
 case ":$PATH:" in
   *":$dir:"*) ;;
-  *) echo "add $dir to your PATH, or run $dir/tilt-live" ;;
+  *) echo "add $dir to your PATH, or run $dir/tilt" ;;
 esac

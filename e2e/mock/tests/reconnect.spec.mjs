@@ -67,32 +67,6 @@ test('after a reconnect, takes control back at once from its own lost session', 
     .toEqual([expect.objectContaining({ reason: `taken by ${welcomed.session}` })]);
 });
 
-test.describe('with a server that does not name the holder', () => {
-  test.use({ mockOptions: { namesHolder: false } });
-
-  test('after a reconnect, waits for its own lost session to let go of control', async ({ page, mock }) => {
-    await open(page, mock, 'token=devtoken&control=1');
-    const a1 = await controlling(page);
-    let since = mock.messages.length;
-    mock.cut(a1);
-    const a2 = (await mock.waitFor((m) => m.type === 'welcomed' && m.session !== a1, { since })).session;
-    await page.waitForTimeout(1000);
-    expect(from(mock, a2, 'control')).toEqual([]);
-    expect(mock.holder()).toBe(a1);
-    // The server idle-closes a1 and control is free, but the page is hidden: it waits until shown.
-    await setVisibility(page, 'hidden');
-    since = mock.messages.length;
-    mock.drop(a1, 1000);
-    await mock.waitFor((m) => m.session === a1 && m.type === 'closed', { since });
-    await page.waitForTimeout(500);
-    expect(from(mock, a2, 'control')).toEqual([]);
-    expect(mock.holder()).toBe(null);
-    await setVisibility(page, 'visible');
-    await page.waitForFunction(() => window.tilt.stats.control);
-    expect(mock.holder()).toBe(a2);
-  });
-});
-
 test('a hidden page does not reconnect; shown again, it reconnects and takes control back', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const a1 = await controlling(page);

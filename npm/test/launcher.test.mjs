@@ -1,5 +1,5 @@
-// Tests of both launchers, npm/bin/tilt-live.js and its sh twin scripts/tilt-live (installed by
-// install.sh), against a fake release server: `node --test npm/test/*.test.mjs`.
+// Tests of npm/bin/tilt-live.js and install.sh against a fake release server:
+// `node --test npm/test/*.test.mjs`.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -7,45 +7,27 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { after, before, beforeEach, describe, test } from 'node:test';
+import { after, before, beforeEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-const LAUNCHERS = {
-  node: [process.execPath, fileURLToPath(new URL('../bin/tilt-live.js', import.meta.url))],
-  sh: ['/bin/sh', fileURLToPath(new URL('../../scripts/tilt-live', import.meta.url))],
-};
+const LAUNCHER = fileURLToPath(new URL('../bin/tilt-live.js', import.meta.url));
+const INSTALL = fileURLToPath(new URL('../../install.sh', import.meta.url));
 const TRIPLE = { x64: 'x86_64-unknown-linux-musl', arm64: 'aarch64-unknown-linux-musl' }[process.arch];
 
-// Each release's "tilt" prints its version and arguments, and exits with code 7 (0 for
-// --version, like tilt).
-const fake = (version) => `#!/bin/sh\necho "tilt ${version} $*"\n[ "$1" = --version ] && exit 0\nexit 7\n`;
+// The released "tilt" prints its arguments and exits with code 7 (0 for --version, like tilt).
+const FAKE = '#!/bin/sh\necho "tilt $*"\n[ "$1" = --version ] && exit 0\nexit 7\n';
 
 let server;
 let base;
-let latest = '0.1.0';
 let corrupt = false;
 let hits = [];
 
 before(async () => {
   server = http.createServer((req, res) => {
     hits.push(req.url);
-    if (req.url === '/releases/latest') {
-      res.writeHead(302, { location: `${base}/tag/v${latest}` }).end();
-      return;
-    }
-    if (req.url === '/releases/latest/download/tilt-live') {
-      res.end(fs.readFileSync(LAUNCHERS.sh[1]));
-      return;
-    }
-    const m = /^\/releases\/download\/v([\d.]+)\/(.+)$/.exec(req.url);
-    if (!m) {
-      res.writeHead(404).end();
-      return;
-    }
-    const bin = fake(m[1]);
-    const sum = crypto.createHash('sha256').update(corrupt ? 'other' : bin).digest('hex');
-    if (m[2] === `tilt-${TRIPLE}`) res.end(bin);
-    else if (m[2] === 'SHA256SUMS') res.end(`${sum}  tilt-${TRIPLE}\n${'0'.repeat(64)}  tilt-other\n`);
+    const sum = crypto.createHash('sha256').update(corrupt ? 'other' : FAKE).digest('hex');
+    if (req.url === `/releases/latest/download/tilt-${TRIPLE}`) res.end(FAKE);
+    else if (req.url === '/releases/latest/download/SHA256SUMS') res.end(`${sum}  tilt-${TRIPLE}\n${'0'.repeat(64)}  tilt-other\n`);
     else res.writeHead(404).end();
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -57,187 +39,53 @@ after(() => server.close());
 let home;
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), 'tilt-live-'));
-  latest = '0.1.0';
   corrupt = false;
   hits = [];
 });
 
-for (const [name, [interpreter, launcher]] of Object.entries(LAUNCHERS)) describe(name, () => {
-  /** Runs the launcher with `args` and extra environment; resolves to { code, out, err }. */
-  function run(args = [], env = {}) {
-    const child = spawn(interpreter, [launcher, ...args], {
-      env: {
-        PATH: process.env.PATH,
-        HOME: home,
-        XDG_CACHE_HOME: path.join(home, 'cache'),
-        XDG_CONFIG_HOME: path.join(home, 'config'),
-        TILT_RELEASES: base,
-        ...env,
-      },
-    });
-    const r = { out: '', err: '' };
-    child.stdout.on('data', (d) => { r.out += d; });
-    child.stderr.on('data', (d) => { r.err += d; });
-    return new Promise((resolve) => child.on('close', (code) => resolve({ ...r, code })));
-  }
-
-  const versions = () => fs.readdirSync(path.join(home, 'cache', 'tilt-live')).sort();
-
-  test('downloads the latest release, runs it with the arguments and its exit code', async () => {
-    const r = await run(['--display', ':5']);
-    assert.equal(r.code, 7);
-    assert.match(r.out, /^tilt 0\.1\.0 --display :5 --token-file \S+\/config\/tilt-live\/token$/m);
-    assert.deepEqual(versions(), ['0.1.0']);
+/** Runs `cmd args` with a fresh HOME; resolves to { code, out, err }. */
+function run(cmd, args, env = {}) {
+  const child = spawn(cmd, args, {
+    env: { PATH: process.env.PATH, HOME: home, XDG_CACHE_HOME: path.join(home, 'cache'), TILT_RELEASES: base, ...env },
   });
+  const r = { out: '', err: '' };
+  child.stdout.on('data', (d) => { r.out += d; });
+  child.stderr.on('data', (d) => { r.err += d; });
+  return new Promise((resolve) => child.on('exit', (code) => resolve({ ...r, code })));
+}
+const launch = (args, env) => run(process.execPath, [LAUNCHER, ...args], env);
 
-  test('makes a private token once, keeps it, and prints the link', async () => {
-    const first = await run();
-    const file = path.join(home, 'config', 'tilt-live', 'token');
-    const token = fs.readFileSync(file, 'utf8').trim();
-    assert.match(token, /^[0-9a-f]{32}$/);
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-    assert.match(first.err, new RegExp(`open http://localhost:6090/#token=${token}`));
-    await run();
-    assert.equal(fs.readFileSync(file, 'utf8').trim(), token);
-    // A bind address of its own is the one in the link.
-    assert.match((await run(['--bind', '127.0.0.1:7000'])).err, new RegExp(`open http://127\\.0\\.0\\.1:7000/#token=${token}\\n`));
-  });
-
-  test('leaves access control alone when it is given', async () => {
-    for (const [args, env] of [[['--no-auth'], {}], [['--token=x'], {}], [['--token-file', '/t'], {}], [[], { TILT_TOKEN: 'x' }], [['--version'], {}]]) {
-      const r = await run(args, env);
-      assert.doesNotMatch(r.out, /--token-file \S+\/config\//, JSON.stringify(args));
-      assert.doesNotMatch(r.err, /open http/);
-    }
-  });
-
-  test('updates to a newer release on start and keeps two', async () => {
-    await run();
-    latest = '0.2.0';
-    assert.match((await run()).out, /^tilt 0\.2\.0 /);
-    latest = '0.10.0';
-    assert.match((await run()).out, /^tilt 0\.10\.0 /);
-    assert.deepEqual(versions(), ['0.10.0', '0.2.0']);
-    // Up to date: no download.
-    hits = [];
-    await run();
-    assert.deepEqual(hits, ['/releases/latest']);
-  });
-
-  test('runs the newest download when offline, or when told not to update', async () => {
-    await run();
-    latest = '0.2.0';
-    await run();
-    assert.match((await run([], { TILT_RELEASES: 'http://127.0.0.1:9/releases' })).out, /^tilt 0\.2\.0 /);
-    latest = '0.3.0';
-    hits = [];
-    assert.match((await run([], { TILT_NO_UPDATE: '1' })).out, /^tilt 0\.2\.0 /);
-    assert.deepEqual(hits, []);
-  });
-
-  test('pins a release with TILT_VERSION', async () => {
-    latest = '0.3.0';
-    assert.match((await run([], { TILT_VERSION: '0.1.5' })).out, /^tilt 0\.1\.5 /);
-  });
-
-  test('refuses a download whose checksum does not match', async () => {
-    corrupt = true;
-    const r = await run();
-    assert.equal(r.code, 1);
-    assert.match(r.err, /checksum mismatch/);
-    corrupt = false;
-    await run();
-    corrupt = true;
-    latest = '0.2.0';
-    const fallback = await run();
-    assert.match(fallback.err, /checksum mismatch\); running 0\.1\.0/);
-    assert.match(fallback.out, /^tilt 0\.1\.0 /);
-  });
-
-  test('says why when there is nothing to run', async () => {
-    const r = await run([], { TILT_RELEASES: 'http://127.0.0.1:9/releases' });
-    assert.equal(r.code, 1);
-    assert.match(r.err, /cannot find the latest tilt release/);
-  });
-
-  describe('in Docker (TILT_DOCKER=1, or not on Linux)', () => {
-    // A fake docker on PATH: prints its arguments, then the token it was given, and exits with
-    // 7 (`docker version` with 0).
-    let bin;
-    beforeEach(() => {
-      bin = path.join(home, 'fakebin');
-      fs.mkdirSync(bin);
-      fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\necho "docker $*"\necho "TILT_TOKEN=${TILT_TOKEN:-}"\n[ "$1" = version ] && exit 0\nexit 7\n', { mode: 0o755 });
-    });
-    const docker = (args = [], env = {}) => run(args, { TILT_DOCKER: '1', PATH: `${bin}:${process.env.PATH}`, ...env });
-    const token = () => fs.readFileSync(path.join(home, 'config', 'tilt-live', 'token'), 'utf8').trim();
-
-    test('runs the latest release image with the token, publishing the port', async () => {
-      const r = await docker(['--max-fps', '30']);
-      assert.equal(r.code, 7);
-      assert.match(r.err, new RegExp(`open http://localhost:6090/#token=${token()}`));
-      assert.match(r.err, /starting the demo desktop ghcr\.io\/cloudycotton\/tilt-desktop:0\.1\.0 in Docker/);
-      const [line, env] = r.out.split('\n');
-      assert.match(line, /^docker run --rm --init --shm-size 1g -p 6090:6090 /);
-      assert.match(line, / -e TESTPATTERN=0 /);
-      assert.match(line, / -e TILT_TOKEN /);
-      assert.equal(env, `TILT_TOKEN=${token()}`);
-      assert.match(line, / ghcr\.io\/cloudycotton\/tilt-desktop:0\.1\.0 --max-fps 30$/);
-      assert.doesNotMatch(line, /--token-file/);
-      assert.deepEqual(hits, ['/releases/latest']);
-      assert.ok(!fs.existsSync(path.join(home, 'cache', 'tilt-live')));
-    });
-
-    test('maps --bind to the published port, pins a version, and mounts a token file', async () => {
-      const r = await docker(['--bind', '127.0.0.1:7000', '--token-file', path.join(home, 't')], { TILT_VERSION: '0.3.0', TILT_IMAGE: 'tilt-desktop', SCREEN: '800x600x24' });
-      const [line] = r.out.split('\n');
-      assert.match(line, / -p 127\.0\.0\.1:7000:6090 /);
-      assert.match(line, new RegExp(` -v ${home}/t:/run/tilt-live/token1?:ro `));
-      assert.match(line, / -e SCREEN /);
-      assert.match(line, / tilt-desktop:0\.3\.0 --token-file \/run\/tilt-live\/token1?$/);
-      assert.doesNotMatch(line, /--bind/);
-      assert.doesNotMatch(r.err, /open http/);
-      assert.doesNotMatch(line, /TILT_VERSION|TILT_DOCKER|TILT_IMAGE/);
-    });
-
-    test('uses the latest image when offline, and just the binary for --version', async () => {
-      const r = await docker(['--version'], { TILT_RELEASES: 'http://127.0.0.1:9/releases' });
-      const [line] = r.out.split('\n');
-      assert.match(line, / --entrypoint tilt .*tilt-desktop:latest --version$/);
-    });
-
-    test('says what to install when docker is missing', async () => {
-      const r = await run([], { TILT_DOCKER: '1', PATH: path.join(home, 'nothing') });
-      assert.equal(r.code, 1);
-      assert.match(r.err, /docker is not running\./);
-      assert.match(r.err, /Docker Desktop/);
-    });
-  });
+test('downloads tilt once and passes arguments and exit code through', async () => {
+  let r = await launch(['--display', ':1']);
+  assert.equal(r.code, 7, r.err);
+  assert.equal(r.out, 'tilt --display :1\n');
+  assert.match(r.err, /downloading tilt/);
+  hits = [];
+  // tilt keeps itself up to date from then on: the launcher does not download again.
+  r = await launch(['--version']);
+  assert.equal(r.code, 0);
+  assert.equal(r.out, 'tilt --version\n');
+  assert.deepEqual(hits, []);
 });
 
-test('install.sh installs tilt-live, which then runs the latest tilt', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tilt-install-'));
-  const env = {
-    PATH: process.env.PATH,
-    HOME: home,
-    XDG_CACHE_HOME: path.join(home, 'cache'),
-    XDG_CONFIG_HOME: path.join(home, 'config'),
-    TILT_RELEASES: base,
-    TILT_INSTALL_DIR: path.join(home, 'bin'),
-  };
-  const sh = (cmd, args) => new Promise((resolve) => {
-    const child = spawn(cmd, args, { env });
-    let out = '';
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { out += d; });
-    child.on('close', (code) => resolve({ code, out }));
-  });
-  latest = '0.4.0';
-  const installed = await sh('/bin/sh', [fileURLToPath(new URL('../../install.sh', import.meta.url))]);
-  assert.equal(installed.code, 0, installed.out);
-  assert.match(installed.out, /tilt 0\.4\.0 --version/);
-  assert.match(installed.out, /installed \S+\/bin\/tilt-live/);
-  const r = await sh(path.join(home, 'bin', 'tilt-live'), ['--display', ':3']);
-  assert.equal(r.code, 7);
-  assert.match(r.out, /tilt 0\.4\.0 --display :3 --token-file/);
+test('refuses a binary whose checksum does not match', async () => {
+  corrupt = true;
+  const r = await launch(['--version']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /checksum mismatch/);
+  assert.ok(!fs.existsSync(path.join(home, 'cache', 'tilt-live', 'tilt')));
+});
+
+test('install.sh installs a verified tilt', async () => {
+  const dir = path.join(home, 'bin');
+  const r = await run('/bin/sh', [INSTALL], { TILT_INSTALL_DIR: dir });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, new RegExp(`installed ${dir}/tilt`));
+  const v = await run(path.join(dir, 'tilt'), ['--version']);
+  assert.equal(v.out, 'tilt --version\n');
+  corrupt = true;
+  const bad = await run('/bin/sh', [INSTALL], { TILT_INSTALL_DIR: path.join(home, 'bad') });
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.err, /checksum/);
+  assert.ok(!fs.existsSync(path.join(home, 'bad', 'tilt')));
 });

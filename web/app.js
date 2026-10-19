@@ -17,9 +17,8 @@ const BACKOFF_MS = [250, 500, 1000, 2000, 5000];
 const PING_MS = 1000;
 const DEAD_MS = 5000;
 const WELCOME_TIMEOUT_MS = 10000;
-// After a reconnect, how long this page waits for control to be free before giving up taking it
-// back. A server that names no holder may be leaving it with this page's own lost session, which
-// it idle-closes within 30 s.
+// After a reconnect, how long this page waits for another viewer to let go of control before
+// giving up taking it back.
 const RETAKE_MS = 35000;
 const IDR_INTERVAL_MS = 500;
 // Frames in the decoder this long with no output: flush it, and replace it if the flush hangs.
@@ -490,8 +489,7 @@ function onControl(m) {
  * Sends a pending automatic take once it is due: at once for control=1's first take, otherwise
  * when this session's `control` status says nobody holds control, or that this page's own lost
  * session does (the server closes it only once it notices). Never from another viewer, and never
- * while the page is hidden. A server that names no holder leaves us unable to tell the two
- * apart, so control held there is waited out for RETAKE_MS.
+ * while the page is hidden.
  */
 function maybeTake() {
   const t = conn.take;

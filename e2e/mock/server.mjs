@@ -62,7 +62,6 @@ export const DEFAULTS = {
   noAuth: false,
   tokenFile: null, // read on every hello, like TILT_TOKEN_FILE; missing file -> not_ready
   maxViewers: 4,
-  namesHolder: true, // false: `control` messages without `holder`, as from servers before it
   maxMsgBytes: 262144,
   fps: 30,
   window: 4, // frames in flight before the stream waits for ACKs
@@ -229,7 +228,7 @@ export async function startMockServer(options = {}) {
 
   function controlMsg(sess) {
     const h = state.holder;
-    return { t: 'control', you: sess === h, held: h !== null, holder: h && opts.namesHolder ? h.id : undefined };
+    return { t: 'control', you: sess === h, held: h !== null, holder: h ? h.id : undefined };
   }
 
   function broadcastControl() {

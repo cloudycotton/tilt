@@ -1,4 +1,4 @@
-// The WebTransport fast path (docs/protocol.md section 7), against tilt started with --wt-bind:
+// The WebTransport fast path (docs/protocol.md section 7), against a running tilt:
 // a browser that has WebTransport streams and sends input over UDP, falls back to the WebSocket
 // when UDP does not get through, and keeps to the WebSocket when told to. Skipped when the
 // server offers no fast path.
@@ -25,7 +25,7 @@ test.afterEach(async ({ page }) => {
 });
 
 test('streams and takes input over WebTransport', async ({ page, request }) => {
-  test.skip(!(await advert(request)), 'the server offers no WebTransport (--wt-bind)');
+  test.skip(!(await advert(request)), 'the server offers no WebTransport');
   test.skip(!(await hasWebTransport(page)), 'this browser has no WebTransport');
   await openTilt(page, `token=${CONTROL_TOKEN}&control=1&probe=${MARKER}`);
   expect(await page.evaluate(() => window.tilt.stats.transport)).toBe('udp');
@@ -51,7 +51,7 @@ test('streams and takes input over WebTransport', async ({ page, request }) => {
 
 test('falls back to the WebSocket when UDP does not get through, and remembers', async ({ page, request }) => {
   const wt = await advert(request);
-  test.skip(!wt, 'the server offers no WebTransport (--wt-bind)');
+  test.skip(!wt, 'the server offers no WebTransport');
   test.skip(!(await hasWebTransport(page)), 'this browser has no WebTransport');
   // As if the UDP port were blocked: the advert names a port nothing listens on.
   await page.route('**/transport', (route) => route.fulfill({ json: { wt: { ...wt, port: 9 } } }));
@@ -70,7 +70,7 @@ test('falls back to the WebSocket when UDP does not get through, and remembers',
 });
 
 test('#transport=ws keeps to the WebSocket', async ({ page, request }) => {
-  test.skip(!(await advert(request)), 'the server offers no WebTransport (--wt-bind)');
+  test.skip(!(await advert(request)), 'the server offers no WebTransport');
   await openTilt(page, `token=${CONTROL_TOKEN}&transport=ws`);
   expect(await page.evaluate(() => window.tilt.stats.transport)).toBe('ws');
 });

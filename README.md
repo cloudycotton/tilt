@@ -24,14 +24,15 @@ npx tilt-live
 
 Open the link it prints, click the cursor button, and the desktop is yours.
 
-<sub>Run it on the Linux machine whose screen you want. On a Mac or Windows PC it runs a demo Linux desktop in Docker instead.
-No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh` then `tilt-live`.</sub>
+<sub>Run it on the Linux machine or VM whose screen you want. It keeps itself up to date.
+No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh` then `tilt`.</sub>
 
 ## Why tilt
 
 - **Fast.** 60 fps, about 20 ms from key press to pixel.
 - **Tiny.** One static binary. Almost no CPU while nobody watches.
-- **Goes anywhere.** One HTTPS port. Happy behind proxies and gateways.
+- **Goes anywhere.** One port: UDP where it gets through, HTTPS everywhere else. Happy behind proxies and gateways.
+- **Always current.** Updates itself whenever it starts.
 - **Any device.** Mouse, keyboard, touch, paste, view-only links.
 
 ## Next
