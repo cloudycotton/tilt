@@ -1,5 +1,6 @@
 // tilt web client: connection, decoder, renderer, UI, stats and debug hooks (brief 6).
 import { createInput, message } from './input.js';
+import { WtSocket, wtCandidate } from './transport.js';
 
 const VIDEO = 0x01;
 const CURSOR_SHAPE = 0x02;
@@ -153,6 +154,8 @@ function readOptions() {
     probe: probe.length === 2 && probe.every((v) => Number.isInteger(v) && v >= 0) ? probe : null,
     scale: get('scale') === '1' ? '1' : 'fit',
     framing: get('framing') === 'avcc' ? 'avcc' : 'annexb',
+    // 'ws' never tries the WebTransport fast path; 'udp' tries it despite a remembered failure.
+    transport: ['ws', 'udp'].includes(get('transport')) ? get('transport') : '',
   };
 }
 
@@ -187,6 +190,8 @@ const stats = {
   // Beyond the brief's list: the server's session id and the H.264 framing in use (annexb | avcc).
   session: '',
   framing: opts.framing,
+  // 'udp' (WebTransport) or 'ws', for the stats overlay and tests.
+  transport: '',
 };
 const probeEvents = [];
 
@@ -277,18 +282,43 @@ function connect() {
   clearTimeout(conn.timer);
   conn.timer = 0;
   detach();
+  conn.openedAt = performance.now();
+  setDot('wait', 'Connecting');
+  if (!wtCandidate(opts.transport)) {
+    openWebSocket();
+    return;
+  }
+  // The UDP fast path, if the server offers it and the network lets it through; otherwise it
+  // hands over to the WebSocket within a couple of seconds (transport.js).
+  const wt = new WtSocket(location.href);
+  wt.onfallback = () => {
+    if (wt === conn.ws) openWebSocket();
+  };
+  // A video stream that never arrived: ack past it and resync on a keyframe.
+  wt.onskip = (seq) => {
+    if (wt === conn.ws && conn.welcomed) skipFrame(seq);
+  };
+  attach(wt, 'udp');
+}
+
+function openWebSocket() {
   let ws;
   try {
     ws = new WebSocket(streamUrl());
   } catch (e) {
+    conn.ws = null;
     conn.fatal = `Cannot open the stream: ${e.message}`;
     showFatal();
     return;
   }
   ws.binaryType = 'arraybuffer';
+  attach(ws, 'ws');
+}
+
+/** Makes `ws` (a WebSocket or a WtSocket) the session's connection. */
+function attach(ws, transport) {
   conn.ws = ws;
-  conn.openedAt = performance.now();
-  setDot('wait', 'Connecting');
+  stats.transport = transport;
   ws.onopen = () => {
     if (ws !== conn.ws) return;
     const hello = { t: 'hello', v: 1 };
@@ -310,7 +340,7 @@ function detach() {
   const ws = conn.ws;
   conn.ws = null;
   if (!ws) return;
-  ws.onopen = ws.onmessage = ws.onclose = null;
+  ws.onopen = ws.onmessage = ws.onclose = ws.onfallback = ws.onskip = null;
   try { ws.close(); } catch { /* already closing */ }
 }
 
@@ -1370,7 +1400,7 @@ function updateStats(now) {
   const s = serverStats || {};
   ui.stats.textContent = [
     `fps    ${n(rates.fpsDecoded)} decoded  ${n(rates.fpsDrawn)} drawn`,
-    `recv   ${n(rates.kbps, 0)} kbps   ping ${stats.rttMs ?? '-'} ms`,
+    `recv   ${n(rates.kbps, 0)} kbps   ping ${stats.rttMs ?? '-'} ms   ${stats.transport || '-'}`,
     `video  ${stats.width}x${stats.height} ${stats.codec || '-'} ${video.framing}${video.hw === 'prefer-software' ? ' software' : ''}  queue ${video.decoder ? video.decoder.decodeQueueSize : 0}`,
     `you    ${stats.role ? `${stats.role} role` : '-'}${stats.control ? ', in control' : ''}  errors ${stats.decodeErrors}  stalls ${stats.decoderStalls}`,
     `server ${n(s.fps)} fps  ${n(s.kbps, 0)} kbps  target ${n(s.bitrate_kbps, 0)} kbps`,

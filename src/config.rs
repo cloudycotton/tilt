@@ -336,6 +336,39 @@ mod tests {
     }
 
     #[test]
+    fn webtransport_flags() {
+        let c = parse(&["--no-auth"]).unwrap();
+        assert_eq!(
+            (c.wt_bind, c.wt_public_port, &c.wt_public_host),
+            (None, None, &None)
+        );
+        let c = parse(&[
+            "--no-auth",
+            "--wt-bind",
+            "0.0.0.0:6091",
+            "--wt-public-port",
+            "7091",
+            "--wt-public-host",
+            "203.0.113.7",
+        ])
+        .unwrap();
+        assert_eq!(c.wt_bind, Some("0.0.0.0:6091".parse().unwrap()));
+        assert_eq!(c.wt_public_port, Some(7091));
+        assert_eq!(c.wt_public_host.as_deref(), Some("203.0.113.7"));
+        // The public port and host mean nothing without the endpoint.
+        assert!(parse(&["--no-auth", "--wt-public-port", "7091"]).is_err());
+        assert!(parse(&["--no-auth", "--wt-public-host", "a.example"]).is_err());
+        let bind = ["--no-auth", "--wt-bind", "0.0.0.0:6091"];
+        assert!(parse(&[&bind[..], &["--wt-public-port", "0"]].concat()).is_err());
+        for bad in ["", "a b", "a/b", "user@a"] {
+            assert!(
+                parse(&[&bind[..], &["--wt-public-host", bad]].concat()).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn auto_profile_picks_cavlc_on_small_boxes() {
         let c = parse(&["--no-auth", "--profile", "auto"]).unwrap();
         assert_eq!(c.resolved_profile(1), Profile::Baseline);

@@ -6,6 +6,7 @@ Pick what you need. Every section stands on its own.
 - [Docker](#docker): try it with a demo desktop
 - [Run the binary](#run-the-binary): on your own machine or VM
 - [Behind a proxy](#behind-a-proxy): a remote VM at `https://gw.example.com/vm1/`
+- [UDP fast path](#udp-fast-path): smoother over lossy links (Firecracker and other VMs)
 - [E2B](#e2b) · [Sail](#sail): sandboxes
 - [Flags](#flags)
 - [Tips and limits](#tips-and-limits)
@@ -145,6 +146,39 @@ page's origin, or use a token. Origin checks stop neither DNS rebinding nor non-
 with `--no-auth`, **anyone who reaches the port has control**.
 </details>
 
+## UDP fast path
+
+Over the internet, a lost packet stalls a TCP connection until it is resent, and every frame
+behind it waits: that is the hitch you see on Wi-Fi or a long path. With `--wt-bind`, browsers
+that can (Chrome and Edge; others as they support WebTransport with certificate hashes) stream over WebTransport (QUIC, UDP) instead, where each frame
+travels on its own and QUIC recovers faster. Everyone else, and everyone whose network blocks
+UDP, keeps using the WebSocket on the HTTP port, automatically.
+
+```sh
+tilt --display :0 --token-file /run/tilt/token --wt-bind 0.0.0.0:6091
+```
+
+- Open the page as usual. The `···` menu's stats (or `&stats=1`) show `udp` or `ws`.
+- No certificate needed: tilt makes a short-lived self-signed one and tells the page its hash.
+- The page must reach the UDP port directly: an HTTPS gateway or proxy cannot carry it. Such
+  pages wait about 1.5 s for UDP, then use the WebSocket; after two such failures in a row they
+  go straight to the WebSocket for a day.
+
+**Firecracker (or any VM behind NAT).** Forward the UDP port from the host to the VM, and tell
+tilt which port browsers dial if it differs:
+
+```sh
+# on the host: public UDP 7091 -> VM 172.16.0.2:6091
+iptables -t nat -A PREROUTING -p udp --dport 7091 -j DNAT --to-destination 172.16.0.2:6091
+iptables -A FORWARD -p udp -d 172.16.0.2 --dport 6091 -j ACCEPT
+# in the VM
+tilt --display :0 --token-file /run/tilt/token --wt-bind 0.0.0.0:6091 --wt-public-port 7091
+```
+
+If the page is served from a gateway host but UDP goes to another address (the host's public IP),
+add `--wt-public-host 203.0.113.7`. Allow the UDP port in the host's firewall and any cloud
+security group.
+
 ## E2B
 
 Upload the static x86_64 binary into an `@e2b/desktop` sandbox and point it at display `:0`.
@@ -219,6 +253,7 @@ Every flag also has an environment variable. You need one of `--token`, `--token
 | `--no-auth` | `TILT_NO_AUTH` | off | everyone gets control. Local testing only |
 | `--max-viewers <N>` | `TILT_MAX_VIEWERS` | 4 | viewers at once (each one costs an encoder) |
 | `--max-fps <N>` | `TILT_MAX_FPS` | 60 | frame rate cap per viewer, 1 to 60 |
+| `--wt-bind <ADDR>` | `TILT_WT_BIND` | off | UDP address for the [WebTransport fast path](#udp-fast-path), such as `0.0.0.0:6091` |
 
 <details>
 <summary>More flags</summary>
@@ -238,6 +273,8 @@ Every flag also has an environment variable. You need one of `--token`, `--token
 | `--rc-frame-skip` | `TILT_RC_FRAME_SKIP` | off | let OpenH264 rate control skip frames |
 | `--max-msg-bytes <N>` | `TILT_MAX_MSG_BYTES` | 65536 | larger video frames are split into fragments; small ones keep a slow link's client hearing from the server while a keyframe arrives |
 | `--notsent-lowat <BYTES>` | `TILT_NOTSENT_LOWAT` | 32768 | TCP_NOTSENT_LOWAT, 0 = off (Linux only) |
+| `--wt-public-port <PORT>` | `TILT_WT_PUBLIC_PORT` | the `--wt-bind` port | the UDP port browsers dial, when the host forwards another one to tilt |
+| `--wt-public-host <HOST>` | `TILT_WT_PUBLIC_HOST` | the page's host | the host browsers dial for UDP |
 | `--poll-ms <N>` | `TILT_POLL_MS` | 1000 | safety full-frame compare while viewers wait, backing off to 8× while it finds nothing; 0 = off |
 
 Usage errors (a missing token, an inconsistent quantizer or bitrate range) exit with code 2 at
