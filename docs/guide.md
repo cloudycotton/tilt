@@ -99,15 +99,16 @@ Rules:
 <details>
 <summary>Latency through a gateway</summary>
 
-tilt adds about 10 ms between a change on screen and its frame leaving the server (grab 0.6 ms,
-conversion 0.8 ms, encoding 6–10 ms at 1080p). The page draws each frame as soon as it's
-decoded; the rest is your network's round trip. Key press to drawn, 1080p, through
-[e2e/proxy.mjs](../e2e/proxy.mjs):
+A small change (typing, a caret, a hover) leaves tilt about 2 ms after it reaches the screen:
+it is sent as the changed pixels, with no video encoding or decoding. A bigger change (a scroll,
+a moved window) goes through H.264, about 5 ms more each side at 1080p. The page draws each
+update as soon as it's ready; the rest is your network's round trip. Key press to drawn, 1080p,
+through [e2e/proxy.mjs](../e2e/proxy.mjs):
 
 | round trip added | Chrome p50 / p95 | WebKit p50 / p95 |
 |---|---|---|
-| 0 ms | 12 / 18 ms | 38 / 47 ms |
-| 50 ms | 64 / 68 ms | 85 / 98 ms |
+| 0 ms | 3 / 14 ms | 10 / 15 ms |
+| 50 ms | 54 / 57 ms | 61 / 64 ms |
 
 An animated screen kept 60 fps at 100 ms round trip (frame gaps p50 16.7 ms, p95 21 ms): flow
 control keeps about 1.5 bandwidth-delay products in flight, so frame rate doesn't drop as

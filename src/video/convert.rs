@@ -29,6 +29,20 @@ impl I420Frame {
         self.v.copy_from_slice(&other.v);
     }
 
+    /// Copies rows `[top, bottom)` (even, within the frame) of `other`, which must have the
+    /// same size.
+    pub fn copy_rows_from(&mut self, other: &I420Frame, top: u32, bottom: u32) {
+        debug_assert_eq!((self.width, self.height), (other.width, other.height));
+        debug_assert!((top | bottom) & 1 == 0 && top <= bottom && bottom <= self.height);
+        let (w, cw) = (self.width as usize, self.width as usize / 2);
+        let (top, bottom) = (top as usize, bottom as usize);
+        let luma = top * w..bottom * w;
+        let chroma = top / 2 * cw..bottom / 2 * cw;
+        self.y[luma.clone()].copy_from_slice(&other.y[luma]);
+        self.u[chroma.clone()].copy_from_slice(&other.u[chroma.clone()]);
+        self.v[chroma.clone()].copy_from_slice(&other.v[chroma]);
+    }
+
     /// Sizes the planes for `width` x `height`, reusing their allocations.
     fn reshape(&mut self, width: u32, height: u32) {
         let chroma = (width / 2) as usize * (height / 2) as usize;
@@ -43,7 +57,8 @@ impl I420Frame {
 /// Recycles I420 buffers between capture and the encoders. Clones share one pool.
 #[derive(Clone, Default)]
 pub struct FramePool {
-    idle: Arc<Mutex<Vec<I420Frame>>>,
+    /// Idle buffers, each with the `content` tag it had.
+    idle: Arc<Mutex<Vec<(I420Frame, u64)>>>,
 }
 
 impl FramePool {
@@ -57,7 +72,8 @@ impl FramePool {
         drop(idle);
     }
 
-    /// A `width`x`height` frame with unspecified contents, reusing an idle buffer if there is one.
+    /// A `width`x`height` frame with unspecified contents, reusing an idle buffer if there is
+    /// one. Its `content` tag says what it holds (0: nothing known).
     pub fn get(&self, width: u32, height: u32) -> PooledFrame {
         // The list stays consistent even if a holder of the lock panicked, so poison is ignored.
         let idle = self
@@ -65,10 +81,14 @@ impl FramePool {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop();
-        let mut frame = idle.unwrap_or_default();
-        frame.reshape(width, height);
+        let (mut frame, mut content) = idle.unwrap_or_default();
+        if (frame.width, frame.height) != (width, height) {
+            frame.reshape(width, height);
+            content = 0;
+        }
         PooledFrame {
             frame,
+            content,
             pool: self.clone(),
         }
     }
@@ -77,6 +97,10 @@ impl FramePool {
 /// An I420Frame that goes back to its pool, which keeps at most MAX_IDLE idle, when dropped.
 pub struct PooledFrame {
     frame: I420Frame,
+    /// What the pixels are, for whoever fills the frame: capture tags it with the capture seq,
+    /// so that the next time it gets this buffer it copies only the rows changed since. 0 when
+    /// not known.
+    pub content: u64,
     pool: FramePool,
 }
 
@@ -103,7 +127,7 @@ impl Drop for PooledFrame {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if idle.len() < MAX_IDLE {
-            idle.push(frame);
+            idle.push((frame, self.content));
         }
         // Otherwise `frame` is freed after the lock is released.
     }
@@ -189,6 +213,45 @@ mod tests {
             }
         }
         buf
+    }
+
+    #[test]
+    fn copy_rows_copies_just_those_rows() {
+        let mut a = frame(8, 6);
+        let mut b = frame(8, 6);
+        for (i, p) in
+            b.y.iter_mut()
+                .chain(b.u.iter_mut())
+                .chain(b.v.iter_mut())
+                .enumerate()
+        {
+            *p = i as u8 + 1;
+        }
+        a.copy_rows_from(&b, 2, 4);
+        assert!(a.y[..16].iter().chain(&a.y[32..]).all(|&p| p == 0));
+        assert_eq!(a.y[16..32], b.y[16..32]);
+        // Chroma row 1 of 3 (4 samples a row).
+        assert!(a.u[..4].iter().chain(&a.u[8..]).all(|&p| p == 0));
+        assert_eq!((&a.u[4..8], &a.v[4..8]), (&b.u[4..8], &b.v[4..8]));
+        a.copy_rows_from(&b, 0, 6);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn pooled_frames_keep_their_content_tag_while_the_size_holds() {
+        let pool = FramePool::new();
+        let mut f = pool.get(64, 32);
+        assert_eq!(f.content, 0);
+        f.content = 7;
+        drop(f);
+        let f = pool.get(64, 32);
+        assert_eq!(f.content, 7);
+        drop(f);
+        assert_eq!(
+            pool.get(32, 32).content,
+            0,
+            "another size holds nothing known"
+        );
     }
 
     fn frame(width: u32, height: u32) -> I420Frame {

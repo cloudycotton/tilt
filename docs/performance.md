@@ -10,15 +10,38 @@ desktop with Chromium and xterm, tilt pinned to one vCPU and the viewer on anoth
 
 One viewer at 1080p, in % of one vCPU:
 
-| activity | tilt | of which encoding |
+| activity | tilt | before 0.2.0 |
 |---|---|---|
-| typing in a terminal | 11% | 9% |
-| scrolling a web page | 26% | 21% |
-| dragging a window over a page | 38% | 31% |
-| nobody watching, or a still screen | ~0% | 0% |
+| typing in a terminal | 2–3% | 11% |
+| scrolling a web page | 23% | 27–30% |
+| dragging a window over a page | 35% | 44% |
+| nobody watching, or a still screen | ~0% | ~0% |
 
-Encoding one 1080p frame with OpenH264 takes 3–4 ms here. Grabbing and converting only the
-damaged rows takes about 1 ms. Every viewer has its own encoder.
+Encoding one 1080p frame with OpenH264 takes about 3 ms here, and most of that is the same
+whatever changed: OpenH264 works through all 8160 macroblocks of the screen, and a still
+frame costs as much as a typed character. So small changes skip the encoder (below). Every
+viewer has its own encoder.
+
+## Small changes are patches
+
+When what changed since the viewer's last update covers at most an eighth of the screen, and
+its pixels, run-length coded, fit in a frame's share of the bitrate (8 KiB at least), tilt
+sends those pixels instead of an H.264 frame (`src/video/patch.rs`, docs/protocol.md). A
+typed character is a patch of about 300 bytes that takes 6 µs to make, where a frame took
+3–5 ms to encode and as long again to decode in the browser. Key press to drawn fell from
+12 ms to 3 ms (p50, Chrome, local). Scrolls, window moves and video still go through H.264:
+as pixels they would cost far more bytes.
+
+Capture grabs only the damaged rows, and since 0.2.0 it also copies only the rows changed
+since the buffer it reuses, rather than the whole last frame (3 MB at 1080p).
+
+## Encoder settings
+
+Background detection and the deblocking filter are off. Both are camera tools; on the
+recordings below, turning both off makes frames 10–25% faster to encode and 15–25% smaller, at
+1–3 dB more PSNR, at 8 Mbps and at 800 kbps alike. With background detection on, the
+refinement of a still screen also stalled 2–3 dB short, since it skipped the macroblocks it
+took for background.
 
 ## On a small VM
 
@@ -27,8 +50,6 @@ damaged rows takes about 1 ms. Every viewer has its own encoder.
 - **Keep AVX2 in the CPU template.** OpenH264 picks its SIMD code (SSE2 to AVX2) at run time.
   Firecracker's T2/C3 templates keep AVX2; a template that hides it makes encoding several times
   slower.
-- **`--profile baseline`** (CAVLC) encodes 10–25% faster than the default High (CABAC) for 10–15%
-  more bits. `--profile auto` picks it on 1–2 vCPUs.
 - **`--max-fps 30`** halves encoding CPU while the screen is busy; a still screen costs nothing
   either way.
 - **A smaller screen, not a scaled stream.** A 1280×720 Xvfb encodes in about 40–60% of the
@@ -40,6 +61,8 @@ Each measured on recordings of typing, scrolling and dragging (the benchmark bel
 
 | idea | result |
 |---|---|
+| `--profile baseline` with the settings above | no faster than High any more, for 10–15% more bits |
+| mimalloc keeping freed memory for 1 s (`purge_delay`) | no change |
 | OpenH264 screen-content mode | 3× the CPU per frame (10–15 ms) for 20–40% fewer bits |
 | 2 or 4 encoder threads (one slice each) | at best 10–20% faster frames on idle vCPUs, slower when typing, 5–25% more bits |
 | scaling 1080p to 720p or 900p before encoding | only 20–30% faster to encode, but 2–8× the bits: scrolls and window moves stop being whole-pixel motion |

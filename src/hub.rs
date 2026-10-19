@@ -1,13 +1,18 @@
 //! FrameHub: the latest captured frame, viewer demand and new-frame notification
 //! (brief section 5.2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::session::SessionId;
 use crate::video::convert::PooledFrame;
+use crate::video::patch::Rect;
+
+/// How many frames back `damage_between` can see. A worker is never more than a capture or two
+/// behind, except while it waits for credit, and then a video frame is due anyway.
+const DAMAGE_HISTORY: usize = 8;
 
 /// One captured screen converted to I420, shared with the encoders as `Arc<Frame>`.
 pub struct Frame {
@@ -17,6 +22,9 @@ pub struct Frame {
     pub capture_us: u64,
     /// Even-cropped screen size.
     pub image: PooledFrame,
+    /// What changed since frame `seq - 1`, in screen pixels (not clipped to `image`); None
+    /// when that is not known (a full grab).
+    pub damage: Option<Vec<Rect>>,
 }
 
 pub struct FrameHub {
@@ -30,6 +38,8 @@ struct Inner {
     stale: bool,
     subscribers: HashMap<SessionId, Subscriber>,
     screen: (u32, u32),
+    /// `damage` of the last DAMAGE_HISTORY frames published, oldest first.
+    history: VecDeque<(u64, Option<Vec<Rect>>)>,
 }
 
 struct Subscriber {
@@ -48,6 +58,7 @@ impl FrameHub {
             stale: false,
             subscribers: HashMap::new(),
             screen: (0, 0),
+            history: VecDeque::with_capacity(DAMAGE_HISTORY),
         };
         (
             Arc::new(FrameHub {
@@ -134,11 +145,34 @@ impl FrameHub {
         self.lock().stale
     }
 
+    /// Everything that changed after frame `after` up to and including frame `upto`; None
+    /// when some of it is not known, or too long ago. (Addition to the brief's API.)
+    pub fn damage_between(&self, after: u64, upto: u64) -> Option<Vec<Rect>> {
+        let inner = self.lock();
+        let mut rects = Vec::new();
+        let mut next = after + 1;
+        for (seq, damage) in &inner.history {
+            if *seq < next {
+                continue;
+            }
+            if *seq > next || *seq > upto {
+                break;
+            }
+            rects.extend_from_slice(damage.as_ref()?);
+            next += 1;
+        }
+        (after > 0 && next == upto + 1).then_some(rects)
+    }
+
     /// Replaces `latest` and wakes every waiting subscriber, clearing its flag.
     pub fn publish(&self, frame: Frame) {
         let frame = Arc::new(frame);
         let old = {
             let mut inner = self.lock();
+            if inner.history.len() == DAMAGE_HISTORY {
+                inner.history.pop_front();
+            }
+            inner.history.push_back((frame.seq, frame.damage.clone()));
             for sub in inner.subscribers.values_mut().filter(|s| s.wants_new) {
                 sub.wants_new = false;
                 let _ = sub.wake.try_send(());
@@ -156,6 +190,7 @@ impl FrameHub {
         let old = {
             let mut inner = self.lock();
             inner.stale = false;
+            inner.history.clear();
             inner.latest.take()
         };
         drop(old);
@@ -240,7 +275,49 @@ mod tests {
             seq,
             capture_us: seq * 10,
             image: pool.get(64, 32),
+            damage: Some(vec![rect(seq)]),
         }
+    }
+
+    fn rect(seq: u64) -> Rect {
+        Rect {
+            x: seq as u32,
+            y: 0,
+            w: 1,
+            h: 1,
+        }
+    }
+
+    #[test]
+    fn damage_between_adds_up_the_frames_in_between() {
+        let (hub, _wake) = FrameHub::new();
+        let pool = FramePool::new();
+        assert_eq!(hub.damage_between(0, 1), None);
+        for seq in 1..=10 {
+            hub.publish(frame(&pool, seq));
+        }
+        assert_eq!(hub.damage_between(9, 10), Some(vec![rect(10)]));
+        assert_eq!(
+            hub.damage_between(6, 9),
+            Some(vec![rect(7), rect(8), rect(9)])
+        );
+        assert_eq!(
+            hub.damage_between(2, 10),
+            Some((3..=10).map(rect).collect())
+        );
+        assert_eq!(hub.damage_between(1, 10), None, "older than the history");
+        assert_eq!(hub.damage_between(0, 10), None, "nothing sent yet");
+        assert_eq!(hub.damage_between(10, 11), None, "not published yet");
+        // A full grab: nothing across it is known.
+        hub.publish(Frame {
+            damage: None,
+            ..frame(&pool, 11)
+        });
+        hub.publish(frame(&pool, 12));
+        assert_eq!(hub.damage_between(10, 12), None);
+        assert_eq!(hub.damage_between(11, 12), Some(vec![rect(12)]));
+        hub.invalidate();
+        assert_eq!(hub.damage_between(11, 12), None, "a resize forgets it");
     }
 
     #[test]

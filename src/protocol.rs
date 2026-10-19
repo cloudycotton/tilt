@@ -33,6 +33,8 @@ pub const MSG_RELEASE_ALL: u8 = 0x32;
 pub const FLAG_KEY: u8 = 1 << 0;
 /// VIDEO flags bit1: another fragment of the same seq follows.
 pub const FLAG_MORE: u8 = 1 << 1;
+/// VIDEO flags bit2: the access unit is a patch (src/video/patch.rs), not H.264.
+pub const FLAG_PATCH: u8 = 1 << 2;
 /// VIDEO header length, type byte included.
 pub const VIDEO_HEADER_LEN: usize = 18;
 /// The most UTF-8 one TEXT message types; the rest is dropped. Typing is slow (a character
@@ -405,6 +407,8 @@ pub struct Stats {
     pub gov_fps: u32,
     /// Mean quantizer of the frames in the window; 0 when there were none.
     pub qp: f32,
+    /// How many of the `fps` updates were patches rather than H.264 frames.
+    pub patches: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -507,7 +511,7 @@ mod tests {
         });
         assert_eq!(
             stats.to_json(),
-            r#"{"t":"stats","fps":60.0,"kbps":1500.5,"bitrate_kbps":8000,"rtt_ms":0.0,"min_rtt_ms":0.0,"queue_ms":0.0,"enc_ms":0.0,"inflight":0,"skipped":0,"viewers":1,"gov_fps":45,"qp":0.0}"#
+            r#"{"t":"stats","fps":60.0,"kbps":1500.5,"bitrate_kbps":8000,"rtt_ms":0.0,"min_rtt_ms":0.0,"queue_ms":0.0,"enc_ms":0.0,"inflight":0,"skipped":0,"viewers":1,"gov_fps":45,"qp":0.0,"patches":0}"#
         );
     }
 

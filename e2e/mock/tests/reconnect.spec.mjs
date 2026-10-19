@@ -7,8 +7,12 @@ test('reconnects after tilt.ws.close() and takes control again', async ({ page, 
   await open(page, mock, 'token=devtoken&control=1');
   const first = await controlling(page);
   await page.waitForFunction(() => window.tilt.stats.framesDecoded >= 10);
-  const before = await stats(page);
-  await page.evaluate(() => window.tilt.ws.close());
+  // Counted as the socket closes: frames decoded before that (a slow engine has several in its
+  // decoder) are the old session's.
+  const before = await page.evaluate(() => {
+    window.tilt.ws.close();
+    return { ...window.tilt.stats };
+  });
   await expect(page.locator('#overlay-msg')).toHaveText('Reconnecting…');
   // The last frame stays on screen under the overlay.
   expectColor(await sample(page, 192, 192), COLORS[0]);

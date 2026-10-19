@@ -43,6 +43,7 @@ const TEXT = 0x31;
 const RELEASE_ALL = 0x32;
 const FLAG_KEY = 1;
 const FLAG_MORE = 2;
+const FLAG_PATCH = 4;
 const VIDEO_HEADER = 18;
 const CLOSE = { auth: 4001, busy: 4002, version: 4003, not_ready: 4004, hello_timeout: 4005 };
 const IDR_INTERVAL_MS = 500;
@@ -72,6 +73,35 @@ export const DEFAULTS = {
   log: null, // JSON-lines file; stdout when null and !quiet
   quiet: false,
 };
+
+/** BT.709 limited-range Y, U, V of an sRGB colour, as tilt's capture converts it. */
+function yuv709([r, g, b]) {
+  const c = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  return [
+    c(16 + (219 * (0.2126 * r + 0.7152 * g + 0.0722 * b)) / 255),
+    c(128 + (224 * (-0.1146 * r - 0.3854 * g + 0.5 * b)) / 255),
+    c(128 + (224 * (0.5 * r - 0.4542 * g - 0.0458 * b)) / 255),
+  ];
+}
+
+/** The run-length code of patches: c < 128, c + 1 literal bytes; c >= 128, a byte c - 125 times. */
+function runLength(bytes) {
+  const out = [];
+  let i = 0;
+  while (i < bytes.length) {
+    let run = 1;
+    while (run < 130 && i + run < bytes.length && bytes[i + run] === bytes[i]) run++;
+    if (run >= 3) {
+      out.push(run + 125, bytes[i]);
+      i += run;
+    } else {
+      const n = Math.min(128, bytes.length - i);
+      out.push(n - 1, ...bytes.subarray(i, i + n));
+      i += n;
+    }
+  }
+  return Buffer.from(out);
+}
 
 const streams = new Map();
 
@@ -263,6 +293,34 @@ export async function startMockServer(options = {}) {
     }
     const frame = nextFrame(sess);
     if (frame) sendFrame(sess, frame);
+  }
+
+  /** Sends a patch (src/video/patch.rs) painting each of `rects`, [{ x, y, w, h, rgb }], a solid colour. */
+  function sendPatch(sess, rects) {
+    const parts = [Buffer.alloc(2)];
+    parts[0].writeUInt16LE(rects.length);
+    for (const r of rects) {
+      const [y, u, v] = yuv709(r.rgb);
+      const pixels = Buffer.concat([Buffer.alloc(r.w * r.h, y), Buffer.alloc((r.w * r.h) / 4, u), Buffer.alloc((r.w * r.h) / 4, v)]);
+      const rle = runLength(pixels);
+      const head = Buffer.alloc(12);
+      [r.x, r.y, r.w, r.h].forEach((n, i) => head.writeUInt16LE(n, i * 2));
+      head.writeUInt32LE(rle.length, 8);
+      parts.push(head, rle);
+    }
+    const seq = ++sess.seq;
+    const header = Buffer.alloc(VIDEO_HEADER);
+    header[0] = VIDEO;
+    header[1] = FLAG_PATCH;
+    header.writeUInt32LE(seq, 2);
+    header.writeBigUInt64LE(BigInt(Math.round(performance.now() * 1000)), 6);
+    header.writeUInt16LE(state.stream.w, 14);
+    header.writeUInt16LE(state.stream.h, 16);
+    const at = now();
+    sendRaw(sess, Buffer.concat([header, ...parts]));
+    sess.inflight.set(seq, at);
+    sent.push({ session: sess.id, seq, patch: rects.length, at });
+    return seq;
   }
 
   function sendFrame(sess, frame) {
@@ -679,6 +737,21 @@ export async function startMockServer(options = {}) {
         }, timeout);
         waiters.add(w);
       });
+    },
+    /**
+     * Sends the session a patch painting `rects` ([{ x, y, w, h, rgb }], even) solid colours; with
+     * `afterKeyframe`, right behind a keyframe, so that it arrives while that is in the decoder.
+     * Returns the patch's seq.
+     */
+    sendPatch(id, rects, { afterKeyframe = false } = {}) {
+      const sess = sessions.get(id);
+      if (afterKeyframe) {
+        sess.forceIdr = true;
+        sendFrame(sess, nextFrame(sess));
+        // Just the keyframe: the rest of its segment would paint over the patch.
+        if (!opts.loop) sess.pos = state.stream.segEnd[sess.marker % MARKER_COLORS] - 1;
+      }
+      return sendPatch(sess, rects);
     },
     /** Replaces the next P-frame sent to the session (default: every live session). */
     corruptNext(kind = 'p_garbage', id = null) {

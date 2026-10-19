@@ -48,6 +48,44 @@ test('acks every frame once, in order, within the credit window', async ({ page,
   expect(mock.violations).toEqual([]);
 });
 
+test.describe('on a still screen', () => {
+  test.use({ mockOptions: { loop: false } });
+
+  test('draws patches in order with the video, in the stream\'s colours', async ({ page, mock }) => {
+    await open(page, mock);
+    await waitDrawn(page, 1);
+    const id = await sessionOf(page);
+    // The segment plays once; then the stream is still.
+    let last = -1;
+    await expect.poll(() => {
+      const { seq, lastAck } = mock.session(id);
+      const still = seq === last && lastAck === seq;
+      last = seq;
+      return still;
+    }, { intervals: [500], timeout: 15_000 }).toBe(true);
+    expectColor(await sample(page, 192, 192), COLORS[0]);
+
+    let seq = mock.sendPatch(id, [{ x: 400, y: 400, w: 64, h: 32, rgb: COLORS[1] }, { x: 100, y: 100, w: 10, h: 10, rgb: COLORS[2] }]);
+    await expect.poll(() => mock.session(id).lastAck).toBe(seq);
+    expectColor(await sample(page, 430, 415), COLORS[1]);
+    expectColor(await sample(page, 105, 105), COLORS[2]);
+    expectColor(await sample(page, 470, 415), BACKGROUND);
+    expectColor(await sample(page, 192, 192), COLORS[0]);
+    expect((await stats(page)).patchesDrawn).toBe(1);
+
+    // A patch that comes while the keyframe before it is in the decoder is drawn after that.
+    seq = mock.sendPatch(id, [{ x: 600, y: 300, w: 32, h: 32, rgb: COLORS[3] }], { afterKeyframe: true });
+    await expect.poll(() => mock.session(id).lastAck).toBe(seq);
+    await page.waitForFunction((n) => window.tilt.stats.lastDrawnSeq === n, seq);
+    expectColor(await sample(page, 610, 310), COLORS[3]);
+    // The keyframe covered the first patch.
+    expectColor(await sample(page, 430, 415), BACKGROUND);
+    const s = await stats(page);
+    expect([s.patchesDrawn, s.decodeErrors]).toEqual([2, 0]);
+    expect(mock.violations).toEqual([]);
+  });
+});
+
 test.describe('with 4 KiB messages', () => {
   test.use({ mockOptions: { maxMsgBytes: 4096 } });
 

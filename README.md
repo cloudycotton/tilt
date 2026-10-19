@@ -29,8 +29,8 @@ No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/in
 
 ## Why tilt
 
-- **Fast.** 60 fps, about 20 ms from key press to pixel.
-- **Tiny.** One static binary. Almost no CPU while nobody watches.
+- **Fast.** 60 fps; a key press shows up in a few ms plus your network's round trip.
+- **Light.** One static binary. A few % of one CPU while you type, none while nobody watches.
 - **Goes anywhere.** One HTTPS port. Happy behind proxies and gateways. Tuned TCP (BBR) for lossy links.
 - **Always current.** Updates itself whenever it starts.
 - **Any device.** Mouse, keyboard, touch, paste, view-only links.
