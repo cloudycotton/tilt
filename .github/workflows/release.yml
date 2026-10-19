@@ -1,9 +1,8 @@
 name: Release
 
 # Every push to main whose Cargo.toml version has no tag yet becomes a release: static binaries
-# for x86_64 and arm64 and the tilt-live launcher on GitHub, and the demo desktop image
-# ghcr.io/<owner>/tilt-desktop:<version> (and :latest), which tilt-live runs where there is no
-# X display to stream (macOS, Windows). The tilt-live npm package follows
+# for x86_64 and arm64 on GitHub, which every installed tilt picks up the next time it starts
+# (src/update.rs). The tilt-live npm package follows
 # for any version npm does not have yet, so a failed or skipped publish is made up on the next
 # run (Actions > Release > Run workflow). npm uses trusted publishing configured for
 # cloudycotton/tilt and release.yml in tilt-live's npm package settings.
@@ -50,10 +49,9 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
-      packages: write
     steps:
       - uses: actions/checkout@v4
-      # The desktop image's apt-get runs under emulation for arm64; tilt itself is cross-compiled.
+      # Only to run the arm64 binary below; tilt itself is cross-compiled.
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Static binaries (cross-compiled with zig, no emulation)
@@ -62,29 +60,17 @@ jobs:
         # arm64 runs through the QEMU binfmt handler that docker/setup-qemu-action registered.
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          TILT_NO_UPDATE: 1
         run: |
           test "$(dist/tilt-x86_64-unknown-linux-musl --version)" = "tilt $VERSION"
           test "$(dist/tilt-aarch64-unknown-linux-musl --version)" = "tilt $VERSION"
           dist/tilt-x86_64-unknown-linux-musl --help
           dist/tilt-aarch64-unknown-linux-musl --help
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Demo desktop image
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tilt-desktop
-          docker buildx build --platform linux/amd64,linux/arm64 --file docker/Dockerfile \
-            --target desktop --tag "$image:$VERSION" --tag "$image:latest" --push .
       - name: Release v${{ needs.version.outputs.version }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          cp scripts/tilt-live dist/tilt-live
           (cd dist && sha256sum tilt-* > SHA256SUMS && cat SHA256SUMS)
           gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" \
             --title "tilt $VERSION" --generate-notes
@@ -108,6 +94,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
+          TILT_NO_UPDATE: 1
         run: |
           mkdir -p dist
           gh release download "v$VERSION" --dir dist
@@ -131,5 +118,5 @@ jobs:
         run: |
           smoke=$(mktemp -d)
           npm install --prefix "$smoke" --ignore-scripts "tilt-live@$VERSION"
-          TILT_VERSION="$VERSION" "$smoke/node_modules/.bin/tilt-live" --version
-          TILT_VERSION="$VERSION" "$smoke/node_modules/.bin/tilt-live" --help
+          test "$("$smoke/node_modules/.bin/tilt-live" --version)" = "tilt $VERSION"
+          "$smoke/node_modules/.bin/tilt-live" --help

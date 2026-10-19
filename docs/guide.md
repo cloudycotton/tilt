@@ -13,29 +13,22 @@ Pick what you need. Every section stands on its own.
 
 ## Start
 
+On the Linux machine or VM whose screen you want:
+
 ```sh
 npx tilt-live
 ```
 
 Open the link it prints, then click the cursor button to take control.
 
-- Run it on the Linux machine whose screen you want to see; the link works from any browser.
-- On a Mac or Windows PC there is no X display to stream, so it runs a demo Linux desktop
-  (Xvfb + xfce) in [Docker](https://docs.docker.com/desktop/) and streams that. `TILT_DOCKER=1`
-  does the same on Linux. `SCREEN=1280x720x24` sizes it; `DESKTOP=none` leaves out xfce.
-- No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh`, then `tilt-live`.
-- Another display: `tilt-live --display :1`. Every [flag](#flags) works.
-- It always runs the latest release and updates itself on start.
-
-<details>
-<summary>More about tilt-live</summary>
-
-- Downloads static binaries (x86_64, arm64) from [GitHub releases](https://github.com/cloudycotton/tilt/releases), checksum-verified.
-- In Docker it runs `ghcr.io/cloudycotton/tilt-desktop:<version>`, the same image as `docker compose up` below, with the port published at `--bind` (default 6090) and tilt's `TILT_*` variables passed in.
-- `TILT_VERSION=0.2.0` pins a release. `TILT_NO_UPDATE=1` skips the update check.
-- Without `--token`, `--token-file` or `--no-auth`, it keeps a token in `~/.config/tilt-live/token`.
-- Want the bare binary? Download `tilt-<arch>-unknown-linux-musl` from a release.
-</details>
+- No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh`, then `tilt`.
+- Another display: `tilt --display :1`. Every [flag](#flags) works.
+- **Always up to date.** Every time tilt starts it checks for a newer release and, if there is one,
+  downloads it (checksum-verified), replaces itself and runs that. Offline, or without write access
+  to its own file, it just runs. `TILT_NO_UPDATE=1` turns this off.
+- Without `--token`, `--token-file` or `--no-auth`, tilt keeps a token in `~/.config/tilt/token`
+  and prints the link with it.
+- Static binaries for x86_64 and arm64 are on [GitHub releases](https://github.com/cloudycotton/tilt/releases).
 
 ## Docker
 
@@ -106,15 +99,16 @@ Rules:
 <details>
 <summary>Latency through a gateway</summary>
 
-tilt adds about 10 ms between a change on screen and its frame leaving the server (grab 0.6 ms,
-conversion 0.8 ms, encoding 6–10 ms at 1080p). The page draws each frame as soon as it's
-decoded; the rest is your network's round trip. Key press to drawn, 1080p, through
-[e2e/proxy.mjs](../e2e/proxy.mjs):
+A small change (typing, a caret, a hover) leaves tilt about 2 ms after it reaches the screen:
+it is sent as the changed pixels, with no video encoding or decoding. A bigger change (a scroll,
+a moved window) goes through H.264, about 5 ms more each side at 1080p. The page draws each
+update as soon as it's ready; the rest is your network's round trip. Key press to drawn, 1080p,
+through [e2e/proxy.mjs](../e2e/proxy.mjs):
 
 | round trip added | Chrome p50 / p95 | WebKit p50 / p95 |
 |---|---|---|
-| 0 ms | 22 / 27 ms | 38 / 47 ms |
-| 50 ms | 70 / 80 ms | 85 / 98 ms |
+| 0 ms | 3 / 14 ms | 10 / 15 ms |
+| 50 ms | 54 / 57 ms | 61 / 64 ms |
 
 An animated screen kept 60 fps at 100 ms round trip (frame gaps p50 16.7 ms, p95 21 ms): flow
 control keeps about 1.5 bandwidth-delay products in flight, so frame rate doesn't drop as
@@ -206,8 +200,8 @@ Publish port 6090 as an `http` listener, read the token with `cat /run/tilt/toke
 
 ## Flags
 
-Every flag also has an environment variable. You need one of `--token`, `--token-file` or
-`--no-auth`.
+Every flag also has an environment variable. With none of `--token`, `--token-file` or
+`--no-auth`, tilt keeps its own token in `~/.config/tilt/token` and prints the link.
 
 | flag | env | default | what it does |
 |---|---|---|---|
@@ -250,9 +244,14 @@ startup. `tilt serve [flags]` is the same as `tilt [flags]`.
   `xfconf-query -c xfwm4 -p /general/unredirect_overlays -s false`. Without compositing, a fast
   scrolling terminal can freeze every viewer's picture for up to a second.
 - **Small VM (2 vCPUs)?** Use `--max-viewers 2`, and `--max-fps 30` if the desktop's own apps
-  need the CPU.
+  need the CPU. Firecracker or another CPU-only microVM: see [performance](performance.md).
 - **Slow link?** It adapts by itself: bitrate first, then frame rate. Frames are never dropped
   once sent, and each one is the newest screen.
+- **Over the internet:** tilt uses TCP BBR for its connections when the kernel has it (it says so
+  at startup if not), so a lost packet doesn't halve the stream's rate. Also run
+  `sysctl -w net.ipv4.tcp_slow_start_after_idle=0` on the machine (tilt warns when it is on):
+  otherwise every pause in the screen's activity restarts TCP slow start, and the first frames
+  after it take several round trips.
 - **Sizes:** screens up to 9.4 Mpixel (e.g. 4096×2304). Pasted text over 4 KB is sent in pieces.
 
 <details>

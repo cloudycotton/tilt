@@ -444,11 +444,15 @@ fn fill_params(p: &mut SEncParamExt, s: &EncoderSettings) {
     p.iTemporalLayerNum = 1;
     p.iNumRefFrame = 1;
     p.bEnableLongTermReference = false;
-    p.bEnableBackgroundDetection = true;
+    // Background detection and the deblocking filter are camera tools. On desktop recordings
+    // (src/video/bench.rs) turning both off makes frames 10-25% faster to encode and 15-25%
+    // smaller, at 1-3 dB more PSNR: screen content is sharp edges, not noise. A still screen
+    // costs less too, and the refinement tail sharpens it to the lowest quantizer either way.
+    p.bEnableBackgroundDetection = false;
     // OpenH264 2.6 turns adaptive quantisation off in validation whatever this says.
     p.bEnableAdaptiveQuant = false;
     p.bEnableDenoise = false;
-    p.iLoopFilterDisableIdc = 0;
+    p.iLoopFilterDisableIdc = 1;
     p.iMultipleThreadIdc = 1;
 
     let layer = &mut p.sSpatialLayers[0];
@@ -845,16 +849,18 @@ mod tests {
             sizes[1..].iter().all(|&size| size * 8 < idr),
             "a re-encode is not small"
         );
+        // Without background detection every macroblock keeps sharpening, for 25 re-encodes
+        // at 300 kbps; with it, static ones were skipped and the picture stalled 3 dB lower.
         assert!(
-            sizes[20..].iter().all(|&size| size * 50 < idr),
+            sizes[25..].iter().all(|&size| size * 50 < idr),
             "re-encodes did not shrink"
         );
-        assert_refines(&quality, 0.5);
+        assert_refines(&quality, 3.0);
     }
 
     /// When the worker skips or ends the refinement tail, and why that loses nothing visible:
-    /// - new content coded at the lowest quantizer gets no tail: re-encodes of it add well
-    ///   under a tenth of a dB;
+    /// - new content coded at the lowest quantizer gets no tail: re-encodes of it add a few
+    ///   tenths of a dB at most, which do not show;
     /// - a tail ends at a re-encode that came out like the one before, at the lowest
     ///   quantizer: later ones add under a hundredth of a dB (before that, on a slow link, the
     ///   quantizer can touch the floor and rise again, still sharpening).
@@ -894,7 +900,7 @@ mod tests {
                     |at: usize| frames[at..].iter().map(|f| f.2).fold(f64::MIN, f64::max);
                 let at_floor = |f: &(usize, u8, f64)| f.1 <= s.min_qp;
                 if at_floor(&frames[0]) {
-                    assert!(best_from(0) - frames[0].2 < 0.05, "new content; {what}");
+                    assert!(best_from(0) - frames[0].2 < 0.3, "new content; {what}");
                 }
                 let end = (1..frames.len()).find(|&i| {
                     at_floor(&frames[i])
@@ -905,7 +911,7 @@ mod tests {
                 }
                 if bitrate == 8_000_000 {
                     let stop = if at_floor(&frames[0]) { Some(0) } else { end };
-                    assert!(stop.is_some_and(|at| at <= 3), "no early stop; {what}");
+                    assert!(stop.is_some_and(|at| at <= 4), "no early stop; {what}");
                 } else {
                     assert!(!at_floor(&frames[0]), "{what}");
                     assert!(
@@ -948,7 +954,7 @@ mod tests {
             sizes[20..].iter().all(|&size| size * 3 < moving_mean),
             "the tail did not settle"
         );
-        assert_refines(&quality, 1.0);
+        assert_refines(&quality, 2.5);
     }
 
     /// Re-encoding a still picture never makes it worse, and makes it `gain_db` better overall.

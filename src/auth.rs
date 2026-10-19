@@ -1,8 +1,12 @@
 //! Access tokens and roles.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, UdpSocket};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+use anyhow::Context;
 
 use serde::Serialize;
 
@@ -137,6 +141,61 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
+/// The control token tilt keeps for itself when given no --token, --token-file or --no-auth,
+/// in $XDG_CONFIG_HOME/tilt/token (else ~/.config/tilt/token), made on first use: the file and
+/// its token.
+pub fn kept_token() -> anyhow::Result<(PathBuf, String)> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .context("no HOME to keep a token in: pass --token, --token-file or --no-auth")?
+        .join("tilt");
+    let file = dir.join("token");
+    if let Some(token) = read_token_file(&file) {
+        return Ok((file, token));
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no randomness for a token: {e}"))?;
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&file)
+        .and_then(|mut f| writeln!(f, "{token}"))
+        .with_context(|| format!("writing {}", file.display()))?;
+    Ok((file, token))
+}
+
+/// Links that open the viewer with `token`: for a server on every interface, localhost and this
+/// machine's address.
+pub fn links(bind: SocketAddr, token: &str) -> Vec<String> {
+    let port = bind.port();
+    let hosts = if bind.ip().is_unspecified() {
+        // Connecting a UDP socket sends nothing; it only picks the outgoing address.
+        let own = UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| s.connect("192.0.2.1:9").and(s.local_addr()))
+            .ok()
+            .map(|a| a.ip().to_string());
+        std::iter::once("localhost".to_owned()).chain(own).collect()
+    } else {
+        vec![bind.ip().to_string()]
+    };
+    hosts
+        .into_iter()
+        .map(|h| {
+            let h = if h.contains(':') { format!("[{h}]") } else { h };
+            format!("http://{h}:{port}/#token={token}")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +207,30 @@ mod tests {
             file,
             no_auth: false,
         }
+    }
+
+    #[test]
+    fn links_name_the_bound_address() {
+        let bound: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        assert_eq!(links(bound, "t"), ["http://127.0.0.1:7000/#token=t"]);
+        let everywhere = links("0.0.0.0:6090".parse().unwrap(), "t");
+        assert_eq!(everywhere[0], "http://localhost:6090/#token=t");
+    }
+
+    #[test]
+    fn the_kept_token_is_made_once() {
+        let dir = std::env::temp_dir().join(format!("tilt-kept-{}", std::process::id()));
+        // No other test reads XDG_CONFIG_HOME.
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let (file, token) = kept_token().unwrap();
+        assert_eq!(file, dir.join("tilt/token"));
+        assert_eq!(token.len(), 32);
+        assert_eq!(kept_token().unwrap().1, token, "the same token next time");
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&file).unwrap().permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

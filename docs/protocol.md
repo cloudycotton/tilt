@@ -79,11 +79,13 @@ VIDEO fields:
 - **flags:**
   - bit0 KEY: an IDR, with SPS+PPS present in the payload.
   - bit1 MORE: another fragment of the same seq follows.
+  - bit2 PATCH: the payload is a patch (below), not H.264.
 - **seq:** a per-session counter, starting at 1 and incremented once per access unit, not per
   fragment. It is a u32 and wraps (skipping 0).
 - **capture_us:** the server's monotonic µs at capture. It is informational.
 - **width, height:** the coded size, which is the even-cropped screen size.
-- **payload:** Annex B (00 00 00 01 start codes), one access unit per seq.
+- **payload:** Annex B (00 00 00 01 start codes), one access unit per seq; or, with PATCH, a
+  patch.
 - **Codec:** H.264 High profile with CABAC (`--profile high`, the default) or Constrained
   Baseline (`--profile baseline`). The SPS signals a level that covers the screen size at
   `--max-fps` and `--max-bitrate-kbps`, so it holds however the bitrate adapts: with the
@@ -98,6 +100,21 @@ VIDEO fields:
   message (cursor, PONG, JSON) is sent between them. Reassemble by concatenating payloads until
   a fragment without MORE arrives.
 
+Patches: a small change (a typed character, a blinking caret, a hover) is sent as the changed
+pixels instead of an H.264 frame, which would cost the server a full-screen encode. A patch is
+`u16 count`, then per rectangle `u16 x, u16 y, u16 w, u16 h, u32 len` and `len` bytes: the
+rectangle's I420 pixels (Y rows, then U rows, then V rows; x, y, w and h are even),
+run-length coded. In the code, a byte c < 128 is followed by c + 1 literal bytes, and c ≥ 128
+by one byte that repeats c − 125 times. Runs can cross rows and planes. The pixels use the
+stream's colours (BT.709, limited range), so draw them as an I420 VideoFrame with that colour
+space. The decoder never sees a patch, and the next H.264 frame codes everything since the one
+before, patched areas included. A patch never comes before the session's first KEY frame.
+- **Order:** draw updates in seq order. A patch goes over the frame before it, so a patch that
+  arrives while an earlier frame is still in the decoder waits for that frame. Once a frame is
+  drawn, patches with a lower seq are covered by it and can be skipped.
+- **ACK:** a patch is acked once it is drawn (or skipped), in seq order like frames.
+  decode_ms is the time from receipt to drawing.
+
 Cursor messages: CURSOR_SHAPE is sent when the cursor image changes (new serial), CURSOR_POS
 when the pointer moves. Captured frames never contain the cursor; draw it from these.
 The shape is at most 128×128.
@@ -106,7 +123,7 @@ The shape is at most 128×128.
 
 | type | name | layout after the type byte |
 |---|---|---|
-| 0x10 | ACK | `u32 seq, u16 decode_ms` — sent once per VIDEO seq when the decoder outputs it (or discards it); decode_ms = ms from last-fragment receipt to output, saturating. Acks are cumulative: ACK(n) acks every seq ≤ n. |
+| 0x10 | ACK | `u32 seq, u16 decode_ms` — sent once per VIDEO seq when the decoder outputs it (or discards it), or for a patch when it is drawn; decode_ms = ms from last-fragment receipt to output, saturating. Acks are cumulative: ACK(n) acks every seq ≤ n. |
 | 0x11 | PING | `u32 t` (client ms clock, wraps) — every 1 s while connected; doubles as the heartbeat |
 | 0x20 | MOVE | `u16 x, u16 y` — normalized: 0 = left/top edge pixel, 65535 = right/bottom edge pixel |
 | 0x21 | BUTTON | `u8 button, u8 down, u16 x, u16 y` — X button numbers 1 left, 2 middle, 3 right, 8 back, 9 forward |
@@ -155,15 +172,15 @@ Server to client:
   30 s) from another viewer: it may take control back at once from the former, never from the
   latter. A server run never reuses a session id, and each run starts numbering at a random point,
   so a restarted server is unlikely (one chance in a million) to give a new session the id of a
-  lost one. Older servers send no `holder`.
+  lost one.
 - `{"t":"screen","w":W,"h":H}`: sent when the screen size changed. A KEY frame at the new size
   follows. VIDEO width/height are the even-cropped values of W and H.
-- `{"t":"stats","fps":f,"kbps":f,"bitrate_kbps":n,"rtt_ms":f,"min_rtt_ms":f,"queue_ms":f,"enc_ms":f,"inflight":n,"skipped":n,"viewers":n,"gov_fps":n,"qp":f}`:
+- `{"t":"stats","fps":f,"kbps":f,"bitrate_kbps":n,"rtt_ms":f,"min_rtt_ms":f,"queue_ms":f,"enc_ms":f,"inflight":n,"skipped":n,"viewers":n,"gov_fps":n,"qp":f,"patches":n}`:
   sent every 1 s while video is on. `fps`, `kbps` and `enc_ms` cover the last second; `skipped`
   counts captures this session never encoded, over the whole session. `gov_fps` is the frame
   rate cap in force (`--max-fps`); `qp` is the mean quantizer of the last second's frames, 0
-  when there were none. Older servers
-  send neither.
+  when there were none. `patches` is how many of the last second's `fps` were patches; `enc_ms`
+  and `qp` cover the H.264 frames only.
 - `{"t":"error","code":"auth"|"busy"|"version"|"not_ready"|"forbidden"|"hello_timeout"|"unsupported_size","msg":"…"}`.
   `unsupported_size` means the encoder cannot take the screen's size (smaller than 16×16, or
   more than 36864 macroblocks, about 4096×2304). The session stays open without video; when the

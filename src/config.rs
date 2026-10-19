@@ -153,14 +153,6 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), (ErrorKind, String)> {
-        if !self.no_auth && self.token.is_none() && self.token_file.is_none() {
-            return Err((
-                ErrorKind::MissingRequiredArgument,
-                "no control token configured: pass --token (TILT_TOKEN) or --token-file \
-                 (TILT_TOKEN_FILE), or --no-auth for local testing"
-                    .into(),
-            ));
-        }
         for (flag, token) in [("--token", &self.token), ("--view-token", &self.view_token)] {
             if token.as_deref().is_some_and(|t| t.trim().is_empty()) {
                 return Err((ErrorKind::InvalidValue, format!("{flag} must not be empty")));
@@ -196,6 +188,11 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// No --token, --token-file or --no-auth: tilt keeps its own token (auth::kept_token).
+    pub fn uses_kept_token(&self) -> bool {
+        !self.no_auth && self.token.is_none() && self.token_file.is_none()
     }
 
     /// Minimum spacing between frames, 1 / max_fps.
@@ -404,19 +401,20 @@ mod tests {
     }
 
     #[test]
-    fn requires_some_form_of_auth() {
-        // The environment may legitimately provide credentials; only assert when it does not.
+    fn without_auth_flags_tilt_keeps_its_own_token() {
+        // The environment may provide credentials; only assert when it does not.
         if ["TILT_TOKEN", "TILT_TOKEN_FILE", "TILT_NO_AUTH"]
             .iter()
             .any(|v| std::env::var_os(v).is_some())
         {
             return;
         }
-        let err = parse(&[]).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
-        assert!(parse(&["--view-token", "v"]).is_err());
-        assert!(parse(&["--no-auth"]).is_ok());
-        assert!(parse(&["--token-file", "/nonexistent/token"]).is_ok());
+        assert!(parse(&[]).unwrap().uses_kept_token());
+        assert!(parse(&["--view-token", "v"]).unwrap().uses_kept_token());
+        assert!(!parse(&["--no-auth"]).unwrap().uses_kept_token());
+        assert!(!parse(&["--token-file", "/nonexistent/token"])
+            .unwrap()
+            .uses_kept_token());
     }
 
     #[test]

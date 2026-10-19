@@ -50,6 +50,8 @@ COPY tools tools
 
 # Declared this late so that the toolchain layers above are shared by both targets.
 ARG TARGETARCH
+# Release binaries update themselves whenever they start (src/update.rs).
+ENV TILT_SELF_UPDATE=1
 
 # The registry cache is shared by both architectures' builds, so they take turns on it; cargo's
 # own lock lives outside the mount and cannot keep two containers apart. zig's cache keeps the
@@ -79,7 +81,8 @@ FROM scratch AS artifact
 COPY --from=build /out/tilt /tilt
 
 FROM ubuntu:22.04 AS desktop
-ENV DEBIAN_FRONTEND=noninteractive
+# The image is built for one version: tilt does not update itself in it.
+ENV DEBIAN_FRONTEND=noninteractive TILT_NO_UPDATE=1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       xvfb xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils xdotool xterm \

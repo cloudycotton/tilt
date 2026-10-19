@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "tilt"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Stream a Linux X11 desktop to a browser over WebSocket + WebCodecs H.264, with remote control"
 license = "MIT"
@@ -15,8 +15,8 @@ publish = false
 anyhow = "1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 socket2 = { version = "0.6", features = ["all"] }
 crossbeam-channel = "0.5"
 x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "xtest", "randr", "xinput"] }
@@ -31,6 +31,8 @@ mimalloc = { version = "0.1", default-features = false }
 libc = "0.2"
 getrandom = "0.3"
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+ring = { version = "0.17", default-features = false }
 
 [profile.release]
 opt-level = 3

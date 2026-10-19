@@ -314,6 +314,8 @@ pub async fn serve(
         .await
         .map_err(|e| anyhow::anyhow!("cannot listen on {bind}: {e}"))?;
     info!("listening on http://{}", listener.local_addr()?);
+    #[cfg(target_os = "linux")]
+    check_tcp_sysctls();
     let listener = listener.tap_io(move |tcp| tune_socket(tcp, lowat));
 
     let closing = Arc::clone(&state);
@@ -366,6 +368,36 @@ fn tune_socket(tcp: &mut tokio::net::TcpStream, lowat: u32) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = lowat;
+    // BBR paces to the measured bandwidth and does not halve its rate on every lost packet, as
+    // the default (CUBIC) does: on Wi-Fi and long paths that is the difference between a
+    // stream that keeps flowing and one that stalls after each loss.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = socket2::SockRef::from(&*tcp).set_tcp_congestion(b"bbr") {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            warn!(
+                "TCP BBR unavailable ({e}); using the kernel's default congestion control. \
+                 `modprobe tcp_bbr`, or a kernel with CONFIG_TCP_CONG_BBR, makes lossy links \
+                 much smoother"
+            )
+        });
+    }
+}
+
+/// Startup notes on kernel TCP settings that slow the stream down.
+#[cfg(target_os = "linux")]
+fn check_tcp_sysctls() {
+    // Desktop traffic is bursty: still, then a scroll. With this on, every pause longer than
+    // the retransmission timeout shrinks the congestion window back to its initial size, and the
+    // first frames after it trickle out over several round trips.
+    let path = "/proc/sys/net/ipv4/tcp_slow_start_after_idle";
+    if std::fs::read_to_string(path).is_ok_and(|v| v.trim() == "1") {
+        warn!(
+            "the kernel restarts TCP slow start after every pause, which delays the first \
+             frames after one by several round trips; run `sysctl -w \
+             net.ipv4.tcp_slow_start_after_idle=0` (persist it in /etc/sysctl.d/) on this machine"
+        );
+    }
 }
 
 /// An AppState for tests: `args` after `tilt`, no X server, input going nowhere.
@@ -602,6 +634,14 @@ mod tests {
         assert_eq!(sock.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
         assert_eq!(sock.tcp_keepalive_retries().unwrap(), KEEPALIVE_PROBES);
         assert!(tcp.nodelay().unwrap());
+        // BBR wherever the kernel has it.
+        let available =
+            std::fs::read_to_string("/proc/sys/net/ipv4/tcp_available_congestion_control")
+                .unwrap_or_default();
+        if available.split_whitespace().any(|c| c == "bbr") {
+            let name = sock.tcp_congestion().unwrap();
+            assert_eq!(name.split(|&b| b == 0).next(), Some(&b"bbr"[..]));
+        }
     }
 
     #[test]

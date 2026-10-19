@@ -1,7 +1,7 @@
 {
   "name": "tilt-live",
-  "version": "0.1.1",
-  "description": "See and control any Linux desktop, right in your browser (runs the latest tilt release; the demo desktop in Docker on macOS and Windows)",
+  "version": "0.2.0",
+  "description": "See and control any Linux desktop, right in your browser (downloads tilt, which then keeps itself up to date)",
   "keywords": [
     "vnc",
     "remote-desktop",
@@ -26,9 +26,7 @@
     "bin"
   ],
   "os": [
-    "linux",
-    "darwin",
-    "win32"
+    "linux"
   ],
   "cpu": [
     "x64",

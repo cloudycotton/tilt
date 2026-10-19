@@ -13,10 +13,11 @@ use crate::clock;
 use crate::config::Config;
 use crate::flow::{self, FlowControl};
 use crate::hub::Frame;
-use crate::protocol::{self, ErrorCode, ServerText, Stats, VideoHeader, FLAG_KEY};
+use crate::protocol::{self, ErrorCode, ServerText, Stats, VideoHeader, FLAG_KEY, FLAG_PATCH};
 use crate::server::AppState;
 use crate::session::{OutMsg, SessionId};
 use crate::video::encoder::{H264Encoder, UnsupportedSize};
+use crate::video::patch;
 
 /// What the session's reader, writer and the hub tell the worker. However fast a client sends,
 /// it cannot grow: ACKs are cumulative, so the newest stands for all before it, and the rest
@@ -140,6 +141,10 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// After the encoder fails (a frame, or creating one), the next attempt waits a frame interval,
 /// doubling with every further failure in a row up to this.
 const ENCODER_RETRY_MAX: Duration = Duration::from_secs(2);
+/// A change is sent as a patch when it covers at most 1/PATCH_AREA_DIVISOR of the screen and
+/// its patch is no bigger than a frame's share of the bitrate, or this, whichever is more.
+const PATCH_AREA_DIVISOR: u64 = 8;
+const PATCH_MIN_BYTES: usize = 8 * 1024;
 
 /// Starts the encoder thread for `sid`. It writes VIDEO, `screen`, `stats` and `error`
 /// messages to `out` (bounded, with blocking_send) and exits on `inbox.shutdown()` or once
@@ -194,8 +199,13 @@ struct Schedule {
     /// When a new capture (not a tail frame) was last encoded: the tail starts TAIL_SETTLE
     /// after it.
     last_new: Option<Instant>,
-    /// When the next new capture may be encoded: the frame rate cap, kept on a grid
-    /// (clock::next_slot) so that late timer wake-ups do not lower the frame rate.
+    /// The frame rate cap for new captures: the earliest the next one may be encoded. Each
+    /// capture encoded moves it on by a frame interval, but never to before that encode (a
+    /// rate limiter, GCRA with a burst of two). Over any stretch that is at most one capture
+    /// per interval, plus one, yet a capture is encoded as soon as it arrives whatever its
+    /// phase. A grid of the encoder's own, as before, made every capture wait for the
+    /// encoder's phase, which drifted from capture's (an input pull-forward moved it): up to
+    /// a frame interval on every frame, 9.5 ms on average in a 60 Hz animation.
     new_slot: Option<Instant>,
 }
 
@@ -267,10 +277,21 @@ impl Schedule {
         if seq != self.last_capture_seq {
             self.tail_left = self.tail_frames;
             self.last_new = Some(sent);
-            self.new_slot = Some(clock::next_slot(self.new_slot, now, self.fi));
+            self.new_slot = Some(self.new_slot.map_or(now, |s| (s + self.fi).max(now)));
         } else {
             self.tail_left = self.tail_left.saturating_sub(1);
         }
+        self.last_capture_seq = seq;
+        self.last_encode = Some(now);
+    }
+
+    /// A patch for new capture `seq`, decided on at `now`, went out at `sent`. It counts
+    /// against the frame rate cap like an encoded frame, but starts no tail: the encoder saw
+    /// nothing to refine. A tail still running from an earlier frame waits for the screen to
+    /// settle again.
+    fn patched(&mut self, seq: u64, now: Instant, sent: Instant) {
+        self.last_new = Some(sent);
+        self.new_slot = Some(self.new_slot.map_or(now, |s| (s + self.fi).max(now)));
         self.last_capture_seq = seq;
         self.last_encode = Some(now);
     }
@@ -386,6 +407,8 @@ struct Worker {
     bytes: u64,
     encode_us: u64,
     qp_sum: u64,
+    /// Of `frames`, the patches.
+    patches: u32,
     skipped: u64,
 }
 
@@ -431,6 +454,7 @@ impl Worker {
             bytes: 0,
             encode_us: 0,
             qp_sum: 0,
+            patches: 0,
             skipped: 0,
         }
     }
@@ -583,6 +607,9 @@ impl Worker {
             self.next_tick = Some(at);
             return Ok(());
         }
+        if !idr && frame.seq != self.sched.last_capture_seq && self.patch(frame, now)? {
+            return Ok(());
+        }
         if !self.ensure_encoder(w, h, frame.seq, now)? {
             return Ok(());
         }
@@ -598,25 +625,8 @@ impl Worker {
                         failures, "encoder working again after {lasted:.1?} of failures"
                     );
                 }
-                if self.sched.last_capture_seq != 0 && frame.seq > self.sched.last_capture_seq {
-                    // Captures that went to other viewers while this one waited.
-                    self.skipped += frame.seq - self.sched.last_capture_seq - 1;
-                }
-                self.seq = self.seq.wrapping_add(1).max(1);
-                // Before the first fragment goes out, so its ACK is never ahead of it.
-                self.inbox.sent_seq.store(self.seq, Ordering::Release);
-                let header = VideoHeader {
-                    flags: if f.keyframe { FLAG_KEY } else { 0 },
-                    seq: self.seq,
-                    capture_us: frame.capture_us,
-                    width: w as u16,
-                    height: h as u16,
-                };
-                for msg in protocol::video_messages(header, &f.data, self.cfg.max_msg_bytes) {
-                    self.send(OutMsg::Binary(msg))?;
-                }
-                let sent = Instant::now();
-                self.flow.on_sent(self.seq, f.data.len(), sent);
+                let flags = if f.keyframe { FLAG_KEY } else { 0 };
+                let sent = self.send_unit(frame, flags, &f.data)?;
                 let tail = frame.seq == self.sched.last_capture_seq;
                 self.sched.encoded(frame.seq, f.keyframe, now, sent);
                 // At the lowest quantizer, new content needs no refinement, and a tail is done
@@ -675,6 +685,71 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// Sends what changed since the last access unit as a patch when that is small; Ok(false)
+    /// when it is not (or not known), and a video frame should go instead. Only on top of a
+    /// stream the client has: an encoder of this size exists.
+    fn patch(&mut self, frame: &Frame, now: Instant) -> Result<bool, Closed> {
+        let (w, h) = (frame.image.width, frame.image.height);
+        let same_size = |e: &H264Encoder| (e.settings().width, e.settings().height) == (w, h);
+        if !self.enc.as_ref().is_some_and(same_size) {
+            return Ok(false);
+        }
+        let last = self.sched.last_capture_seq;
+        let Some(damage) = self.state.hub.damage_between(last, frame.seq) else {
+            return Ok(false);
+        };
+        let started = Instant::now();
+        let rects = patch::even_rects(&damage, w, h);
+        let budget = self.bitrate as usize / 8 / self.cfg.max_fps.max(1) as usize;
+        let max_area = u64::from(w) * u64::from(h) / PATCH_AREA_DIVISOR;
+        let Some(data) = patch::encode(&frame.image, &rects, max_area, budget.max(PATCH_MIN_BYTES))
+        else {
+            return Ok(false);
+        };
+        let made_us = started.elapsed().as_micros();
+        let sent = self.send_unit(frame, FLAG_PATCH, &data)?;
+        self.sched.patched(frame.seq, now, sent);
+        self.next_tick = Some(sent);
+        self.frames += 1;
+        self.patches += 1;
+        self.bytes += data.len() as u64;
+        debug!(
+            session = self.sid,
+            seq = self.seq,
+            capture = frame.seq,
+            bytes = data.len(),
+            rects = rects.len(),
+            made_us,
+            age_us = crate::clock::now_us().saturating_sub(frame.capture_us),
+            "patch"
+        );
+        Ok(true)
+    }
+
+    /// Queues one access unit for capture `frame` (in fragments) and returns when it went out.
+    fn send_unit(&mut self, frame: &Frame, flags: u8, data: &[u8]) -> Result<Instant, Closed> {
+        if self.sched.last_capture_seq != 0 && frame.seq > self.sched.last_capture_seq {
+            // Captures that went to other viewers while this one waited.
+            self.skipped += frame.seq - self.sched.last_capture_seq - 1;
+        }
+        self.seq = self.seq.wrapping_add(1).max(1);
+        // Before the first fragment goes out, so its ACK is never ahead of it.
+        self.inbox.sent_seq.store(self.seq, Ordering::Release);
+        let header = VideoHeader {
+            flags,
+            seq: self.seq,
+            capture_us: frame.capture_us,
+            width: frame.image.width as u16,
+            height: frame.image.height as u16,
+        };
+        for msg in protocol::video_messages(header, data, self.cfg.max_msg_bytes) {
+            self.send(OutMsg::Binary(msg))?;
+        }
+        let sent = Instant::now();
+        self.flow.on_sent(self.seq, data.len(), sent);
+        Ok(sent)
     }
 
     /// Makes sure an encoder for `w`x`h` (the size of capture `seq`) exists, announcing a size
@@ -776,6 +851,7 @@ impl Worker {
             .sessions
             .update_stats(self.sid, fps, kbps, round(flow.rtt_ms));
         if self.video_on {
+            let encoded = self.frames - self.patches;
             let stats = Stats {
                 fps,
                 kbps,
@@ -783,16 +859,17 @@ impl Worker {
                 rtt_ms: round(flow.rtt_ms),
                 min_rtt_ms: round(flow.min_rtt_ms),
                 queue_ms: round(flow.queue_ms),
-                enc_ms: if self.frames > 0 {
-                    round(self.encode_us as f32 / self.frames as f32 / 1000.0)
+                enc_ms: if encoded > 0 {
+                    round(self.encode_us as f32 / encoded as f32 / 1000.0)
                 } else {
                     0.0
                 },
-                qp: if self.frames > 0 {
-                    round(self.qp_sum as f32 / self.frames as f32)
+                qp: if encoded > 0 {
+                    round(self.qp_sum as f32 / encoded as f32)
                 } else {
                     0.0
                 },
+                patches: self.patches,
                 inflight: flow.inflight_frames,
                 skipped: self.skipped,
                 viewers: self.state.sessions.count() as u32,
@@ -805,6 +882,7 @@ impl Worker {
         self.bytes = 0;
         self.encode_us = 0;
         self.qp_sum = 0;
+        self.patches = 0;
         Ok(())
     }
 
@@ -893,28 +971,70 @@ mod tests {
             Step::Encode { idr: false }
         );
         s.encoded(2, false, tail + 3 * MS, tail + 3 * MS);
-        // After a pause the next frame may follow half an interval later (clock::next_slot),
-        // then the grid resumes.
+        // After a pause the frame rate cap allows a second new frame right behind it (a burst
+        // of two), then one per frame interval.
         assert_eq!(
             s.decide(3, true, tail + 5 * MS),
-            Step::Wait(tail + 3 * MS + s.fi / 2)
+            Step::Encode { idr: false }
+        );
+        s.encoded(3, false, tail + 5 * MS, tail + 5 * MS);
+        assert_eq!(
+            s.decide(4, true, tail + 6 * MS),
+            Step::Wait(tail + 3 * MS + s.fi)
         );
     }
 
     #[test]
-    fn the_frame_rate_cap_keeps_to_a_grid() {
+    fn captures_go_out_as_they_arrive_whatever_their_phase() {
         let (mut s, t0) = sched();
         s.tail_frames = 0;
         s.encoded(1, true, t0, t0);
-        // The worker woke 3 ms after the slot: the frame goes out then...
-        let late = t0 + s.fi + 3 * MS;
-        assert_eq!(s.decide(2, true, late), Step::Encode { idr: false });
-        s.encoded(2, false, late, late);
-        // ...and the next slot is still t0 + 2 fi, not `late` + fi.
-        assert_eq!(s.decide(3, true, late + 5 * MS), Step::Wait(t0 + 2 * s.fi));
+        // A 60 Hz animation whose captures land 10 ms before the encoder's slots (an input
+        // pull-forward shifted capture's grid): each is encoded as it arrives. A grid of the
+        // encoder's own held every one of them back by 10 ms.
+        for k in 1..=5u32 {
+            let at = t0 + s.fi * k - 10 * MS;
+            let seq = u64::from(k) + 1;
+            assert_eq!(s.decide(seq, true, at), Step::Encode { idr: false }, "{k}");
+            s.encoded(seq, false, at, at);
+        }
+    }
+
+    #[test]
+    fn the_frame_rate_cap_holds_on_average() {
+        let (mut s, t0) = sched();
+        s.tail_frames = 0;
+        s.encoded(1, true, t0, t0);
+        // New captures every half interval (input pull-forward on every grab), for 60
+        // intervals: one per interval is encoded, like before.
+        let (mut seq, mut sent) = (1, 0);
+        for k in 1..=120u32 {
+            seq += 1;
+            let at = t0 + s.fi * k / 2;
+            match s.decide(seq, true, at) {
+                Step::Encode { idr: false } => {
+                    s.encoded(seq, false, at, at);
+                    sent += 1;
+                }
+                Step::Wait(due) => assert!(due > at),
+                other => panic!("{other:?} at capture {k}"),
+            }
+        }
+        assert!((60..=62).contains(&sent), "{sent} encoded in 60 intervals");
+        // After a pause, at most two go out back to back.
+        let late = t0 + 70 * s.fi;
+        for (i, at) in [late, late + MS].into_iter().enumerate() {
+            assert_eq!(
+                s.decide(seq + 1, true, at),
+                Step::Encode { idr: false },
+                "{i}"
+            );
+            seq += 1;
+            s.encoded(seq, false, at, at);
+        }
         assert_eq!(
-            s.decide(3, true, t0 + 2 * s.fi),
-            Step::Encode { idr: false }
+            s.decide(seq + 1, true, late + 2 * MS),
+            Step::Wait(late + s.fi)
         );
     }
 
@@ -939,11 +1059,14 @@ mod tests {
     fn frame_rate_cap_and_credit() {
         let (mut s, t0) = sched();
         s.encoded(1, true, t0, t0);
-        // A new frame 5 ms later waits for the frame interval; without credit it is blocked.
-        assert_eq!(s.decide(2, true, t0 + 5 * MS), Step::Wait(t0 + s.fi));
-        assert_eq!(s.decide(2, false, t0 + 5 * MS), Step::Blocked);
-        assert_eq!(s.decide(2, false, t0 + s.fi), Step::Blocked);
-        assert_eq!(s.decide(2, true, t0 + s.fi), Step::Encode { idr: false });
+        s.encoded(2, false, t0 + MS, t0 + MS);
+        // A third new frame right behind the first two waits for the frame interval; without
+        // credit it is blocked.
+        let due = t0 + s.fi;
+        assert_eq!(s.decide(3, true, t0 + 2 * MS), Step::Wait(due));
+        assert_eq!(s.decide(3, false, t0 + 2 * MS), Step::Blocked);
+        assert_eq!(s.decide(3, false, due), Step::Blocked);
+        assert_eq!(s.decide(3, true, due), Step::Encode { idr: false });
         // Nothing due means idle even without credit.
         let (mut s, t0) = sched();
         s.tail_frames = 0;
@@ -1086,6 +1209,16 @@ mod tests {
             seq,
             capture_us: seq * 1000,
             image: pool.get(width, height),
+            damage: None,
+        });
+    }
+
+    fn publish_damage(w: &Worker, pool: &FramePool, seq: u64, damage: Vec<patch::Rect>) {
+        w.state.hub.publish(Frame {
+            seq,
+            capture_us: seq * 1000,
+            image: pool.get(SIZE.0, SIZE.1),
+            damage: Some(damage),
         });
     }
 
@@ -1116,6 +1249,98 @@ mod tests {
     }
 
     const SIZE: (u32, u32) = (64, 48);
+
+    #[test]
+    fn small_changes_go_as_patches_and_big_ones_as_frames() {
+        let (mut w, mut rx, pool) = worker(&["--tail-frames", "0"]);
+        let small = || {
+            vec![patch::Rect {
+                x: 3,
+                y: 5,
+                w: 4,
+                h: 4,
+            }]
+        };
+        let kind = |v: &[VideoHeader]| {
+            assert_eq!(v.len(), 1, "one access unit");
+            match v[0].flags {
+                FLAG_KEY => "key",
+                FLAG_PATCH => "patch",
+                0 => "frame",
+                f => panic!("flags {f}"),
+            }
+        };
+        let mut step = |w: &mut Worker| {
+            let v = step_until_sent(w, &mut rx);
+            assert!(w.inbox.ack(w.seq, 1, Instant::now()));
+            let pending = w.inbox.take();
+            w.apply(pending);
+            v
+        };
+        // The stream starts with a keyframe, however small the change.
+        publish_damage(&w, &pool, 1, small());
+        assert_eq!(kind(&step(&mut w)), "key");
+        publish_damage(&w, &pool, 2, small());
+        let v = step(&mut w);
+        assert_eq!((kind(&v), v[0].capture_us), ("patch", 2000));
+        // A third of the screen is too much for a patch.
+        publish_damage(
+            &w,
+            &pool,
+            3,
+            vec![patch::Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 16,
+            }],
+        );
+        assert_eq!(kind(&step(&mut w)), "frame");
+        // Changes the worker did not see one by one add up.
+        publish_damage(&w, &pool, 4, small());
+        publish_damage(
+            &w,
+            &pool,
+            5,
+            vec![patch::Rect {
+                x: 40,
+                y: 40,
+                w: 2,
+                h: 2,
+            }],
+        );
+        let v = step(&mut w);
+        assert_eq!((kind(&v), v[0].capture_us), ("patch", 5000));
+        // Unknown damage (a full grab) in between: a frame.
+        publish(&w, &pool, 6, SIZE);
+        publish_damage(&w, &pool, 7, small());
+        assert_eq!(kind(&step(&mut w)), "frame");
+        // A keyframe the client asked for is never a patch.
+        w.sched.force_idr = true;
+        w.sched.last_idr = None;
+        publish_damage(&w, &pool, 8, small());
+        assert_eq!(kind(&step(&mut w)), "key");
+        assert_eq!(w.sched.tail_left, 0);
+    }
+
+    #[test]
+    fn a_patch_starts_no_refinement_tail() {
+        let mut s = Schedule::new(Duration::from_millis(16), 3);
+        let t0 = Instant::now();
+        s.encoded(1, true, t0, t0);
+        s.converged();
+        s.patched(2, t0 + 20 * MS, t0 + 20 * MS);
+        assert_eq!(s.tail_left, 0);
+        assert_eq!(s.decide(2, true, t0 + TAIL_SETTLE * 2), Step::Idle(None));
+        // One still running waits for the screen to settle after the patch.
+        s.encoded(3, false, t0 + 40 * MS, t0 + 40 * MS);
+        s.patched(4, t0 + 60 * MS, t0 + 60 * MS);
+        assert_eq!(s.tail_left, 3);
+        assert_eq!(
+            s.decide(4, true, t0 + 100 * MS),
+            Step::Idle(Some(t0 + 60 * MS + TAIL_SETTLE))
+        );
+    }
 
     #[test]
     fn a_keyframe_waits_briefly_for_a_fresh_grab_when_latest_is_stale() {

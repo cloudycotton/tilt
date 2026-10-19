@@ -1,6 +1,7 @@
 //! The capture thread `tilt-capture` and its X event reader `tilt-xevents`: demand-driven,
 //! damage-woken, frame-paced grabs published to the FrameHub (brief section 5.2).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -47,6 +48,12 @@ const REBUILD_AFTER: u32 = 5;
 /// segment setups.
 const BROKEN_RETRY: Duration = Duration::from_secs(1);
 const MAX_REBUILD_WAIT: Duration = Duration::from_secs(30);
+/// How many published frames `changed_rows` remembers.
+const ROWS_HISTORY: usize = 8;
+
+/// Per published frame, oldest first: its seq and the row bands `[top, bottom)` in which it
+/// differs from the frame before, None when all rows may.
+type RowsHistory = VecDeque<(u64, Option<Vec<(u32, u32)>>)>;
 
 /// Opens the capture connection to `cfg.display`, sets up damage and the grabber, records the
 /// screen size in `hub`, then starts both threads. `wake` is the receiver from FrameHub::new.
@@ -119,6 +126,7 @@ pub fn spawn_capture(
         damage_pending: true,
         resize_pending: false,
         full_next: true,
+        changed_rows: VecDeque::with_capacity(ROWS_HISTORY),
         idle: false,
         last_grab: None,
         last_grab_us: 0,
@@ -194,6 +202,8 @@ struct Capture {
     resize_pending: bool,
     /// The next grab must be a full one: a failed grab took damage it never delivered.
     full_next: bool,
+    /// The last ROWS_HISTORY frames published.
+    changed_rows: RowsHistory,
     /// No session is subscribed, and the memory for frames has been given back.
     idle: bool,
     /// When the last grab attempt started, in both clocks.
@@ -352,13 +362,16 @@ impl Capture {
         };
         // Subtract first, then grab: damage after this point raises a new notify, so no
         // change can slip between the grab and the re-arm.
-        let bands = match &base {
-            Some(_) => match self.damage.subtract_rows(&self.conn) {
-                Ok(spans) => row_bands(spans, h),
+        let (bands, damage) = match &base {
+            Some(_) => match self.damage.subtract_rects(&self.conn) {
+                Ok(rects) => {
+                    let spans = rects.iter().map(|r| (r.y, r.y + r.h)).collect();
+                    (row_bands(spans, h), Some(rects))
+                }
                 Err(e) => return self.failed(e.context("damage_subtract"), now),
             },
             None => match self.damage.subtract(&self.conn) {
-                Ok(()) => None,
+                Ok(()) => (None, None),
                 Err(e) => return self.failed(e.context("damage_subtract"), now),
             },
         };
@@ -390,9 +403,21 @@ impl Capture {
             return;
         }
         let mut image = self.pool.get(w, h);
+        // Whatever happens next, the buffer will not hold that frame any more.
+        let held = std::mem::take(&mut image.content);
         let converted = match (&bands, &base) {
             (Some(bands), Some(base)) => {
-                image.copy_from(&base.image);
+                // The buffer is a frame from a moment ago: only the rows changed since differ
+                // from `base`. Copying just those, rather than the whole frame, saves most of
+                // a damage grab's time while a small part of the screen changes.
+                match rows_changed_since(&self.changed_rows, held, base.seq) {
+                    Some(rows) => {
+                        for (top, bottom) in rows {
+                            image.copy_rows_from(&base.image, top, bottom);
+                        }
+                    }
+                    None => image.copy_from(&base.image),
+                }
                 bands.iter().try_for_each(|&(top, bottom)| {
                     let pixels = self.grabber.pixels();
                     bgrx_rows_to_i420(pixels, self.grabber.stride(), &mut image, top, bottom)
@@ -420,11 +445,19 @@ impl Capture {
             self.poll_gap = self.poll.unwrap_or_default();
         }
         self.seq += 1;
+        image.content = self.seq;
+        if self.changed_rows.len() == ROWS_HISTORY {
+            self.changed_rows.pop_front();
+        }
+        let rows = bands.as_ref().filter(|_| base.is_some()).cloned();
+        self.changed_rows.push_back((self.seq, rows));
         let converted_us = clock::now_us();
         self.hub.publish(Frame {
             seq: self.seq,
             capture_us: start_us,
             image,
+            // None for full grabs, poll grabs included: what changed is not known.
+            damage,
         });
         debug!(
             seq = self.seq,
@@ -475,6 +508,24 @@ impl Capture {
     }
 }
 
+/// The row bands in which frame `upto` differs from frame `from`, from `history` (see
+/// Capture::changed_rows); None when that is not known (`from` is 0, too old, or a full grab
+/// came in between).
+fn rows_changed_since(history: &RowsHistory, from: u64, upto: u64) -> Option<Vec<(u32, u32)>> {
+    if from == 0 || from > upto {
+        return None;
+    }
+    let mut rows = Vec::new();
+    let mut next = from + 1;
+    for (seq, changed) in history {
+        if *seq == next && next <= upto {
+            rows.extend_from_slice(changed.as_ref()?);
+            next += 1;
+        }
+    }
+    (next == upto + 1).then_some(rows)
+}
+
 /// The row bands a damage grab of an `height`-row frame (even) reads, from the damaged row spans
 /// `[top, bottom)`: merged when close, widened to even rows (4:2:0 chroma covers row pairs) and
 /// clipped to the frame. None when a full grab is about as cheap. Empty when nothing was
@@ -505,6 +556,34 @@ fn row_bands(mut spans: Vec<(u32, u32)>, height: u32) -> Option<Vec<(u32, u32)>>
 #[cfg(test)]
 mod band_tests {
     use super::*;
+
+    #[test]
+    fn rows_changed_since_adds_up_the_frames_in_between() {
+        let history: VecDeque<_> = [
+            (3, Some(vec![(0, 2)])),
+            (4, None),
+            (5, Some(vec![(10, 20)])),
+            (6, Some(vec![(4, 8), (30, 32)])),
+        ]
+        .into();
+        assert_eq!(
+            rows_changed_since(&history, 5, 6),
+            Some(vec![(4, 8), (30, 32)])
+        );
+        assert_eq!(
+            rows_changed_since(&history, 4, 6),
+            Some(vec![(10, 20), (4, 8), (30, 32)])
+        );
+        assert_eq!(rows_changed_since(&history, 6, 6), Some(vec![]));
+        assert_eq!(
+            rows_changed_since(&history, 3, 6),
+            None,
+            "a full grab in between"
+        );
+        assert_eq!(rows_changed_since(&history, 1, 6), None, "too old");
+        assert_eq!(rows_changed_since(&history, 0, 6), None, "nothing known");
+        assert_eq!(rows_changed_since(&history, 5, 7), None, "not published");
+    }
 
     #[test]
     fn damaged_rows_become_even_merged_bands() {

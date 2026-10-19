@@ -480,6 +480,8 @@ struct Stats {
 struct Unit {
     seq: u32,
     key: bool,
+    /// A patch (pixels drawn over the picture), not H.264.
+    patch: bool,
     data: Vec<u8>,
     received: Instant,
 }
@@ -782,6 +784,7 @@ async fn read_loop(
                             let unit = Unit {
                                 seq: au.header.seq,
                                 key: au.header.key(),
+                                patch: au.header.patch(),
                                 data: au.data,
                                 received,
                             };
@@ -848,7 +851,18 @@ fn decode_loop(
         // Every unit is acked, decoded or dropped, so the server's credit keeps flowing. As in
         // the web client, a unit dropped while waiting for a keyframe is acked with 0 ms.
         let mut decode_ms = 0;
-        if !need_key {
+        if unit.patch {
+            // Drawn over the picture, as the web client does: it changes the marker only where
+            // it covers it.
+            let at = Instant::now();
+            lock(&stats).decoded.push(at);
+            let (x, y) = marker;
+            if let Some((y, u, v)) = tilt_e2e::patch_pixel(&unit.data, x, y) {
+                let color = nearest_color(yuv_to_rgb(y, u, v));
+                samples.send_replace(Some(Sample { color, at }));
+            }
+            decode_ms = u16::try_from(unit.received.elapsed().as_millis()).unwrap_or(u16::MAX);
+        } else if !need_key {
             match decode(&mut decoder, &unit.data, marker) {
                 Ok(Some(sample)) => {
                     lock(&stats).decoded.push(sample.at);
@@ -952,6 +966,7 @@ mod wire {
     const MSG_KEY: u8 = 0x30;
     const FLAG_KEY: u8 = 1 << 0;
     const FLAG_MORE: u8 = 1 << 1;
+    const FLAG_PATCH: u8 = 1 << 2;
     /// VIDEO header length, type byte included.
     const VIDEO_HEADER_LEN: usize = 18;
 
@@ -986,6 +1001,10 @@ mod wire {
 
         pub fn more(&self) -> bool {
             self.flags & FLAG_MORE != 0
+        }
+
+        pub fn patch(&self) -> bool {
+            self.flags & FLAG_PATCH != 0
         }
     }
 

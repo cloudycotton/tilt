@@ -9,6 +9,9 @@ const ACK = 0x10;
 const PING = 0x11;
 const FLAG_KEY = 1;
 const FLAG_MORE = 2;
+const FLAG_PATCH = 4;
+// Patches carry I420 with the stream's colours: BT.709, limited range (src/video/patch.rs).
+const PATCH_COLORS = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false };
 const VIDEO_HEADER = 18;
 
 const CLIENT = 'tilt-web/0.1';
@@ -16,9 +19,8 @@ const BACKOFF_MS = [250, 500, 1000, 2000, 5000];
 const PING_MS = 1000;
 const DEAD_MS = 5000;
 const WELCOME_TIMEOUT_MS = 10000;
-// After a reconnect, how long this page waits for control to be free before giving up taking it
-// back. A server that names no holder may be leaving it with this page's own lost session, which
-// it idle-closes within 30 s.
+// After a reconnect, how long this page waits for another viewer to let go of control before
+// giving up taking it back.
 const RETAKE_MS = 35000;
 const IDR_INTERVAL_MS = 500;
 // Frames in the decoder this long with no output: flush it, and replace it if the flush hangs.
@@ -171,6 +173,7 @@ const finePointer = matchMedia('(pointer: fine)');
 const stats = {
   framesDecoded: 0,
   framesDrawn: 0,
+  patchesDrawn: 0,
   keyframes: 0,
   bytes: 0,
   decodeErrors: 0,
@@ -228,8 +231,10 @@ const video = {
   needKey: true,
   frag: null,
   pending: new Map(), // seq -> receive time, in seq order, until acked
-  frame: null, // a decoded frame waiting for the next refresh
-  raf: 0, // the next refresh is booked: frames until then wait for it
+  // Frames and patches not drawn yet, in seq order: { seq, frame, patch, done }. A frame is
+  // done once it came out of the decoder (`frame`) or never will; a patch is done on arrival.
+  queue: [],
+  raf: 0, // the next refresh is booked: what is ready until then waits for it
   lastIdrAt: -Infinity,
   idrTimer: 0,
   sizeNotice: false, // the server cannot encode the screen at its size (until its next KEY frame)
@@ -460,8 +465,7 @@ function onControl(m) {
  * Sends a pending automatic take once it is due: at once for control=1's first take, otherwise
  * when this session's `control` status says nobody holds control, or that this page's own lost
  * session does (the server closes it only once it notices). Never from another viewer, and never
- * while the page is hidden. A server that names no holder leaves us unable to tell the two
- * apart, so control held there is waited out for RETAKE_MS.
+ * while the page is hidden.
  */
 function maybeTake() {
   const t = conn.take;
@@ -593,13 +597,14 @@ function onVideo(buf) {
       o += p.length;
     }
   }
-  onAccessUnit(seq, (flags & FLAG_KEY) !== 0, width, height, data);
+  if (flags & FLAG_PATCH) onPatch(seq, width, height, data);
+  else onAccessUnit(seq, (flags & FLAG_KEY) !== 0, width, height, data);
 }
 
 /** Acks a frame that will not be decoded (decode_ms 0) and asks for a keyframe. */
 function skipFrame(seq) {
   video.pending.set(seq, performance.now());
-  ackThrough(seq);
+  settle();
   video.needKey = true;
   requestIdr();
 }
@@ -619,6 +624,7 @@ function onAccessUnit(seq, key, width, height, data) {
     return;
   }
   video.pending.set(seq, performance.now());
+  video.queue.push({ seq, frame: null, patch: null, done: false });
   try {
     video.decoder.decode(new EncodedVideoChunk({
       type: key ? 'key' : 'delta',
@@ -701,8 +707,13 @@ function closeDecoder(ack) {
   if (d && d.state !== 'closed') {
     try { d.close(); } catch { /* closed by the browser */ }
   }
-  if (ack) ackThrough(Infinity);
-  else video.pending.clear();
+  if (ack) {
+    ackThrough(Infinity);
+    return;
+  }
+  video.pending.clear();
+  for (const u of video.queue) if (u.frame) u.frame.close();
+  video.queue = [];
 }
 
 function decoderFailed(e) {
@@ -771,29 +782,53 @@ function onDecoded(decoder, frame) {
   video.lastOutputAt = performance.now();
   // The session works: the next drop starts the reconnect backoff afresh.
   conn.attempt = 0;
-  ackThrough(Math.round(frame.timestamp / 1000));
-  // The first frame after a quiet refresh is drawn at once, half a refresh sooner on average
-  // than at the next animation frame (the low-latency canvas shows it at the next refresh
-  // either way); frames that follow before that refresh wait for it, newest first. So the
-  // canvas is drawn at most once per refresh: drawing each frame as it came made a busy main
-  // thread on a loaded machine fall behind the decoder.
-  if (video.raf) {
-    if (video.frame) video.frame.close();
-    video.frame = frame;
-    return;
-  }
-  draw(frame);
-  video.raf = requestAnimationFrame(nextRefresh);
+  const seq = Math.round(frame.timestamp / 1000);
+  const u = video.queue.find((q) => q.seq === seq && !q.done);
+  if (u) u.frame = frame;
+  else frame.close();
+  ackThrough(seq);
 }
 
-/** Draws the frame that waited for this refresh, if any, and books the next one for it. */
+/** A patch: what changed since the last frame or patch, as pixels (src/video/patch.rs). */
+function onPatch(seq, width, height, data) {
+  stats.lastSeq = seq;
+  video.pending.set(seq, performance.now());
+  video.queue.push({ seq, frame: null, patch: { width, height, data }, done: true });
+  settle();
+}
+
+/**
+ * Draws what is ready: the newest decoded frame, then the patches after it, in order. Earlier
+ * frames and patches are covered by that frame. The first update after a quiet refresh is drawn
+ * at once, half a refresh sooner on average than at the next animation frame (the low-latency
+ * canvas shows it at the next refresh either way); updates that follow before that refresh wait
+ * for it. So the canvas is drawn at most once per refresh: drawing each frame as it came made a
+ * busy main thread on a loaded machine fall behind the decoder.
+ */
+function refresh() {
+  let n = 0;
+  let newest = -1;
+  while (n < video.queue.length && video.queue[n].done) {
+    if (video.queue[n].frame) newest = n;
+    n++;
+  }
+  let drew = false;
+  video.queue.splice(0, n).forEach((u, i) => {
+    if (i < newest) {
+      if (u.frame) u.frame.close();
+    } else if (u.frame) {
+      draw(u.frame);
+      drew = true;
+    } else if (u.patch) {
+      drew = drawPatch(u.seq, u.patch) || drew;
+    }
+  });
+  if (drew) video.raf = requestAnimationFrame(nextRefresh);
+}
+
 function nextRefresh() {
   video.raf = 0;
-  const frame = video.frame;
-  if (!frame) return;
-  video.frame = null;
-  draw(frame);
-  video.raf = requestAnimationFrame(nextRefresh);
+  refresh();
 }
 
 /**
@@ -827,17 +862,33 @@ function watchDecoder(now) {
   });
 }
 
-/** ACKs every pending seq up to `seq`, oldest first: one ACK per seq, cumulative by construction. */
+/** Nothing up to `seq` will come out of the decoder any more: acks and draws what that frees. */
 function ackThrough(seq) {
+  for (const u of video.queue) {
+    if (u.seq > seq) break;
+    u.done = true;
+  }
+  settle();
+}
+
+/**
+ * ACKs every pending seq before the first frame still in the decoder, oldest first: one ACK per
+ * seq, cumulative by construction (a patch after a frame in the decoder waits for it), then
+ * draws what is ready unless a refresh is booked.
+ */
+function settle() {
+  const waiting = video.queue.find((u) => !u.done);
+  const upto = waiting ? waiting.seq - 1 : Infinity;
   const now = performance.now();
   for (const [s, at] of video.pending) {
-    if (s > seq) break;
+    if (s > upto) break;
     video.pending.delete(s);
     const [b, d] = message(ACK, 7);
     d.setUint32(1, s, true);
     d.setUint16(5, Math.min(65535, Math.round(now - at)), true);
     wsSend(b);
   }
+  if (!video.raf) refresh();
 }
 
 function requestIdr() {
@@ -873,6 +924,58 @@ function draw(frame) {
   // A fresh frame in a live session ends "Connecting…", "Reconnecting…" and decoder trouble alike;
   // frames the decoder still held when the screen size failed do not.
   if (!ui.overlay.hidden && conn.welcomed && !video.sizeNotice) hideOverlay();
+}
+
+/** Draws a patch's rectangles; false if it does not fit the canvas (no frame of its size yet). */
+function drawPatch(seq, p) {
+  if (ui.canvas.width !== p.width || ui.canvas.height !== p.height) return false;
+  const b = p.data;
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  try {
+    let at = 2;
+    for (let n = dv.getUint16(0, true); n > 0; n--) {
+      const x = dv.getUint16(at, true);
+      const y = dv.getUint16(at + 2, true);
+      const w = dv.getUint16(at + 4, true);
+      const h = dv.getUint16(at + 6, true);
+      const len = dv.getUint32(at + 8, true);
+      const pixels = unrle(b.subarray(at + 12, at + 12 + len), (w * h * 3) / 2);
+      at += 12 + len;
+      const f = new VideoFrame(pixels, { format: 'I420', codedWidth: w, codedHeight: h, timestamp: seq * 1000, colorSpace: PATCH_COLORS });
+      ctx.drawImage(f, x, y);
+      f.close();
+    }
+  } catch (e) {
+    // A patch this browser cannot draw: a keyframe repaints everything.
+    stats.decodeErrors++;
+    requestIdr();
+    return false;
+  }
+  stats.lastDrawnSeq = seq;
+  stats.patchesDrawn++;
+  if (opts.probe) probe(seq);
+  return true;
+}
+
+/** Undoes the run-length code of a patch rectangle: `size` bytes of I420. */
+function unrle(src, size) {
+  const out = new Uint8Array(size);
+  let i = 0;
+  let o = 0;
+  while (i < src.length && o < size) {
+    const c = src[i++];
+    if (c < 128) {
+      const n = Math.min(c + 1, size - o);
+      out.set(src.subarray(i, i + n), o);
+      i += c + 1;
+      o += n;
+    } else {
+      const n = Math.min(c - 125, size - o);
+      out.fill(src[i++], o, o + n);
+      o += n;
+    }
+  }
+  return out;
 }
 
 // Pixel reads (probe, sample) copy through a 1x1 CPU canvas: reading the display canvas itself
@@ -1351,7 +1454,7 @@ function onFullscreenChange() {
   else if (!on && kl && kl.unlock) kl.unlock();
 }
 
-let rates = { at: performance.now(), decoded: 0, drawn: 0, bytes: 0 };
+let rates = { at: performance.now(), decoded: 0, drawn: 0, patches: 0, bytes: 0 };
 function updateStats(now) {
   const dt = (now - rates.at) / 1000;
   if (dt >= 0.5) {
@@ -1359,9 +1462,11 @@ function updateStats(now) {
       at: now,
       decoded: stats.framesDecoded,
       drawn: stats.framesDrawn,
+      patches: stats.patchesDrawn,
       bytes: stats.bytes,
       fpsDecoded: (stats.framesDecoded - rates.decoded) / dt,
       fpsDrawn: (stats.framesDrawn - rates.drawn) / dt,
+      patchesPerS: (stats.patchesDrawn - rates.patches) / dt,
       kbps: ((stats.bytes - rates.bytes) * 8) / 1000 / dt,
     };
   }
@@ -1369,12 +1474,12 @@ function updateStats(now) {
   const n = (v, digits = 1) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(Number.isInteger(v) ? 0 : digits) : '-');
   const s = serverStats || {};
   ui.stats.textContent = [
-    `fps    ${n(rates.fpsDecoded)} decoded  ${n(rates.fpsDrawn)} drawn`,
+    `fps    ${n(rates.fpsDecoded)} decoded  ${n(rates.fpsDrawn)} drawn  ${n(rates.patchesPerS)} patches`,
     `recv   ${n(rates.kbps, 0)} kbps   ping ${stats.rttMs ?? '-'} ms`,
     `video  ${stats.width}x${stats.height} ${stats.codec || '-'} ${video.framing}${video.hw === 'prefer-software' ? ' software' : ''}  queue ${video.decoder ? video.decoder.decodeQueueSize : 0}`,
     `you    ${stats.role ? `${stats.role} role` : '-'}${stats.control ? ', in control' : ''}  errors ${stats.decodeErrors}  stalls ${stats.decoderStalls}`,
     `server ${n(s.fps)} fps  ${n(s.kbps, 0)} kbps  target ${n(s.bitrate_kbps, 0)} kbps`,
-    `       rtt ${n(s.rtt_ms)} (min ${n(s.min_rtt_ms)})  queue ${n(s.queue_ms)}  enc ${n(s.enc_ms)} ms`,
+    `       rtt ${n(s.rtt_ms)} (min ${n(s.min_rtt_ms)})  queue ${n(s.queue_ms)}  enc ${n(s.enc_ms)} ms  patches ${n(s.patches)}`,
     `       inflight ${n(s.inflight)}  skipped ${n(s.skipped)}  viewers ${n(s.viewers)}`,
   ].join('\n');
 }

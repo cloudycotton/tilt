@@ -10,6 +10,8 @@ use x11rb::protocol::xproto::Window;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
+use crate::video::patch::Rect;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XEventKind {
     /// Something on the root was drawn.
@@ -75,10 +77,10 @@ impl DamageTracker {
         Ok(())
     }
 
-    /// Re-arms the damage like `subtract` and returns the row spans `[top, bottom)` of what was
-    /// damaged since the last subtract, one per rectangle of the region, unsorted and possibly
-    /// overlapping. Costs one round trip.
-    pub fn subtract_rows(&self, conn: &RustConnection) -> anyhow::Result<Vec<(u32, u32)>> {
+    /// Re-arms the damage like `subtract` and returns the rectangles of what was damaged since
+    /// the last subtract, clipped to non-negative coordinates (not to the screen). Costs one
+    /// round trip.
+    pub fn subtract_rects(&self, conn: &RustConnection) -> anyhow::Result<Vec<Rect>> {
         conn.damage_subtract(self.damage, x11rb::NONE, self.region)?;
         let region = conn
             .xfixes_fetch_region(self.region)?
@@ -87,16 +89,20 @@ impl DamageTracker {
         Ok(region
             .rectangles
             .iter()
-            .filter(|r| r.width > 0 && r.height > 0)
-            .map(|r| {
-                let top = i32::from(r.y).max(0) as u32;
-                (top, (i32::from(r.y) + i32::from(r.height)).max(0) as u32)
+            .filter_map(|r| {
+                let (x, y) = (i32::from(r.x), i32::from(r.y));
+                let (x1, y1) = (x + i32::from(r.width), y + i32::from(r.height));
+                let (x, y) = (x.max(0), y.max(0));
+                (x1 > x && y1 > y).then(|| Rect {
+                    x: x as u32,
+                    y: y as u32,
+                    w: (x1 - x) as u32,
+                    h: (y1 - y) as u32,
+                })
             })
-            .filter(|(top, bottom)| top < bottom)
             .collect())
     }
 
-    /// Whether screen-change events were selected.
     pub fn has_randr(&self) -> bool {
         self.randr
     }
