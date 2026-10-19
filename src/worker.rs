@@ -194,8 +194,13 @@ struct Schedule {
     /// When a new capture (not a tail frame) was last encoded: the tail starts TAIL_SETTLE
     /// after it.
     last_new: Option<Instant>,
-    /// When the next new capture may be encoded: the frame rate cap, kept on a grid
-    /// (clock::next_slot) so that late timer wake-ups do not lower the frame rate.
+    /// The frame rate cap for new captures: the earliest the next one may be encoded. Each
+    /// capture encoded moves it on by a frame interval, but never to before that encode (a
+    /// rate limiter, GCRA with a burst of two). Over any stretch that is at most one capture
+    /// per interval, plus one, yet a capture is encoded as soon as it arrives whatever its
+    /// phase. A grid of the encoder's own, as before, made every capture wait for the
+    /// encoder's phase, which drifted from capture's (an input pull-forward moved it): up to
+    /// a frame interval on every frame, 9.5 ms on average in a 60 Hz animation.
     new_slot: Option<Instant>,
 }
 
@@ -267,7 +272,7 @@ impl Schedule {
         if seq != self.last_capture_seq {
             self.tail_left = self.tail_frames;
             self.last_new = Some(sent);
-            self.new_slot = Some(clock::next_slot(self.new_slot, now, self.fi));
+            self.new_slot = Some(self.new_slot.map_or(now, |s| (s + self.fi).max(now)));
         } else {
             self.tail_left = self.tail_left.saturating_sub(1);
         }
@@ -893,28 +898,70 @@ mod tests {
             Step::Encode { idr: false }
         );
         s.encoded(2, false, tail + 3 * MS, tail + 3 * MS);
-        // After a pause the next frame may follow half an interval later (clock::next_slot),
-        // then the grid resumes.
+        // After a pause the frame rate cap allows a second new frame right behind it (a burst
+        // of two), then one per frame interval.
         assert_eq!(
             s.decide(3, true, tail + 5 * MS),
-            Step::Wait(tail + 3 * MS + s.fi / 2)
+            Step::Encode { idr: false }
+        );
+        s.encoded(3, false, tail + 5 * MS, tail + 5 * MS);
+        assert_eq!(
+            s.decide(4, true, tail + 6 * MS),
+            Step::Wait(tail + 3 * MS + s.fi)
         );
     }
 
     #[test]
-    fn the_frame_rate_cap_keeps_to_a_grid() {
+    fn captures_go_out_as_they_arrive_whatever_their_phase() {
         let (mut s, t0) = sched();
         s.tail_frames = 0;
         s.encoded(1, true, t0, t0);
-        // The worker woke 3 ms after the slot: the frame goes out then...
-        let late = t0 + s.fi + 3 * MS;
-        assert_eq!(s.decide(2, true, late), Step::Encode { idr: false });
-        s.encoded(2, false, late, late);
-        // ...and the next slot is still t0 + 2 fi, not `late` + fi.
-        assert_eq!(s.decide(3, true, late + 5 * MS), Step::Wait(t0 + 2 * s.fi));
+        // A 60 Hz animation whose captures land 10 ms before the encoder's slots (an input
+        // pull-forward shifted capture's grid): each is encoded as it arrives. A grid of the
+        // encoder's own held every one of them back by 10 ms.
+        for k in 1..=5u32 {
+            let at = t0 + s.fi * k - 10 * MS;
+            let seq = u64::from(k) + 1;
+            assert_eq!(s.decide(seq, true, at), Step::Encode { idr: false }, "{k}");
+            s.encoded(seq, false, at, at);
+        }
+    }
+
+    #[test]
+    fn the_frame_rate_cap_holds_on_average() {
+        let (mut s, t0) = sched();
+        s.tail_frames = 0;
+        s.encoded(1, true, t0, t0);
+        // New captures every half interval (input pull-forward on every grab), for 60
+        // intervals: one per interval is encoded, like before.
+        let (mut seq, mut sent) = (1, 0);
+        for k in 1..=120u32 {
+            seq += 1;
+            let at = t0 + s.fi * k / 2;
+            match s.decide(seq, true, at) {
+                Step::Encode { idr: false } => {
+                    s.encoded(seq, false, at, at);
+                    sent += 1;
+                }
+                Step::Wait(due) => assert!(due > at),
+                other => panic!("{other:?} at capture {k}"),
+            }
+        }
+        assert!((60..=62).contains(&sent), "{sent} encoded in 60 intervals");
+        // After a pause, at most two go out back to back.
+        let late = t0 + 70 * s.fi;
+        for (i, at) in [late, late + MS].into_iter().enumerate() {
+            assert_eq!(
+                s.decide(seq + 1, true, at),
+                Step::Encode { idr: false },
+                "{i}"
+            );
+            seq += 1;
+            s.encoded(seq, false, at, at);
+        }
         assert_eq!(
-            s.decide(3, true, t0 + 2 * s.fi),
-            Step::Encode { idr: false }
+            s.decide(seq + 1, true, late + 2 * MS),
+            Step::Wait(late + s.fi)
         );
     }
 
@@ -939,11 +986,14 @@ mod tests {
     fn frame_rate_cap_and_credit() {
         let (mut s, t0) = sched();
         s.encoded(1, true, t0, t0);
-        // A new frame 5 ms later waits for the frame interval; without credit it is blocked.
-        assert_eq!(s.decide(2, true, t0 + 5 * MS), Step::Wait(t0 + s.fi));
-        assert_eq!(s.decide(2, false, t0 + 5 * MS), Step::Blocked);
-        assert_eq!(s.decide(2, false, t0 + s.fi), Step::Blocked);
-        assert_eq!(s.decide(2, true, t0 + s.fi), Step::Encode { idr: false });
+        s.encoded(2, false, t0 + MS, t0 + MS);
+        // A third new frame right behind the first two waits for the frame interval; without
+        // credit it is blocked.
+        let due = t0 + s.fi;
+        assert_eq!(s.decide(3, true, t0 + 2 * MS), Step::Wait(due));
+        assert_eq!(s.decide(3, false, t0 + 2 * MS), Step::Blocked);
+        assert_eq!(s.decide(3, false, due), Step::Blocked);
+        assert_eq!(s.decide(3, true, due), Step::Encode { idr: false });
         // Nothing due means idle even without credit.
         let (mut s, t0) = sched();
         s.tail_frames = 0;

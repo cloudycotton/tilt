@@ -250,7 +250,7 @@ startup. `tilt serve [flags]` is the same as `tilt [flags]`.
   `xfconf-query -c xfwm4 -p /general/unredirect_overlays -s false`. Without compositing, a fast
   scrolling terminal can freeze every viewer's picture for up to a second.
 - **Small VM (2 vCPUs)?** Use `--max-viewers 2`, and `--max-fps 30` if the desktop's own apps
-  need the CPU.
+  need the CPU. Firecracker or another CPU-only microVM: see [performance](performance.md).
 - **Slow link?** It adapts by itself: bitrate first, then frame rate. Frames are never dropped
   once sent, and each one is the newest screen.
 - **Sizes:** screens up to 9.4 Mpixel (e.g. 4096×2304). Pasted text over 4 KB is sent in pieces.
