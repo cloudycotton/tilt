@@ -10,23 +10,22 @@ use std::sync::{mpsc as std_mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail};
+use std::collections::BTreeMap;
+
+use anyhow::{anyhow, bail, ensure, Context};
 use clap::Parser;
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
 use openh264::decoder::{Decoder, DecoderConfig, Flush};
 use openh264::formats::YUVSource;
 use openh264::OpenH264API;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tilt_e2e::{nearest_color, yuv_to_rgb, COLORS};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, sleep_until};
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use wtransport::tls::Sha256Digest;
+use wtransport::{ClientConfig, Connection, Endpoint, RecvStream, SendStream};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,8 +34,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
     about = "Headless tilt client: decodes the stream and measures input latency and frame rate"
 )]
 struct Args {
-    /// tilt stream URL
-    #[arg(long, default_value = "ws://127.0.0.1:6090/stream")]
+    /// tilt's page URL (http://host:port/, or with a path prefix): the probe reads `transport`
+    /// there and connects to the stream it names
+    #[arg(long, default_value = "http://127.0.0.1:6090/")]
     url: String,
 
     /// Control token sent in hello
@@ -211,6 +211,13 @@ async fn main() -> ExitCode {
 
 async fn run(args: &Args) -> anyhow::Result<Report> {
     let mut session = Session::connect(args).await?;
+    // Closed on every path, so the server frees this viewer's place at once.
+    let report = measure(&mut session, args).await;
+    session.close().await;
+    report
+}
+
+async fn measure(session: &mut Session, args: &Args) -> anyhow::Result<Report> {
     let role = session.handshake(args.token.as_deref()).await?;
     let (w, h) = session.screen();
     eprintln!(
@@ -265,7 +272,7 @@ async fn run(args: &Args) -> anyhow::Result<Report> {
         };
     }
     if args.latency_trials > 0 {
-        let (mut latencies, failed) = latency_trials(&mut session, args.latency_trials).await?;
+        let (mut latencies, failed) = latency_trials(session, args.latency_trials).await?;
         latencies.sort_by(f64::total_cmp);
         report.latency_ms = Latency {
             p50: round1(percentile(&latencies, 50.0)),
@@ -276,12 +283,11 @@ async fn run(args: &Args) -> anyhow::Result<Report> {
         };
     }
     if !args.no_click {
-        report.click = Some(click(&mut session, args.click).await?);
+        report.click = Some(click(session, args.click).await?);
     }
     if args.idle_s > 0.0 {
         report.idle = Some(session.idle(args.idle_s).await?);
     }
-    session.close().await;
 
     let stats = session.lock();
     report.frames = stats.decoded.len() as u64;
@@ -492,10 +498,26 @@ struct Window {
     gaps_ms: Vec<f64>,
 }
 
-type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// One protocol message (docs/protocol.md).
+#[derive(Debug)]
+enum Message {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(Option<(u16, String)>),
+}
 
-/// A connected probe: a reader task, a writer task, a pinger and a decode thread around one
-/// WebSocket.
+impl Message {
+    fn binary(b: Vec<u8>) -> Message {
+        Message::Binary(b)
+    }
+
+    fn text(t: impl Into<String>) -> Message {
+        Message::Text(t.into())
+    }
+}
+
+/// A connected probe: reader tasks, a writer task, a pinger and a decode thread around one
+/// WebTransport session.
 struct Session {
     out: mpsc::UnboundedSender<Message>,
     /// Every JSON message from the server, in order.
@@ -504,27 +526,48 @@ struct Session {
     /// Why the connection ended, once it has.
     closed: watch::Receiver<Option<String>>,
     stats: Arc<Mutex<Stats>>,
+    conn: Connection,
+    endpoint: Endpoint<wtransport::endpoint::endpoint_side::Client>,
 }
 
 impl Session {
     async fn connect(args: &Args) -> anyhow::Result<Session> {
-        // No Nagle: input messages are tiny and latency is what is being measured.
-        // tungstenite's error already prints its IO cause, so it is not kept as a source too.
-        let (ws, _) = tokio_tungstenite::connect_async_with_config(args.url.as_str(), None, true)
+        let (host, port, prefix) = page_url(&args.url)?;
+        let advert = fetch_advert(&host, port, &prefix).await?;
+        // IPv4 unless the server is IPv6: a dual-stack socket fails where IPv6 is off.
+        let bind = if host.contains(':') {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let config = ClientConfig::builder()
+            .with_bind_address(bind.parse().expect("an address"))
+            .with_server_certificate_hashes([Sha256Digest::new(advert.hash)])
+            .build();
+        let url = format!(
+            "https://{host}:{}/stream?ticket={}",
+            advert.port, advert.ticket
+        );
+        let endpoint = Endpoint::client(config)?;
+        let conn = endpoint
+            .connect(&url)
             .await
-            .map_err(|e| anyhow!("connecting to {}: {e}", args.url))?;
-        let (sink, stream) = ws.split();
+            .map_err(|e| anyhow!("connecting to {url}: {e}"))?;
+        let (send, recv) = conn.open_bi().await?.await?;
         let start = Instant::now();
         let stats = Arc::new(Mutex::new(Stats::default()));
         let (out, out_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, incoming) = mpsc::unbounded_channel();
         let (events_tx, events) = mpsc::unbounded_channel();
         let (samples_tx, samples) = watch::channel(None);
         let (closed_tx, closed) = watch::channel(None);
         let (units_tx, units_rx) = std_mpsc::channel();
 
-        tokio::spawn(write_loop(sink, out_rx));
+        tokio::spawn(write_loop(send, out_rx));
+        tokio::spawn(control_reader(recv, incoming_tx.clone()));
+        tokio::spawn(video_reader(conn.clone(), incoming_tx));
         tokio::spawn(read_loop(
-            stream,
+            incoming,
             units_tx,
             events_tx,
             stats.clone(),
@@ -555,10 +598,11 @@ impl Session {
             samples,
             closed,
             stats,
+            conn,
+            endpoint,
         })
     }
 
-    /// Sends hello and waits for welcome; returns the role.
     async fn handshake(&mut self, token: Option<&str>) -> anyhow::Result<String> {
         let mut hello = json!({
             "t": "hello",
@@ -650,12 +694,10 @@ impl Session {
         })
     }
 
-    /// Closes with 1000 and gives the server a moment to answer.
+    /// Closes with 1000, gives the server a moment to answer, then ends the connection and
+    /// waits for QUIC to say so.
     async fn close(&mut self) {
-        let frame = CloseFrame {
-            code: CloseCode::Normal,
-            reason: "probe done".into(),
-        };
+        let frame = (1000, "probe done".to_owned());
         if self.out.send(Message::Close(Some(frame))).is_ok() {
             let _ = tokio::time::timeout(
                 Duration::from_secs(1),
@@ -663,6 +705,9 @@ impl Session {
             )
             .await;
         }
+        self.conn
+            .close(wtransport::VarInt::from_u32(0), b"probe done");
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.endpoint.wait_idle()).await;
     }
 
     fn send(&self, msg: Vec<u8>) {
@@ -740,57 +785,205 @@ fn lock(stats: &Mutex<Stats>) -> MutexGuard<'_, Stats> {
     stats.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-async fn write_loop(
-    mut sink: SplitSink<WsStream, Message>,
-    mut rx: mpsc::UnboundedReceiver<Message>,
-) {
+/// The stream's address, from GET `transport` next to the page.
+struct Advert {
+    port: u16,
+    hash: [u8; 32],
+    ticket: String,
+}
+
+/// Host, port and path prefix (ending in `/`) of `http://host[:port][/prefix/]`.
+fn page_url(url: &str) -> anyhow::Result<(String, u16, String)> {
+    let rest = url
+        .strip_prefix("http://")
+        .with_context(|| format!("{url}: expected http://host:port/"))?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().with_context(|| format!("{url}: bad port"))?),
+        None => (authority, 80),
+    };
+    let mut prefix = format!("/{path}");
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    Ok((host.to_owned(), port, prefix))
+}
+
+async fn fetch_advert(host: &str, port: u16, prefix: &str) -> anyhow::Result<Advert> {
+    let mut tcp = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| anyhow!("connecting to {host}:{port}: {e}"))?;
+    let request = format!(
+        "GET {prefix}transport HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    );
+    tcp.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    tcp.read_to_end(&mut response).await?;
+    let response = String::from_utf8_lossy(&response);
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .context("GET transport: no HTTP response")?;
+    let status = head.lines().next().unwrap_or("");
+    ensure!(status.contains(" 200 "), "GET {prefix}transport: {status}");
+    let v: Value = serde_json::from_str(body).context("GET transport: not JSON")?;
+    let wt = &v["wt"];
+    let hex = wt["hashes"][0]
+        .as_str()
+        .context("GET transport: no certificate hash")?;
+    let mut hash = [0u8; 32];
+    ensure!(hex.len() == 64, "GET transport: bad certificate hash");
+    for (i, b) in hash.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)?;
+    }
+    Ok(Advert {
+        port: wt["port"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .context("GET transport: no port")?,
+        hash,
+        ticket: wt["ticket"].as_str().unwrap_or("").to_owned(),
+    })
+}
+
+const KIND_TEXT: u8 = 0;
+const KIND_BINARY: u8 = 1;
+const KIND_CLOSE: u8 = 2;
+
+fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len() + 1).expect("small messages");
+    [&len.to_le_bytes()[..], &[kind], payload].concat()
+}
+
+/// Writes the client's messages on the control stream; a close is the last.
+async fn write_loop(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Message>) {
     while let Some(msg) = rx.recv().await {
-        let last = matches!(msg, Message::Close(_));
-        if sink.send(msg).await.is_err() || last {
+        let (bytes, last) = match msg {
+            Message::Text(t) => (frame(KIND_TEXT, t.as_bytes()), false),
+            Message::Binary(b) => (frame(KIND_BINARY, &b), false),
+            Message::Close(c) => {
+                let (code, reason) = c.unwrap_or((1005, String::new()));
+                let payload = [&code.to_le_bytes()[..], reason.as_bytes()].concat();
+                (frame(KIND_CLOSE, &payload), true)
+            }
+        };
+        if send.write_all(&bytes).await.is_err() || last {
+            let _ = send.finish().await;
             break;
         }
     }
 }
 
+/// Reads the server's control-stream messages; an Err ends the session with that reason.
+async fn control_reader(
+    mut recv: RecvStream,
+    incoming: mpsc::UnboundedSender<Result<Message, String>>,
+) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    let reason = loop {
+        while buf.len() >= 4 {
+            let len = u32::from_le_bytes(buf[..4].try_into().expect("4 bytes")) as usize;
+            if len == 0 {
+                let _ = incoming.send(Err("empty control-stream frame".into()));
+                return;
+            }
+            if buf.len() < 4 + len {
+                break;
+            }
+            let kind = buf[4];
+            let payload = buf[5..4 + len].to_vec();
+            buf.drain(..4 + len);
+            let msg = match kind {
+                KIND_TEXT => Message::Text(String::from_utf8_lossy(&payload).into_owned()),
+                KIND_BINARY => Message::Binary(payload),
+                KIND_CLOSE => Message::Close((payload.len() >= 2).then(|| {
+                    let code = u16::from_le_bytes([payload[0], payload[1]]);
+                    (code, String::from_utf8_lossy(&payload[2..]).into_owned())
+                })),
+                k => {
+                    let _ = incoming.send(Err(format!("unknown control-stream kind {k}")));
+                    return;
+                }
+            };
+            if incoming.send(Ok(msg)).is_err() {
+                return;
+            }
+        }
+        match recv.read(&mut chunk).await {
+            Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(None) => break "connection closed without a close message".to_owned(),
+            Err(e) => break format!("connection error: {e}"),
+        }
+    };
+    let _ = incoming.send(Err(reason));
+}
+
+/// Reads every VIDEO stream to its end and passes the messages on in seq order, as the server
+/// numbers them (1, 2, ...), whatever order their streams finish in.
+async fn video_reader(conn: Connection, incoming: mpsc::UnboundedSender<Result<Message, String>>) {
+    let (done_tx, mut done) = mpsc::unbounded_channel::<Vec<u8>>();
+    let accepting = tokio::spawn(async move {
+        while let Ok(mut stream) = conn.accept_uni().await {
+            let done = done_tx.clone();
+            tokio::spawn(async move {
+                let mut msg = Vec::new();
+                let mut chunk = [0u8; 64 * 1024];
+                while let Ok(Some(n)) = stream.read(&mut chunk).await {
+                    msg.extend_from_slice(&chunk[..n]);
+                }
+                let _ = done.send(msg);
+            });
+        }
+    });
+    let mut waiting = BTreeMap::new();
+    let mut next: u32 = 1;
+    while let Some(msg) = done.recv().await {
+        let seq = wire::VideoHeader::parse(&msg).map_or(next, |(h, _)| h.seq);
+        waiting.insert(seq, msg);
+        while let Some(msg) = waiting.remove(&next) {
+            if incoming.send(Ok(Message::Binary(msg))).is_err() {
+                accepting.abort();
+                return;
+            }
+            next = next.wrapping_add(1).max(1);
+        }
+    }
+}
+
 async fn read_loop(
-    mut stream: SplitStream<WsStream>,
+    mut incoming: mpsc::UnboundedReceiver<Result<Message, String>>,
     units: std_mpsc::Sender<Unit>,
     events: mpsc::UnboundedSender<Value>,
     stats: Arc<Mutex<Stats>>,
     closed: watch::Sender<Option<String>>,
     start: Instant,
 ) {
-    let mut joiner = wire::Reassembler::default();
     let reason = loop {
-        let msg = match stream.next().await {
+        let msg = match incoming.recv().await {
             Some(Ok(msg)) => msg,
-            Some(Err(e)) => break format!("connection error: {e}"),
-            None => break "connection closed without a close frame".to_owned(),
+            Some(Err(reason)) => break reason,
+            None => break "connection closed".to_owned(),
         };
         match msg {
             Message::Binary(b) => match b.first() {
                 Some(&wire::MSG_VIDEO) => {
-                    let unit = joiner.push(&b);
                     let received = Instant::now();
+                    let Some((header, payload)) = wire::VideoHeader::parse(&b) else {
+                        lock(&stats).protocol_errors += 1;
+                        continue;
+                    };
                     let mut s = lock(&stats);
-                    s.protocol_errors += std::mem::take(&mut joiner.dropped);
-                    match unit {
-                        Ok(Some(au)) => {
-                            s.units.push((received, au.wire_bytes));
-                            s.keyframes += u64::from(au.header.key());
-                            drop(s);
-                            let unit = Unit {
-                                seq: au.header.seq,
-                                key: au.header.key(),
-                                data: au.data,
-                                received,
-                            };
-                            if units.send(unit).is_err() {
-                                break "decode thread stopped".to_owned();
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(wire::Malformed) => s.protocol_errors += 1,
+                    s.units.push((received, b.len()));
+                    s.keyframes += u64::from(header.key());
+                    drop(s);
+                    let unit = Unit {
+                        seq: header.seq,
+                        key: header.key(),
+                        data: payload.to_vec(),
+                        received,
+                    };
+                    if units.send(unit).is_err() {
+                        break "decode thread stopped".to_owned();
                     }
                 }
                 Some(&wire::MSG_PONG) => match wire::pong(&b) {
@@ -821,11 +1014,10 @@ async fn read_loop(
             },
             Message::Close(frame) => {
                 break match frame {
-                    Some(f) => format!("closed by server: {} {}", u16::from(f.code), f.reason),
+                    Some((code, reason)) => format!("closed by server: {code} {reason}"),
                     None => "closed by server".to_owned(),
                 }
             }
-            _ => {}
         }
     };
     let _ = closed.send(Some(reason));
@@ -951,7 +1143,6 @@ mod wire {
     const MSG_BUTTON: u8 = 0x21;
     const MSG_KEY: u8 = 0x30;
     const FLAG_KEY: u8 = 1 << 0;
-    const FLAG_MORE: u8 = 1 << 1;
     /// VIDEO header length, type byte included.
     const VIDEO_HEADER_LEN: usize = 18;
 
@@ -982,60 +1173,6 @@ mod wire {
 
         pub fn key(&self) -> bool {
             self.flags & FLAG_KEY != 0
-        }
-
-        pub fn more(&self) -> bool {
-            self.flags & FLAG_MORE != 0
-        }
-    }
-
-    /// One reassembled access unit.
-    #[derive(Debug, PartialEq, Eq)]
-    pub struct AccessUnit {
-        /// The first fragment's header.
-        pub header: VideoHeader,
-        /// Annex B payload of all fragments.
-        pub data: Vec<u8>,
-        /// Bytes received for it, headers included.
-        pub wire_bytes: usize,
-    }
-
-    /// A VIDEO message too short for its header.
-    #[derive(Debug, PartialEq, Eq)]
-    pub struct Malformed;
-
-    /// Joins VIDEO fragments. Fragments of one seq are contiguous on the socket, so at most one
-    /// access unit is ever pending.
-    #[derive(Default)]
-    pub struct Reassembler {
-        pending: Option<AccessUnit>,
-        /// Incomplete units abandoned because a different seq started (a server bug).
-        pub dropped: u64,
-    }
-
-    impl Reassembler {
-        /// Adds one VIDEO message; returns the access unit once its last fragment is in.
-        pub fn push(&mut self, msg: &[u8]) -> Result<Option<AccessUnit>, Malformed> {
-            let (header, payload) = VideoHeader::parse(msg).ok_or(Malformed)?;
-            let mut unit = match self.pending.take() {
-                Some(unit) if unit.header.seq == header.seq => unit,
-                stale => {
-                    self.dropped += u64::from(stale.is_some());
-                    AccessUnit {
-                        header,
-                        data: Vec::new(),
-                        wire_bytes: 0,
-                    }
-                }
-            };
-            unit.data.extend_from_slice(payload);
-            unit.wire_bytes += msg.len();
-            if header.more() {
-                self.pending = Some(unit);
-                Ok(None)
-            } else {
-                Ok(Some(unit))
-            }
         }
     }
 
@@ -1116,7 +1253,7 @@ mod tests {
                 height: 1080,
             }
         );
-        assert!(h.key() && !h.more());
+        assert!(h.key());
         assert_eq!(payload, &[0, 0, 0, 1, 0x67]);
         // A header with no payload is still well-formed.
         assert!(VideoHeader::parse(&msg[..18]).is_some());
@@ -1125,34 +1262,6 @@ mod tests {
         wrong_type[0] = 0x02;
         assert!(VideoHeader::parse(&wrong_type).is_none());
         assert!(VideoHeader::parse(&[]).is_none());
-    }
-
-    #[test]
-    fn reassembles_fragments() {
-        let mut r = Reassembler::default();
-        // seq 7: KEY, three fragments.
-        assert_eq!(r.push(&video(0b11, 7, b"abc")), Ok(None));
-        assert_eq!(r.push(&video(0b11, 7, b"def")), Ok(None));
-        let au = r.push(&video(0b01, 7, b"gh")).unwrap().unwrap();
-        assert_eq!(au.data, b"abcdefgh");
-        assert_eq!(au.header.seq, 7);
-        assert!(au.header.key());
-        assert_eq!(au.wire_bytes, 3 * 18 + 8);
-        // seq 8: a single unfragmented delta.
-        let au = r.push(&video(0, 8, b"p")).unwrap().unwrap();
-        assert_eq!((au.data.as_slice(), au.header.key()), (&b"p"[..], false));
-        assert_eq!(r.dropped, 0);
-    }
-
-    #[test]
-    fn interrupted_unit_is_dropped_and_counted() {
-        let mut r = Reassembler::default();
-        assert_eq!(r.push(&video(0b10, 9, b"half")), Ok(None));
-        // seq 10 starts before seq 9 finished: 9 is abandoned, 10 decodes normally.
-        let au = r.push(&video(0, 10, b"whole")).unwrap().unwrap();
-        assert_eq!((au.header.seq, au.data.as_slice()), (10, &b"whole"[..]));
-        assert_eq!(r.dropped, 1);
-        assert_eq!(r.push(&[0x01, 0, 1]), Err(Malformed));
     }
 
     #[test]

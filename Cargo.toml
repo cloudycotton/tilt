@@ -13,11 +13,9 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws", "json"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 bytes = "1"
-socket2 = { version = "0.6", features = ["all"] }
 crossbeam-channel = "0.5"
 x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "xtest", "randr", "xinput"] }
 openh264-sys2 = "0.9.8"

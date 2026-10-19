@@ -31,13 +31,13 @@ No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/in
 
 - **Fast.** 60 fps, about 20 ms from key press to pixel.
 - **Tiny.** One static binary. Almost no CPU while nobody watches.
-- **Goes anywhere.** One port: UDP where it gets through, HTTPS everywhere else. Happy behind proxies and gateways.
+- **Smooth over the internet.** WebTransport over UDP: a lost packet never stalls your input or the next frame. One port.
 - **Always current.** Updates itself whenever it starts.
-- **Any device.** Mouse, keyboard, touch, paste, view-only links.
+- **Chrome or Edge.** Mouse, keyboard, touch, paste, view-only links.
 
 ## Next
 
-- **Docker, servers, E2B, Sail, flags:** [the guide](docs/guide.md)
+- **Docker, servers, Firecracker, flags:** [the guide](docs/guide.md)
 - **Writing your own client:** [the protocol](docs/protocol.md)
 
 <details>

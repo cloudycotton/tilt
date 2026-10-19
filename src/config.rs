@@ -42,7 +42,7 @@ pub enum Profile {
 /// Server settings. Every flag can also be set through its `TILT_*` environment variable.
 #[derive(Args, Debug, Clone)]
 pub struct Config {
-    /// Address for HTTP and the /stream WebSocket (TCP), and WebTransport (UDP, same port)
+    /// Address for HTTP (TCP) and the stream (WebTransport, UDP, same port)
     #[arg(long, env = "TILT_BIND", default_value = "0.0.0.0:6090")]
     pub bind: SocketAddr,
 
@@ -65,16 +65,6 @@ pub struct Config {
     /// Let everyone in with the control role (local testing only)
     #[arg(long, env = "TILT_NO_AUTH", value_parser = BoolishValueParser::new())]
     pub no_auth: bool,
-
-    /// With --no-auth, also let browser pages on these origins connect (comma-separated, such
-    /// as https://desk.example.com; * for any)
-    #[arg(
-        long,
-        env = "TILT_ALLOW_ORIGIN",
-        value_delimiter = ',',
-        value_name = "ORIGINS"
-    )]
-    pub allow_origin: Vec<String>,
 
     /// Frame rate cap per viewer (OpenH264 caps at 60)
     #[arg(long, env = "TILT_MAX_FPS", default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=60))]
@@ -115,14 +105,6 @@ pub struct Config {
     /// Maximum simultaneous viewers
     #[arg(long, env = "TILT_MAX_VIEWERS", default_value_t = 4, value_parser = RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_viewers: usize,
-
-    /// Largest WebSocket message; bigger access units are split into fragments
-    #[arg(long, env = "TILT_MAX_MSG_BYTES", default_value_t = 65_536, value_parser = RangedU64ValueParser::<usize>::new().range(1024..))]
-    pub max_msg_bytes: usize,
-
-    /// TCP_NOTSENT_LOWAT in bytes, 0 = off (Linux only)
-    #[arg(long, env = "TILT_NOTSENT_LOWAT", default_value_t = 32_768)]
-    pub notsent_lowat: u32,
 
     /// UDP port browsers dial for WebTransport, when the host forwards it from another port
     /// [default: the --bind port]
@@ -300,10 +282,7 @@ mod tests {
             (c.tail_frames, c.rc_frame_skip, c.max_viewers),
             (30, false, 4)
         );
-        assert_eq!(
-            (c.max_msg_bytes, c.notsent_lowat, c.poll_ms),
-            (65_536, 32_768, 1000)
-        );
+        assert_eq!(c.poll_ms, 1000);
     }
 
     #[test]
@@ -331,22 +310,6 @@ mod tests {
         );
         // Auto may resolve to High, so it is held to High's QP floor.
         assert!(parse(&["--no-auth", "--profile", "auto", "--qp-min", "12"]).is_err());
-    }
-
-    #[test]
-    fn allowed_origins_are_a_comma_separated_list() {
-        let c = parse(&["--no-auth"]).unwrap();
-        assert!(c.allow_origin.is_empty());
-        let c = parse(&[
-            "--no-auth",
-            "--allow-origin",
-            "https://a.example,https://b.example:8443",
-        ])
-        .unwrap();
-        assert_eq!(
-            c.allow_origin,
-            ["https://a.example", "https://b.example:8443"]
-        );
     }
 
     #[test]

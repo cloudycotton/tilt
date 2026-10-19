@@ -1,98 +1,62 @@
-//! What a session reads from and writes to: a WebSocket, or a WebTransport session (src/wt.rs)
-//! that carries the same messages (docs/protocol.md section 7).
+//! A session's connection: a WebTransport session (src/wt.rs, docs/protocol.md).
 //!
-//! Sessions speak in WebSocket messages either way. Over WebTransport, one client-opened
-//! bidirectional stream (the control stream) carries every message but VIDEO, each framed as
-//! `u32 length (LE) | u8 kind | payload`, where `length` counts the kind byte and the payload,
-//! and kind is KIND_TEXT (a JSON message), KIND_BINARY (a binary message) or KIND_CLOSE
-//! (`u16 code (LE) | utf8 reason`, the WebSocket close). Each VIDEO access unit goes on a
-//! unidirectional stream of its own: its 18-byte header with MORE clear, then the whole access
-//! unit, so a lost packet of one frame holds up neither the next frames' transfer nor cursor,
-//! PONG or control messages.
+//! One client-opened bidirectional stream (the control stream) carries every message but VIDEO,
+//! each framed as `u32 length (LE) | u8 kind | payload`, where `length` counts the kind byte and
+//! the payload, and kind is KIND_TEXT (a JSON message), KIND_BINARY (a binary message) or
+//! KIND_CLOSE (`u16 code (LE) | utf8 reason`). Each VIDEO access unit goes on a unidirectional
+//! stream of its own: its 18-byte header, then the whole access unit, so a lost packet of one
+//! frame holds up neither the next frames' transfer nor cursor, PONG or control messages.
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use bytes::{Buf, Bytes, BytesMut};
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
 use wtransport::error::StreamReadError;
 use wtransport::{Connection, RecvStream, SendStream, VarInt};
 
-use crate::protocol::{self, FLAG_MORE, MSG_VIDEO, VIDEO_HEADER_LEN};
+use crate::protocol::MSG_VIDEO;
 
 pub const KIND_TEXT: u8 = 0;
 pub const KIND_BINARY: u8 = 1;
 pub const KIND_CLOSE: u8 = 2;
 
-/// Close code sent in a KIND_CLOSE without one, as WebSocket reports a close without a code.
+/// Close code sent in a KIND_CLOSE without one.
 const NO_STATUS: u16 = 1005;
 /// Bytes read from the control stream at a time.
 const READ_CHUNK: usize = 16 * 1024;
 
-/// The sending half of a session's connection.
-pub enum Sink {
-    Ws(SplitSink<WebSocket, Message>),
-    Wt(WtSink),
+/// One message of the protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    Text(String),
+    Binary(Bytes),
+    Close(Option<CloseFrame>),
 }
 
-impl Sink {
-    pub async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
-        match self {
-            Sink::Ws(s) => Ok(s.send(msg).await?),
-            Sink::Wt(s) => s.send(msg).await,
-        }
-    }
-
-    /// Flushes what was sent and ends the connection: for a WebSocket its closing handshake,
-    /// for WebTransport the control stream's end, acknowledged, and then the QUIC connection.
-    pub async fn close(&mut self) -> anyhow::Result<()> {
-        match self {
-            Sink::Ws(s) => Ok(s.close().await?),
-            Sink::Wt(s) => s.close().await,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseFrame {
+    pub code: u16,
+    pub reason: String,
 }
 
-/// The receiving half of a session's connection.
-pub enum Stream {
-    Ws(SplitStream<WebSocket>),
-    Wt(WtStream),
-}
-
-impl Stream {
-    /// The next message; None once the peer has finished. Cancel-safe: a message is never
-    /// half-consumed by a dropped call.
-    pub async fn next(&mut self) -> Option<anyhow::Result<Message>> {
-        match self {
-            Stream::Ws(s) => s.next().await.map(|r| r.map_err(Into::into)),
-            Stream::Wt(s) => s.next().await,
-        }
-    }
-}
-
-/// Writes a session's messages to a WebTransport session.
-pub struct WtSink {
+/// Writes a session's messages.
+pub struct Sink {
     conn: Connection,
     control: SendStream,
-    /// The stream of an access unit whose remaining fragments are still to come.
-    video: Option<SendStream>,
     /// Each video stream gets a lower priority than the one before, so QUIC sends (and resends)
     /// the oldest frame first, as the decoder needs them, rather than interleaving them.
     video_priority: i32,
 }
 
-impl WtSink {
+impl Sink {
     /// `control` is the session's control stream, which goes ahead of all video.
-    pub fn new(conn: Connection, control: SendStream) -> WtSink {
+    pub fn new(conn: Connection, control: SendStream) -> Sink {
         control.set_priority(i32::MAX);
-        WtSink {
+        Sink {
             conn,
             control,
-            video: None,
             video_priority: 0,
         }
     }
 
-    async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
+    pub async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
         match msg {
             Message::Text(t) => self.frame(KIND_TEXT, t.as_bytes()).await,
             Message::Binary(b) if b.first() == Some(&MSG_VIDEO) => self.video(&b).await,
@@ -105,7 +69,6 @@ impl WtSink {
                 payload.extend_from_slice(reason.as_bytes());
                 self.frame(KIND_CLOSE, &payload).await
             }
-            Message::Ping(_) | Message::Pong(_) => Ok(()),
         }
     }
 
@@ -114,73 +77,54 @@ impl WtSink {
         Ok(())
     }
 
-    /// One VIDEO message: the first fragment of an access unit opens its stream, the last one
-    /// finishes it. Finishing does not wait for the peer's acknowledgement.
+    /// One VIDEO message (header and whole access unit) on a stream of its own. Finishing does
+    /// not wait for the peer's acknowledgement.
     async fn video(&mut self, msg: &[u8]) -> anyhow::Result<()> {
-        let more = protocol::video_has_more(msg);
-        let mut stream = match self.video.take() {
-            Some(mut stream) => {
-                stream
-                    .write_all(msg.get(VIDEO_HEADER_LEN..).unwrap_or_default())
-                    .await?;
-                stream
-            }
-            None => {
-                let mut stream = self.conn.open_uni().await?.await?;
-                stream.set_priority(self.video_priority);
-                self.video_priority = self.video_priority.checked_sub(1).unwrap_or(0);
-                // The stream holds the whole access unit, so the header's MORE is clear.
-                let mut first = msg.to_vec();
-                if let Some(flags) = first.get_mut(1) {
-                    *flags &= !FLAG_MORE;
-                }
-                stream.write_all(&first).await?;
-                stream
-            }
-        };
-        if more {
-            self.video = Some(stream);
-        } else {
-            // Errs only on a stream already finished or reset; the data is queued either way.
-            let _ = stream.quic_stream_mut().finish();
-        }
+        let mut stream = self.conn.open_uni().await?.await?;
+        stream.set_priority(self.video_priority);
+        self.video_priority = self.video_priority.checked_sub(1).unwrap_or(0);
+        stream.write_all(msg).await?;
+        // Errs only on a stream already reset; the data is queued either way.
+        let _ = stream.quic_stream_mut().finish();
         Ok(())
     }
 
-    async fn close(&mut self) -> anyhow::Result<()> {
-        // Ends the control stream and waits until the peer has all of it (a close message
-        // included): closing the QUIC connection would throw away anything unacknowledged.
+    /// Flushes the control stream, waiting until the peer has all of it (a close message
+    /// included), then ends the connection: closing it at once would drop unacknowledged data.
+    pub async fn close(&mut self) -> anyhow::Result<()> {
         let flushed = self.control.finish().await;
         self.conn.close(VarInt::from_u32(0), b"");
         Ok(flushed?)
     }
 }
 
-impl Drop for WtSink {
+impl Drop for Sink {
     fn drop(&mut self) {
         // A session that ends without `close` (a write timeout) still ends its connection.
         self.conn.close(VarInt::from_u32(0), b"");
     }
 }
 
-/// Reads a session's messages from its WebTransport control stream.
-pub struct WtStream {
+/// Reads a session's messages from its control stream.
+pub struct Stream {
     recv: RecvStream,
     buf: BytesMut,
     max_msg: usize,
 }
 
-impl WtStream {
-    /// Messages longer than `max_msg` bytes end the session, as they do on a WebSocket.
-    pub fn new(recv: RecvStream, max_msg: usize) -> WtStream {
-        WtStream {
+impl Stream {
+    /// Messages longer than `max_msg` bytes end the session.
+    pub fn new(recv: RecvStream, max_msg: usize) -> Stream {
+        Stream {
             recv,
             buf: BytesMut::new(),
             max_msg,
         }
     }
 
-    async fn next(&mut self) -> Option<anyhow::Result<Message>> {
+    /// The next message; None once the peer has finished. Cancel-safe: a message is never
+    /// half-consumed by a dropped call.
+    pub async fn next(&mut self) -> Option<anyhow::Result<Message>> {
         loop {
             match parse_frame(&mut self.buf, self.max_msg) {
                 Ok(Some(msg)) => return Some(Ok(msg)),
@@ -232,7 +176,7 @@ fn parse_frame(buf: &mut BytesMut, max_msg: usize) -> anyhow::Result<Option<Mess
     let kind = buf.get_u8();
     let payload = buf.split_to(len - 1).freeze();
     Ok(Some(match kind {
-        KIND_TEXT => Message::Text(String::from_utf8(payload.to_vec())?.into()),
+        KIND_TEXT => Message::Text(String::from_utf8(payload.to_vec())?),
         KIND_BINARY => Message::Binary(payload),
         KIND_CLOSE => Message::Close(close_frame(&payload)?),
         k => anyhow::bail!("unknown control-stream message kind {k}"),
@@ -247,7 +191,7 @@ fn close_frame(payload: &Bytes) -> anyhow::Result<Option<CloseFrame>> {
     let reason = std::str::from_utf8(&payload[2..])?;
     Ok(Some(CloseFrame {
         code,
-        reason: reason.to_owned().into(),
+        reason: reason.to_owned(),
     }))
 }
 
@@ -304,7 +248,7 @@ mod tests {
         assert!(parse_all(&[0, 0, 0, 0], 64)[0].is_err());
         assert!(parse_all(&frame(9, b"x"), 64)[0].is_err());
         assert!(parse_all(&frame(KIND_TEXT, &[0xff]), 64)[0].is_err());
-        // A close without a code is a close without a frame, as on a WebSocket.
+        // A close without a code is a close without a frame.
         let r = parse_all(&frame(KIND_CLOSE, &[]), 64);
         assert!(matches!(r[0], Ok(Some(Message::Close(None)))));
     }

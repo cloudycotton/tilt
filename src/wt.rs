@@ -1,5 +1,4 @@
-//! The WebTransport fast path: the /stream protocol over QUIC on UDP, on the same port as the
-//! WebSocket (docs/protocol.md section 7). A session that arrives here runs exactly like a
+//! The stream: tilt's protocol over WebTransport (QUIC, UDP), on the same port as HTTP (docs/protocol.md section 7). A session that arrives here runs exactly like a
 //! WebSocket one (src/session.rs); src/transport.rs carries its messages.
 //!
 //! Browsers learn the port and the certificate from GET /transport. The certificate is
@@ -21,9 +20,9 @@ use wtransport::{Endpoint, Identity, ServerConfig, VarInt};
 
 use crate::clock::LogEvery;
 use crate::protocol;
-use crate::server::{self, AppState};
+use crate::server::AppState;
 use crate::session;
-use crate::transport::{Sink, Stream, WtSink, WtStream};
+use crate::transport::{Sink, Stream};
 
 /// The path of the WebTransport session, as for the WebSocket.
 pub const STREAM_PATH: &str = "/stream";
@@ -46,15 +45,15 @@ const SEND_WINDOW: u64 = 4 * 1024 * 1024;
 /// Incoming control-stream messages are limited like WebSocket ones.
 const MAX_INCOMING_MSG: usize = 64 * 1024;
 
-/// What GET /transport tells browsers about the fast path. None of it is secret.
+/// What GET /transport tells browsers about the stream.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Advert {
     /// The UDP port to dial, on the page's own host.
     pub port: u16,
     /// SHA-256 of the certificate, hex, for `serverCertificateHashes`.
     pub hashes: Vec<String>,
-    /// Goes in the session URL (`/stream?ticket=`). With --no-auth it stands in for the
-    /// WebSocket's Origin check: other sites' pages cannot read /transport, so cannot learn it.
+    /// Goes in the session URL (`/stream?ticket=`): other sites' pages cannot read /transport,
+    /// so a session with it comes from a page this server served.
     pub ticket: String,
 }
 
@@ -162,30 +161,25 @@ async fn accept(incoming: IncomingSession, state: Arc<AppState>) {
         debug!(path, "WebTransport request for an unknown path");
         return request.not_found().await;
     }
-    if state.tokens.no_auth() {
-        let ticket = query
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("ticket="))
-            .unwrap_or("");
-        let expected = state.wt_advert().as_ref().map(|a| a.ticket.clone());
-        let origin = request.origin();
-        if expected.as_deref() != Some(ticket)
-            && !server::origin_allowed(&state.cfg.allow_origin, origin)
-        {
-            static REFUSALS: Mutex<LogEvery> = Mutex::new(LogEvery::new(Duration::from_secs(10)));
-            let log = REFUSALS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .ready(Instant::now());
-            if let Some(more) = log {
-                warn!(
-                    ?origin,
-                    "refused a WebTransport session without this server's ticket, as \
-                     --no-auth gives everyone control ({more} more since the last warning)"
-                );
-            }
-            return request.forbidden().await;
+    let ticket = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("ticket="))
+        .unwrap_or("");
+    let expected = state.wt_advert().as_ref().map(|a| a.ticket.clone());
+    if expected.as_deref() != Some(ticket) {
+        static REFUSALS: Mutex<LogEvery> = Mutex::new(LogEvery::new(Duration::from_secs(10)));
+        let log = REFUSALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ready(Instant::now());
+        if let Some(more) = log {
+            warn!(
+                origin = ?request.origin(),
+                "refused a session without this server's ticket ({more} more since the last \
+                 warning)"
+            );
         }
+        return request.forbidden().await;
     }
     let conn = match request.accept().await {
         Ok(conn) => conn,
@@ -204,9 +198,9 @@ async fn accept(incoming: IncomingSession, state: Arc<AppState>) {
         }
     };
     debug!(%peer, "WebTransport session");
-    session::run_with(
-        Sink::Wt(WtSink::new(conn, send)),
-        Stream::Wt(WtStream::new(recv, MAX_INCOMING_MSG)),
+    session::run(
+        Sink::new(conn, send),
+        Stream::new(recv, MAX_INCOMING_MSG),
         state,
     )
     .await;
@@ -218,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_advert_names_the_certificate_and_the_public_port() {
-        let state = server::test_state(&["--no-auth", "--udp-public-port", "4433"]);
+        let state = crate::server::test_state(&["--no-auth", "--udp-public-port", "4433"]);
         let endpoint = bind(&state, "127.0.0.1:0".parse().unwrap()).unwrap();
         let advert = state.wt_advert().clone().unwrap();
         assert_eq!(advert.port, 4433);
@@ -250,11 +244,15 @@ mod tests {
 
     /// A server on a free UDP port with `args`, and its advert.
     async fn start(args: &[&str]) -> (Arc<AppState>, Advert, tokio::task::JoinHandle<()>) {
-        let state = server::test_state(args);
+        let state = crate::server::test_state(args);
         let endpoint = bind(&state, "127.0.0.1:0".parse().unwrap()).unwrap();
         let advert = state.wt_advert().clone().unwrap();
         let task = tokio::spawn(run(endpoint, Arc::clone(&state)));
         (state, advert, task)
+    }
+
+    fn stream_path(advert: &Advert) -> String {
+        format!("{STREAM_PATH}?ticket={}", advert.ticket)
     }
 
     /// Connects as a browser given `advert` would, to `path`.
@@ -299,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_over_webtransport_speaks_the_protocol() {
         let (state, advert, server) = start(&["--token", "secret"]).await;
-        let conn = connect(&advert, STREAM_PATH).await.unwrap();
+        let conn = connect(&advert, &stream_path(&advert)).await.unwrap();
         let (mut send, mut recv) = hello(&conn, "secret").await;
         let welcome = read_json(&mut recv).await;
         assert_eq!(
@@ -347,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_token_gets_the_error_and_the_close_code() {
         let (_state, advert, server) = start(&["--token", "secret"]).await;
-        let conn = connect(&advert, STREAM_PATH).await.unwrap();
+        let conn = connect(&advert, &stream_path(&advert)).await.unwrap();
         let (_send, mut recv) = hello(&conn, "nope").await;
         let error = read_json(&mut recv).await;
         assert_eq!(error["code"], "auth");
@@ -361,24 +359,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_auth_needs_the_ticket_or_an_allowed_origin() {
+    async fn sessions_need_the_ticket() {
+        for args in [&["--no-auth"][..], &["--token", "secret"][..]] {
+            let (_state, advert, server) = start(args).await;
+            assert!(connect(&advert, "/stream").await.is_err(), "no ticket");
+            assert!(connect(&advert, "/stream?ticket=wrong").await.is_err());
+            assert!(
+                connect(&advert, "/elsewhere").await.is_err(),
+                "unknown path"
+            );
+            assert!(connect(&advert, &stream_path(&advert)).await.is_ok());
+            server.abort();
+        }
         let (_state, advert, server) = start(&["--no-auth"]).await;
-        assert!(connect(&advert, "/stream").await.is_err(), "no ticket");
-        assert!(connect(&advert, "/stream?ticket=wrong").await.is_err());
-        assert!(
-            connect(&advert, "/elsewhere").await.is_err(),
-            "unknown path"
-        );
-        let conn = connect(&advert, &format!("/stream?ticket={}", advert.ticket))
-            .await
-            .unwrap();
+        let conn = connect(&advert, &stream_path(&advert)).await.unwrap();
         let (_send, mut recv) = hello(&conn, "").await;
         assert_eq!(read_json(&mut recv).await["t"], "welcome");
-        server.abort();
-
-        // A token server needs no ticket: the token is the secret.
-        let (_state, advert, server) = start(&["--token", "secret"]).await;
-        assert!(connect(&advert, "/stream").await.is_ok());
         server.abort();
     }
 }

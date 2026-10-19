@@ -5,9 +5,7 @@ Pick what you need. Every section stands on its own.
 - [Start](#start): one command
 - [Docker](#docker): try it with a demo desktop
 - [Run the binary](#run-the-binary): on your own machine or VM
-- [Behind a proxy](#behind-a-proxy): a remote VM at `https://gw.example.com/vm1/`
-- [UDP fast path](#udp-fast-path): smoother over lossy links (Firecracker and other VMs)
-- [E2B](#e2b) · [Sail](#sail): sandboxes
+- [Network](#network): what has to reach the VM (Firecracker and other VMs)
 - [Flags](#flags)
 - [Tips and limits](#tips-and-limits)
 - [Build](#build)
@@ -65,165 +63,31 @@ Open `http://<host>:6090/#token=<token>`.
   buttons, and exits.
 </details>
 
-## Behind a proxy
+## Network
 
-Run tilt on the VM bound to loopback, and point a path (or host) of your HTTPS gateway at it.
+tilt serves the page over HTTP and streams over WebTransport (QUIC, UDP) on the same port,
+6090 by default. Each frame travels on its own, so a lost packet delays only that frame, never
+the cursor, your input or the frames after it. There is one protocol and nothing to fall back to:
 
-```sh
-tilt --display :0 --bind 127.0.0.1:6090 --token-file /run/tilt/token
-```
-
-**nginx**
-
-```nginx
-location /vm1/ {
-    proxy_pass http://127.0.0.1:6090/;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_read_timeout 1h;
-}
-```
-
-**Caddy:** `handle_path /vm1/* { reverse_proxy 127.0.0.1:6090 }`
-
-Open `https://gw.example.com/vm1/#token=<token>`.
-
-Rules:
-- Any path prefix works. A missing trailing slash is added for you.
-- The gateway must speak **HTTP/1.1** to tilt (no WebSocket over HTTP/2), and must not
-  compress or buffer the stream.
-- Only one TCP port is needed, no UDP. The token travels in the URL fragment and then inside the
-  WebSocket, so it never shows up in proxy logs.
-
-<details>
-<summary>Latency through a gateway</summary>
-
-tilt adds about 10 ms between a change on screen and its frame leaving the server (grab 0.6 ms,
-conversion 0.8 ms, encoding 6–10 ms at 1080p). The page draws each frame as soon as it's
-decoded; the rest is your network's round trip. Key press to drawn, 1080p, through
-[e2e/proxy.mjs](../e2e/proxy.mjs):
-
-| round trip added | Chrome p50 / p95 | WebKit p50 / p95 |
-|---|---|---|
-| 0 ms | 22 / 27 ms | 38 / 47 ms |
-| 50 ms | 70 / 80 ms | 85 / 98 ms |
-
-An animated screen kept 60 fps at 100 ms round trip (frame gaps p50 16.7 ms, p95 21 ms): flow
-control keeps about 1.5 bandwidth-delay products in flight, so frame rate doesn't drop as
-latency grows.
-
-Measure your own gateway:
-
-```sh
-node e2e/proxy.mjs --upstream 127.0.0.1:6090 --prefix /desk/ --delay-ms 25
-cd e2e && TILT_URL=http://localhost:6190/desk/ npx playwright test
-```
-</details>
-
-<details>
-<summary>Using <code>--no-auth</code> behind a proxy</summary>
-
-With `--no-auth`, a browser page's `Origin` must match the `Host` (or `X-Forwarded-Host`, or
-`Forwarded: host=`) or be listed in `--allow-origin`.
-
-- E2B's edge passes the public `Host` through, or sets `X-Forwarded-Host` with
-  `maskRequestHost`, so the page served from the sandbox URL just works.
-- A custom domain in front of E2B arrives as the sandbox's own host (E2B drops any
-  `X-Forwarded-Host` it receives). Sail doesn't document the headers its edge sends.
-- An app's WebView loading the client from its own files sends that origin (`null` for `file:`).
-
-If the log says `refused a /stream upgrade from another origin`, pass `--allow-origin` with the
-page's origin, or use a token. Origin checks stop neither DNS rebinding nor non-browser clients:
-with `--no-auth`, **anyone who reaches the port has control**.
-</details>
-
-## UDP fast path
-
-Over the internet, a lost packet stalls a TCP connection until it is resent, and every frame
-behind it waits: that is the hitch you see on Wi-Fi or a long path. So tilt also listens on UDP,
-on the same port as HTTP, and browsers that can (Chrome and Edge) stream over WebTransport (QUIC)
-instead, where each frame travels on its own and QUIC recovers faster. Everyone else, and everyone
-whose network blocks UDP, uses the WebSocket, automatically.
-
-- The `···` menu's stats (or `&stats=1`) show `udp` or `ws`.
+- The viewer's browser must reach the port over **TCP and UDP**: TCP for the page, UDP for the
+  stream. An HTTPS gateway or proxy cannot carry the stream.
+- **Chrome or Edge** (WebTransport with certificate hashes). Other browsers get a clear message.
 - No certificate needed: tilt makes a short-lived self-signed one and tells the page its hash.
-- The page must reach the UDP port directly: an HTTPS gateway or proxy cannot carry it. Such
-  pages wait about 1.5 s for UDP, then use the WebSocket; after two such failures in a row they
-  go straight to the WebSocket for a day.
 
-**Firecracker (or any VM behind NAT).** Forward the port for UDP as well as TCP. If browsers dial a
+**Firecracker (or any VM behind NAT).** Forward the port for both protocols. If browsers dial a
 different UDP port than tilt's, say which:
 
 ```sh
-# on the host: public UDP 7090 -> VM 172.16.0.2:6090
-iptables -t nat -A PREROUTING -p udp --dport 7090 -j DNAT --to-destination 172.16.0.2:6090
-iptables -A FORWARD -p udp -d 172.16.0.2 --dport 6090 -j ACCEPT
+# on the host: public 6090 -> VM 172.16.0.2:6090, TCP and UDP
+for proto in tcp udp; do
+  iptables -t nat -A PREROUTING -p $proto --dport 6090 -j DNAT --to-destination 172.16.0.2:6090
+  iptables -A FORWARD -p $proto -d 172.16.0.2 --dport 6090 -j ACCEPT
+done
 # in the VM
-tilt --display :0 --udp-public-port 7090
+tilt --display :0              # or --udp-public-port 7090 if the host maps UDP 7090 to it
 ```
 
-Allow the UDP port in the host's firewall and any cloud security group.
-
-## E2B
-
-Upload the static x86_64 binary into an `@e2b/desktop` sandbox and point it at display `:0`.
-Make the token after `create`, never in a template.
-
-```js
-import { Sandbox } from '@e2b/desktop'
-import { randomBytes } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
-
-const desktop = await Sandbox.create({ timeoutMs: 30 * 60_000 })
-const token = randomBytes(16).toString('hex')
-
-await desktop.files.write('/home/user/tilt', new Blob([await readFile('dist/tilt-x86_64-unknown-linux-musl')]))
-await desktop.files.write('/home/user/.tilt-token', token)   // re-read on every connection
-await desktop.commands.run('chmod 755 /home/user/tilt && chmod 600 /home/user/.tilt-token')
-await desktop.commands.run(
-  '/home/user/tilt --display :0 --token-file /home/user/.tilt-token',
-  { background: true },
-)
-
-const url = `https://${desktop.getHost(6090)}/#token=${encodeURIComponent(token)}`
-```
-
-- Rotate the token any time by rewriting the file. Connected sessions stay connected.
-- Streaming doesn't keep an E2B sandbox alive: extend its timeout while someone is watching.
-
-## Sail
-
-Sail images don't run `ENTRYPOINT`/`CMD`, so run tilt as a unit next to your Xvfb unit. The
-token is made the first time the service starts (never during image boot) and kept across
-restarts.
-
-```ini
-# /etc/systemd/system/tilt.service
-[Unit]
-Description=tilt desktop streamer
-After=xvfb.service
-Wants=xvfb.service
-
-[Service]
-# The account that runs Xvfb.
-User=user
-Environment=TILT_DISPLAY=:0
-Environment=TILT_TOKEN_FILE=/run/tilt/token
-RuntimeDirectory=tilt
-RuntimeDirectoryPreserve=restart
-ExecStartPre=/bin/sh -c 'umask 077; [ -s /run/tilt/token ] || head -c 16 /dev/urandom | od -An -tx1 | tr -dc 0-9a-f > /run/tilt/token'
-ExecStart=/usr/local/bin/tilt
-Restart=always
-RestartSec=1
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Publish port 6090 as an `http` listener, read the token with `cat /run/tilt/token`, and open
-`https://sb-<uuid>-6090.sail.box/#token=<token>`.
+Allow both in the host's firewall and any cloud security group.
 
 ## Flags
 
@@ -247,8 +111,7 @@ Every flag also has an environment variable. With none of `--token`, `--token-fi
 | flag | env | default | |
 |---|---|---|---|
 | `--token-file <PATH>` | `TILT_TOKEN_FILE` | | control token = first non-empty line of the file (a UTF-8 byte order mark is skipped), re-read on every connection; while it is missing or empty, viewers get `not_ready` |
-| `--no-auth` | `TILT_NO_AUTH` | off | everyone gets control; local testing only. A browser on another site's page is refused: its `Origin` must match `Host`, or `X-Forwarded-Host` or `Forwarded: host=` behind a proxy that rewrites `Host`, or be listed in `--allow-origin` |
-| `--allow-origin <ORIGINS>` | `TILT_ALLOW_ORIGIN` | | with `--no-auth`, browser pages on these origins may connect too: comma-separated, written as the browser does (`https://desk.example.com`), or `*` for any |
+| `--no-auth` | `TILT_NO_AUTH` | off | everyone who can open the page gets control; local testing only |
 | `--bitrate-kbps <N>` | `TILT_BITRATE_KBPS` | 8000 | starting bitrate |
 | `--min-bitrate-kbps <N>` | `TILT_MIN_BITRATE_KBPS` | 1000 | lowest bitrate under congestion |
 | `--max-bitrate-kbps <N>` | `TILT_MAX_BITRATE_KBPS` | 20000 | highest bitrate |
@@ -257,9 +120,7 @@ Every flag also has an environment variable. With none of `--token`, `--token-fi
 | `--profile <high\|baseline>` | `TILT_PROFILE` | `high` | `high` = CABAC; `baseline` = CAVLC Constrained Baseline |
 | `--tail-frames <N>` | `TILT_TAIL_FRAMES` | 30 | most refinement frames after the screen goes still; none follow a frame coded at `--qp-min`, and the tail ends once a re-encode at `--qp-min` comes out unchanged |
 | `--rc-frame-skip` | `TILT_RC_FRAME_SKIP` | off | let OpenH264 rate control skip frames |
-| `--max-msg-bytes <N>` | `TILT_MAX_MSG_BYTES` | 65536 | larger video frames are split into fragments; small ones keep a slow link's client hearing from the server while a keyframe arrives |
-| `--notsent-lowat <BYTES>` | `TILT_NOTSENT_LOWAT` | 32768 | TCP_NOTSENT_LOWAT, 0 = off (Linux only) |
-| `--udp-public-port <PORT>` | `TILT_UDP_PUBLIC_PORT` | the `--bind` port | the UDP port browsers dial for the [fast path](#udp-fast-path), when the host forwards another one to tilt |
+| `--udp-public-port <PORT>` | `TILT_UDP_PUBLIC_PORT` | the `--bind` port | the UDP port browsers dial for the stream ([network](#network)), when the host forwards another one to tilt |
 | `--poll-ms <N>` | `TILT_POLL_MS` | 1000 | safety full-frame compare while viewers wait, backing off to 8× while it finds nothing; 0 = off |
 
 Usage errors (a missing token, an inconsistent quantizer or bitrate range) exit with code 2 at
@@ -359,15 +220,15 @@ docker run --rm -v "$PWD":/src -v tilt-cargo-registry:/usr/local/cargo/registry 
 <summary>How it works</summary>
 
 tilt streams an X11 desktop (e.g. Xvfb) to a browser or mobile WebView, and one viewer at a time
-can take the mouse and keyboard. It replaces x11vnc + noVNC in sandboxes like E2B and Sail.
+can take the mouse and keyboard. It replaces x11vnc + noVNC.
 
-- One HTTP/1.1 port serves the web client and a binary WebSocket at `/stream`.
+- One port: HTTP serves the web client, WebTransport (QUIC, UDP) carries the stream.
 - Each viewer gets its own H.264 encoder (OpenH264, built in), decoded by WebCodecs in the page.
 - Capture is demand-driven (DAMAGE + MIT-SHM): a still screen costs no CPU, and only changed rows
   are read and converted.
 - Flow control is ack-based: frames are never dropped, the newest frame goes out when credit
   returns, and the bitrate follows the measured link.
-- Tokens are checked in the first WebSocket message, never in the URL query.
+- Tokens are checked in the first message of the stream, never in a URL.
 
 The wire protocol is in [protocol.md](protocol.md).
 </details>
