@@ -31,6 +31,8 @@ mimalloc = { version = "0.1", default-features = false }
 libc = "0.2"
 getrandom = "0.3"
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+wtransport = { version = "0.7.2", default-features = false, features = ["ring", "self-signed", "quinn"] }
+time = { version = "0.3", default-features = false }
 
 [profile.release]
 opt-level = 3

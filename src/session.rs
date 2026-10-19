@@ -1,5 +1,5 @@
-//! One /stream connection: handshake, reader and writer tasks, and its encoder worker
-//! (brief section 5.5).
+//! One /stream connection, over a WebSocket or WebTransport (src/transport.rs): handshake,
+//! reader and writer tasks, and its encoder worker (brief section 5.5).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use bytes::Bytes;
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -20,6 +19,7 @@ use crate::control::ControlStatus;
 use crate::input::InputCmd;
 use crate::protocol::{self, ClientMsg, ClientText, ErrorCode, ScreenSize, ServerText};
 use crate::server::AppState;
+use crate::transport::{Sink, Stream};
 use crate::worker::{self, Inbox};
 use crate::x11::cursor::CursorState;
 
@@ -235,7 +235,7 @@ impl Sessions {
     }
 }
 
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_CLOSE: Duration = Duration::from_secs(30);
 const HELD_RELEASE: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -245,9 +245,6 @@ const REPLY_CAPACITY: usize = 32;
 /// How long teardown waits for the encoder thread before leaving it to finish on its own.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-type Sink = SplitSink<WebSocket, Message>;
-type Stream = SplitStream<WebSocket>;
-
 fn close_frame(code: u16, reason: &'static str) -> CloseFrame {
     CloseFrame {
         code,
@@ -255,10 +252,18 @@ fn close_frame(code: u16, reason: &'static str) -> CloseFrame {
     }
 }
 
-/// Runs one upgraded /stream connection until it closes.
+/// Runs one upgraded /stream WebSocket until it closes.
 pub async fn run(socket: WebSocket, state: Arc<AppState>) {
-    let (mut sink, mut stream) = socket.split();
+    let (sink, stream) = socket.split();
+    run_with(Sink::Ws(sink), Stream::Ws(stream), state).await;
+}
+
+/// Runs one session, on either transport, until it closes.
+pub async fn run_with(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
     let Some((sid, role, liveness)) = handshake(&mut sink, &mut stream, &state).await else {
+        // Delivers the refusal before the connection goes: over WebTransport, dropping the
+        // sink would discard what the client has not acknowledged yet.
+        let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
         return;
     };
     info!(session = sid, ?role, "connected");

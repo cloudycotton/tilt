@@ -193,7 +193,54 @@ Unknown fields in client JSON are ignored. A repeated `hello` after the handshak
 
 | path | |
 |---|---|
-| `GET /` | the web client (`index.html`); `/app.js`, `/input.js`, `/keysyms.js` alongside. Strong ETag, `Cache-Control: no-cache`, `If-None-Match` answered with 304. |
+| `GET /` | the web client (`index.html`); `/app.js`, `/input.js`, `/transport.js`, `/keysyms.js` alongside. Strong ETag, `Cache-Control: no-cache`, `If-None-Match` answered with 304. |
 | `GET /healthz` | `ok`, no auth |
 | `GET /api/status` | `{"version","screen":{"w","h"},"viewers","controller":bool,"sessions":[{"id","role","control","fps","kbps","rtt_ms"}]}`; needs `Authorization: Bearer <control token>` unless `--no-auth` (401 wrong token, 403 view token, 503 token file missing or empty) |
 | `GET /stream` | the WebSocket above; incoming messages are limited to 64 KiB; with `--no-auth`, 403 for another site's `Origin` (see 1.1) |
+| `GET /transport` | `{"wt":{"port":N,"host":"…","hashes":["<sha-256 hex>"],"ticket":"…"}}` when the WebTransport fast path is on (section 7), else `{}`; no auth, `Cache-Control: no-store`. `host` is present only with `--wt-public-host`. |
+
+## 7. WebTransport (optional, `--wt-bind`)
+
+The same protocol, carried by WebTransport over HTTP/3 (QUIC, UDP) instead of a WebSocket.
+Video frames each travel on a stream of their own, so a lost packet delays only the frame it
+belongs to, not cursor updates, PONGs, input or the frames after it; and QUIC recovers from
+loss faster than TCP. Everything in sections 1 to 5 holds unchanged; only the framing differs.
+
+1. **Discovery.** `GET transport` next to the page (`/transport`, or `/<prefix>/transport`). No
+   `wt` means no fast path: use the WebSocket.
+2. **Session.** Open `https://<host>:<port>/stream?ticket=<ticket>`, where `host` is the
+   advert's `host` or else the page's host, with
+   `serverCertificateHashes: [{algorithm: 'sha-256', value: <hash bytes>}]` for each of
+   `hashes`. The certificate is self-signed ECDSA P-256, valid for 14 days (from a day before it
+   was made) and replaced every 6 days, so fetch `/transport` before each connection. With
+   `--no-auth`, a request without the right `ticket` gets HTTP 403 unless its `Origin` is in
+   `--allow-origin`: other sites' pages cannot read `/transport`, so the ticket does what the
+   `Origin` check does for the WebSocket. Unknown paths get 404.
+3. **Control stream.** The client opens one bidirectional stream and sends its `hello` on it.
+   Every message of sections 1 to 5 except VIDEO travels on it, in both directions, as
+   `u32 length (LE) | u8 kind | payload`, `length` counting the kind byte and the payload:
+
+   | kind | payload |
+   |---|---|
+   | 0 | a JSON (text) message, UTF-8 |
+   | 1 | a binary message, exactly as on the WebSocket (type byte first) |
+   | 2 | close: `u16 code (LE)`, then the UTF-8 reason; the codes of section 1.7 |
+
+   The server sends a kind-2 close before it ends a session (the WebSocket's close frame), then
+   finishes the stream and closes the QUIC connection once the client has acknowledged it. A
+   client that reads the end of the stream or loses the connection without a close treats it as
+   an abnormal close (1006) and reconnects. Messages longer than 64 KiB + 1 end the session.
+4. **Video.** Each access unit arrives on its own server-opened unidirectional stream: the
+   18-byte VIDEO header (MORE always clear) followed by the whole Annex B access unit, then the
+   end of the stream. Streams may complete out of order: decode in `seq` order, starting at 1.
+   If a stream fails before its header was read, skip to the oldest seq that did arrive, ACK the
+   last skipped seq (ACKs are cumulative) and request an IDR. VIDEO may arrive before the
+   `welcome` on the control stream: hold it until then.
+5. **Congestion.** The server uses BBR. The ACK credit of section 3 still decides how much video
+   is in flight.
+
+A client should fall back to the WebSocket when `/transport` offers nothing, or when the session
+does not deliver its first message within a short time (the web client waits 1.5 s; after two
+failures in a row it uses the WebSocket for a day). Gateways and HTTPS proxies carry only TCP, so such pages end
+up on the WebSocket. The web client's `#transport=ws` never tries WebTransport and
+`#transport=udp` tries it despite a remembered failure.

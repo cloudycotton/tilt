@@ -124,6 +124,20 @@ pub struct Config {
     #[arg(long, env = "TILT_NOTSENT_LOWAT", default_value_t = 32_768)]
     pub notsent_lowat: u32,
 
+    /// UDP address for the WebTransport (QUIC) fast path, such as 0.0.0.0:6091; off when unset.
+    /// Browsers that cannot reach it use the WebSocket
+    #[arg(long, env = "TILT_WT_BIND", value_name = "ADDR")]
+    pub wt_bind: Option<SocketAddr>,
+
+    /// UDP port browsers dial for WebTransport, when it is forwarded from another port
+    /// [default: the --wt-bind port]
+    #[arg(long, env = "TILT_WT_PUBLIC_PORT", value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub wt_public_port: Option<u16>,
+
+    /// Host browsers dial for WebTransport [default: the host the page was loaded from]
+    #[arg(long, env = "TILT_WT_PUBLIC_HOST", value_name = "HOST")]
+    pub wt_public_host: Option<String>,
+
     /// Safety full-frame compare interval while viewers wait, in ms, 0 = off
     #[arg(long, env = "TILT_POLL_MS", default_value_t = 1000)]
     pub poll_ms: u64,
@@ -188,6 +202,23 @@ impl Config {
                      it. Use --qp-min {MIN_CABAC_QP} or more, or --profile baseline"
                 ),
             ));
+        }
+        if self.wt_bind.is_none()
+            && (self.wt_public_port.is_some() || self.wt_public_host.is_some())
+        {
+            return Err((
+                ErrorKind::MissingRequiredArgument,
+                "--wt-public-port and --wt-public-host need --wt-bind (TILT_WT_BIND)".into(),
+            ));
+        }
+        if let Some(host) = &self.wt_public_host {
+            let bad = |c: char| c.is_whitespace() || "/?#@".contains(c);
+            if host.is_empty() || host.contains(bad) {
+                return Err((
+                    ErrorKind::InvalidValue,
+                    format!("--wt-public-host {host:?} is not a host name or address"),
+                ));
+            }
         }
         if self.min_bitrate_kbps > self.bitrate_kbps || self.bitrate_kbps > self.max_bitrate_kbps {
             return Err((
@@ -302,6 +333,39 @@ mod tests {
             (c.max_msg_bytes, c.notsent_lowat, c.poll_ms),
             (65_536, 32_768, 1000)
         );
+    }
+
+    #[test]
+    fn webtransport_flags() {
+        let c = parse(&["--no-auth"]).unwrap();
+        assert_eq!(
+            (c.wt_bind, c.wt_public_port, &c.wt_public_host),
+            (None, None, &None)
+        );
+        let c = parse(&[
+            "--no-auth",
+            "--wt-bind",
+            "0.0.0.0:6091",
+            "--wt-public-port",
+            "7091",
+            "--wt-public-host",
+            "203.0.113.7",
+        ])
+        .unwrap();
+        assert_eq!(c.wt_bind, Some("0.0.0.0:6091".parse().unwrap()));
+        assert_eq!(c.wt_public_port, Some(7091));
+        assert_eq!(c.wt_public_host.as_deref(), Some("203.0.113.7"));
+        // The public port and host mean nothing without the endpoint.
+        assert!(parse(&["--no-auth", "--wt-public-port", "7091"]).is_err());
+        assert!(parse(&["--no-auth", "--wt-public-host", "a.example"]).is_err());
+        let bind = ["--no-auth", "--wt-bind", "0.0.0.0:6091"];
+        assert!(parse(&[&bind[..], &["--wt-public-port", "0"]].concat()).is_err());
+        for bad in ["", "a b", "a/b", "user@a"] {
+            assert!(
+                parse(&[&bind[..], &["--wt-public-host", bad]].concat()).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
