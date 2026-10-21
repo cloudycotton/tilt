@@ -728,7 +728,7 @@ impl Worker {
         Ok(true)
     }
 
-    /// Queues one access unit for capture `frame` (in fragments) and returns when it went out.
+    /// Queues one access unit for capture `frame` and returns when it went out.
     fn send_unit(&mut self, frame: &Frame, flags: u8, data: &[u8]) -> Result<Instant, Closed> {
         if self.sched.last_capture_seq != 0 && frame.seq > self.sched.last_capture_seq {
             // Captures that went to other viewers while this one waited.
@@ -744,9 +744,7 @@ impl Worker {
             width: frame.image.width as u16,
             height: frame.image.height as u16,
         };
-        for msg in protocol::video_messages(header, data, self.cfg.max_msg_bytes) {
-            self.send(OutMsg::Binary(msg))?;
-        }
+        self.send(OutMsg::Binary(protocol::video_message(header, data)))?;
         let sent = Instant::now();
         self.flow.on_sent(self.seq, data.len(), sent);
         Ok(sent)
