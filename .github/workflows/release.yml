@@ -113,10 +113,21 @@ jobs:
           cp ../LICENSE .
           npm publish --provenance --access public
       - name: Verify installation from npm
+        timeout-minutes: 10
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           smoke=$(mktemp -d)
-          npm install --prefix "$smoke" --ignore-scripts "tilt-live@$VERSION"
+          # npm can accept a publish before the version is available to install.
+          for attempt in {1..30}; do
+            if npm install --prefix "$smoke" --ignore-scripts --prefer-online --fetch-retries=0 "tilt-live@$VERSION"; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "tilt-live@$VERSION is still unavailable after 30 installation attempts" >&2
+              exit 1
+            fi
+            sleep 10
+          done
           test "$("$smoke/node_modules/.bin/tilt-live" --version)" = "tilt $VERSION"
           "$smoke/node_modules/.bin/tilt-live" --help
