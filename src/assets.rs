@@ -39,6 +39,11 @@ pub static ASSETS: &[Asset] = &[
         body: include_bytes!("../web/input.js"),
     },
     Asset {
+        path: "/transport.js",
+        content_type: JS,
+        body: include_bytes!("../web/transport.js"),
+    },
+    Asset {
         path: "/keysyms.js",
         content_type: JS,
         body: include_bytes!("../web/keysyms.js"),
@@ -203,6 +208,7 @@ mod tests {
             .iter()
             .zip([
                 "text/html; charset=utf-8",
+                "text/javascript; charset=utf-8",
                 "text/javascript; charset=utf-8",
                 "text/javascript; charset=utf-8",
                 "text/javascript; charset=utf-8",

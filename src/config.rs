@@ -42,7 +42,7 @@ pub enum Profile {
 /// Server settings. Every flag can also be set through its `TILT_*` environment variable.
 #[derive(Args, Debug, Clone)]
 pub struct Config {
-    /// Address for HTTP and the /stream WebSocket
+    /// Address for HTTP (TCP) and the stream (WebTransport, UDP, same port)
     #[arg(long, env = "TILT_BIND", default_value = "0.0.0.0:6090")]
     pub bind: SocketAddr,
 
@@ -65,16 +65,6 @@ pub struct Config {
     /// Let everyone in with the control role (local testing only)
     #[arg(long, env = "TILT_NO_AUTH", value_parser = BoolishValueParser::new())]
     pub no_auth: bool,
-
-    /// With --no-auth, also let browser pages on these origins connect (comma-separated, such
-    /// as https://desk.example.com; * for any)
-    #[arg(
-        long,
-        env = "TILT_ALLOW_ORIGIN",
-        value_delimiter = ',',
-        value_name = "ORIGINS"
-    )]
-    pub allow_origin: Vec<String>,
 
     /// Frame rate cap per viewer (OpenH264 caps at 60)
     #[arg(long, env = "TILT_MAX_FPS", default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=60))]
@@ -116,13 +106,15 @@ pub struct Config {
     #[arg(long, env = "TILT_MAX_VIEWERS", default_value_t = 4, value_parser = RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_viewers: usize,
 
-    /// Largest WebSocket message; bigger access units are split into fragments
-    #[arg(long, env = "TILT_MAX_MSG_BYTES", default_value_t = 65_536, value_parser = RangedU64ValueParser::<usize>::new().range(1024..))]
-    pub max_msg_bytes: usize,
+    /// UDP port tilt listens on for the stream (WebTransport) [default: the --bind port]
+    #[arg(long, env = "TILT_UDP_PORT", value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub udp_port: Option<u16>,
 
-    /// TCP_NOTSENT_LOWAT in bytes, 0 = off (Linux only)
-    #[arg(long, env = "TILT_NOTSENT_LOWAT", default_value_t = 32_768)]
-    pub notsent_lowat: u32,
+    /// Where browsers send the stream's UDP, as PORT or HOST:PORT, when that is not the page's
+    /// host and --udp-port: a NAT that forwards another port, or a sandbox's public UDP
+    /// listener [default: the page's host and --udp-port]
+    #[arg(long, env = "TILT_UDP_PUBLIC", value_name = "[HOST:]PORT", value_parser = parse_udp_public)]
+    pub udp_public: Option<UdpPublic>,
 
     /// Safety full-frame compare interval while viewers wait, in ms, 0 = off
     #[arg(long, env = "TILT_POLL_MS", default_value_t = 1000)]
@@ -245,6 +237,36 @@ impl Config {
     }
 }
 
+/// `--udp-public`: the host browsers dial (None: the page's own), and the port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpPublic {
+    pub host: Option<String>,
+    pub port: u16,
+}
+
+fn parse_udp_public(s: &str) -> Result<UdpPublic, String> {
+    let (host, port) = match s.rsplit_once(':') {
+        // An IPv6 address alone has colons but no port after a `]`.
+        Some((host, port)) if !host.contains(':') || host.ends_with(']') => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            (Some(host.to_owned()), port)
+        }
+        _ => (None, s),
+    };
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|&p| p > 0)
+        .ok_or_else(|| format!("{s:?} is not PORT or HOST:PORT"))?;
+    if host
+        .as_ref()
+        .is_some_and(|h| h.is_empty() || h.contains(['/', ' ', '#', '?', '@']))
+    {
+        return Err(format!("{s:?} is not PORT or HOST:PORT"));
+    }
+    Ok(UdpPublic { host, port })
+}
+
 fn kbps_to_bps(kbps: u32) -> u32 {
     kbps.saturating_mul(1000)
 }
@@ -295,10 +317,46 @@ mod tests {
             (c.tail_frames, c.rc_frame_skip, c.max_viewers),
             (30, false, 4)
         );
+        assert_eq!(c.poll_ms, 1000);
+    }
+
+    #[test]
+    fn udp_port_and_public_address() {
+        let c = parse(&["--no-auth"]).unwrap();
+        assert_eq!((c.udp_port, c.udp_public), (None, None));
+        let c = parse(&["--no-auth", "--udp-port", "6091"]).unwrap();
+        assert_eq!(c.udp_port, Some(6091));
+        assert!(parse(&["--no-auth", "--udp-port", "0"]).is_err());
+        let public =
+            |s: &str| parse(&["--no-auth", "--udp-public", s]).map(|c| c.udp_public.unwrap());
+        let up = |host: Option<&str>, port| UdpPublic {
+            host: host.map(String::from),
+            port,
+        };
+        assert_eq!(public("7090").unwrap(), up(None, 7090));
         assert_eq!(
-            (c.max_msg_bytes, c.notsent_lowat, c.poll_ms),
-            (65_536, 32_768, 1000)
+            public("udp-3f2a.sail.box:41234").unwrap(),
+            up(Some("udp-3f2a.sail.box"), 41234)
         );
+        assert_eq!(
+            public("203.0.113.7:9033").unwrap(),
+            up(Some("203.0.113.7"), 9033)
+        );
+        assert_eq!(
+            public("[2001:db8::1]:9033").unwrap(),
+            up(Some("2001:db8::1"), 9033)
+        );
+        for bad in [
+            "0",
+            "host:",
+            ":9033",
+            "host:99999",
+            "a/b:9033",
+            "2001:db8::1",
+            "x",
+        ] {
+            assert!(public(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -318,22 +376,6 @@ mod tests {
         );
         // Auto may resolve to High, so it is held to High's QP floor.
         assert!(parse(&["--no-auth", "--profile", "auto", "--qp-min", "12"]).is_err());
-    }
-
-    #[test]
-    fn allowed_origins_are_a_comma_separated_list() {
-        let c = parse(&["--no-auth"]).unwrap();
-        assert!(c.allow_origin.is_empty());
-        let c = parse(&[
-            "--no-auth",
-            "--allow-origin",
-            "https://a.example,https://b.example:8443",
-        ])
-        .unwrap();
-        assert_eq!(
-            c.allow_origin,
-            ["https://a.example", "https://b.example:8443"]
-        );
     }
 
     #[test]
