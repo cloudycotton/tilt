@@ -101,6 +101,12 @@ Allow both in the host's firewall and any cloud security group.
 
 ## Sail
 
+A systemd service needs a systemd-enabled Sail image: use
+`sail.Image.debian("arm64", install_python=False).with_systemd()` or a Sail devbox
+image. The plain Debian image does not include or run systemd. Devboxes already run
+a small Xvfb display on `:0`; use a separate display (for example `:99`) for your
+desktop and set `TILT_DISPLAY` to match.
+
 A Sailbox publishes the page as an `http` listener and the stream as a `udp` listener. A port
 can't be both, so give tilt's UDP side its own port, and tell tilt the public address Sail
 gives it:
