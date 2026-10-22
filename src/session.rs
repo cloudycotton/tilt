@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::{AuthError, Role, AUTH_FAIL_DELAY};
-use crate::clock::{self, LogEvery};
+use crate::clock::LogEvery;
 use crate::control::ControlStatus;
 use crate::input::InputCmd;
 use crate::protocol::{self, ClientMsg, ClientText, ErrorCode, ScreenSize, ServerText};
@@ -51,9 +51,9 @@ pub struct SessionStatus {
     pub rtt_ms: f32,
 }
 
-/// Live sessions: admission against `--max-viewers`, ids, and the numbers behind /api/status.
+/// Live sessions: ids, and the numbers behind /api/status. There is no viewer limit: anyone
+/// with the link may watch, and control (src/control.rs) is what only one session holds.
 pub struct Sessions {
-    max: usize,
     /// Shared with the cursor thread, which polls faster while anyone watches.
     viewers: Arc<AtomicUsize>,
     next_id: AtomicU64,
@@ -69,28 +69,7 @@ struct Live {
     fps: f32,
     kbps: f32,
     rtt_ms: f32,
-    liveness: Arc<Liveness>,
-    /// Told to close to make room; no longer counts against `--max-viewers`.
-    evicted: bool,
 }
-
-/// When a session last heard from its client, and the flag that closes it to make room for a
-/// new one (see `Sessions::register`).
-#[derive(Debug)]
-pub struct Liveness {
-    /// clock::now_us() at the last message from the client.
-    heard_us: AtomicU64,
-    evict: watch::Sender<bool>,
-}
-
-impl Liveness {
-    fn heard(&self) {
-        self.heard_us.store(clock::now_us(), Ordering::Relaxed);
-    }
-}
-
-/// Clients PING every second; one silent this long has most likely lost its network.
-const EVICT_SILENT_US: u64 = 5_000_000;
 
 /// Where this server's session ids start. Random, so that a page reconnecting to a restarted
 /// server does not take a new session holding control for its own lost one (see
@@ -102,9 +81,8 @@ fn first_session_id() -> u64 {
 }
 
 impl Sessions {
-    pub fn new(max_viewers: usize) -> Sessions {
+    pub fn new() -> Sessions {
         Sessions {
-            max: max_viewers,
             viewers: Arc::new(AtomicUsize::new(0)),
             next_id: AtomicU64::new(first_session_id()),
             live: Mutex::new(HashMap::new()),
@@ -122,39 +100,13 @@ impl Sessions {
         self.viewers.load(Ordering::Relaxed)
     }
 
-    /// Admits a session and counts it as a viewer; None when the server is shutting down, or
-    /// when `--max-viewers` are live and none of them has been silent for 5 s. If one has, the
-    /// longest-silent one is told to close (through its Liveness) to make room: a phone that
-    /// changes networks leaves a dead session behind, which would otherwise hold its place
-    /// for up to 30 s (addition to brief 4.1).
-    pub fn register(&self, role: Role) -> Option<(SessionId, Arc<Liveness>)> {
-        self.admit(role, clock::now_us())
-    }
-
-    fn admit(&self, role: Role, now_us: u64) -> Option<(SessionId, Arc<Liveness>)> {
+    /// Admits a session and counts it as a viewer; None only when the server is shutting down.
+    pub fn register(&self, role: Role) -> Option<SessionId> {
         let mut live = self.lock();
         if self.is_closing() {
             return None;
         }
-        if live.values().filter(|s| !s.evicted).count() >= self.max {
-            let heard = |s: &Live| s.liveness.heard_us.load(Ordering::Relaxed);
-            let (&silent, s) = live
-                .iter_mut()
-                .filter(|(_, s)| !s.evicted)
-                .min_by_key(|(_, s)| heard(s))
-                .filter(|(_, s)| now_us.saturating_sub(heard(s)) > EVICT_SILENT_US)?;
-            s.evicted = true;
-            s.liveness.evict.send_replace(true);
-            info!(
-                session = silent,
-                "closing: silent for over 5 s, and a new client needs its place"
-            );
-        }
         let sid = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let liveness = Arc::new(Liveness {
-            heard_us: AtomicU64::new(now_us),
-            evict: watch::channel(false).0,
-        });
         live.insert(
             sid,
             Live {
@@ -162,12 +114,10 @@ impl Sessions {
                 fps: 0.0,
                 kbps: 0.0,
                 rtt_ms: 0.0,
-                liveness: Arc::clone(&liveness),
-                evicted: false,
             },
         );
         self.counted(live.len());
-        Some((sid, liveness))
+        Some(sid)
     }
 
     pub fn unregister(&self, sid: SessionId) {
@@ -252,7 +202,7 @@ fn close_frame(code: u16, reason: &'static str) -> CloseFrame {
 
 /// Runs one session until it closes.
 pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
-    let Some((sid, role, liveness)) = handshake(&mut sink, &mut stream, &state).await else {
+    let Some((sid, role)) = handshake(&mut sink, &mut stream, &state).await else {
         // Delivers the refusal before the connection goes: over WebTransport, dropping the
         // sink would discard what the client has not acknowledged yet.
         let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
@@ -283,7 +233,6 @@ pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
                 role,
                 state: &state,
                 inbox: &inbox,
-                liveness: &liveness,
                 replies: &reply_tx,
                 malformed: 0,
                 held_keys: HashSet::new(),
@@ -358,7 +307,7 @@ async fn handshake(
     sink: &mut Sink,
     stream: &mut Stream,
     state: &AppState,
-) -> Option<(SessionId, Role, Arc<Liveness>)> {
+) -> Option<(SessionId, Role)> {
     let hello = match tokio::time::timeout(HELLO_TIMEOUT, first_message(stream)).await {
         Err(_) => {
             reject(sink, ErrorCode::HelloTimeout, "no hello within 5 s").await;
@@ -410,8 +359,12 @@ async fn handshake(
         .await;
         return None;
     }
-    let Some((sid, liveness)) = state.sessions.register(role) else {
-        reject(sink, ErrorCode::Busy, "too many viewers").await;
+    let Some(sid) = state.sessions.register(role) else {
+        let _ = send_closing(
+            sink,
+            close_frame(protocol::CLOSE_GOING_AWAY, "shutting down"),
+        )
+        .await;
         return None;
     };
     debug!(
@@ -419,7 +372,7 @@ async fn handshake(
         client = client.as_deref().unwrap_or("?"),
         "hello"
     );
-    Some((sid, role, liveness))
+    Some((sid, role))
 }
 
 /// The first message; None when the peer goes away first.
@@ -463,7 +416,6 @@ struct Reader<'a> {
     role: Role,
     state: &'a AppState,
     inbox: &'a Inbox,
-    liveness: &'a Liveness,
     replies: &'a mpsc::Sender<OutMsg>,
     malformed: u32,
     /// What this session pressed through us, for the 3 s release.
@@ -478,7 +430,6 @@ impl Reader<'_> {
     /// Until the peer goes away (None) or the session should close with the returned frame.
     async fn run(&mut self, stream: &mut Stream) -> (Option<CloseFrame>, &'static str) {
         let mut last_heard = Instant::now();
-        let mut evict = self.liveness.evict.subscribe();
         loop {
             let idle_at = last_heard + IDLE_CLOSE;
             let wake_at = if self.holding() {
@@ -488,12 +439,6 @@ impl Reader<'_> {
             };
             let msg = tokio::select! {
                 m = stream.next() => m,
-                () = until_set(&mut evict) => {
-                    return (
-                        Some(close_frame(protocol::CLOSE_NORMAL, "silent; another client took the place")),
-                        "silent for 5 s while the server was full",
-                    );
-                }
                 _ = tokio::time::sleep_until(wake_at.into()) => {
                     if Instant::now() >= idle_at {
                         return (Some(close_frame(protocol::CLOSE_NORMAL, "idle")), "idle for 30 s");
@@ -508,7 +453,6 @@ impl Reader<'_> {
                 }
             };
             last_heard = Instant::now();
-            self.liveness.heard();
             match msg {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
                     return (None, "closed by the client")
@@ -806,13 +750,16 @@ mod tests {
 
     #[test]
     fn admission_ids_and_status_rows() {
-        let s = Sessions::new(2);
-        let a = s.register(Role::Control).unwrap().0;
-        let b = s.register(Role::View).unwrap().0;
+        let s = Sessions::new();
+        let a = s.register(Role::Control).unwrap();
+        let b = s.register(Role::View).unwrap();
         assert_ne!(a, b);
         assert_eq!(s.count(), 2);
         assert_eq!(s.viewer_counter().load(Ordering::Relaxed), 2);
-        assert!(s.register(Role::View).is_none(), "max viewers");
+        // No viewer limit.
+        let many: Vec<SessionId> = (0..20).map(|_| s.register(Role::View).unwrap()).collect();
+        assert_eq!(s.count(), 22);
+        many.into_iter().for_each(|id| s.unregister(id));
 
         s.update_stats(b, 59.5, 2400.0, 12.5);
         s.update_stats(77, 1.0, 1.0, 1.0);
@@ -837,10 +784,10 @@ mod tests {
         s.unregister(a);
         s.unregister(a);
         assert_eq!(s.count(), 1);
-        let c = s.register(Role::View).unwrap().0;
+        let c = s.register(Role::View).unwrap();
         assert!(c > b, "ids are never reused");
         // Nor are they across restarts (but for a one-in-a-million chance).
-        let again = Sessions::new(2).register(Role::Control).unwrap().0;
+        let again = Sessions::new().register(Role::Control).unwrap();
         assert_ne!(again, a, "a restarted server numbers its sessions afresh");
         s.close_all();
         s.unregister(b);
@@ -853,38 +800,10 @@ mod tests {
         assert_eq!(s.count(), 0);
     }
 
-    #[test]
-    fn a_full_server_closes_the_longest_silent_session_to_admit_a_new_one() {
-        const SEC: u64 = 1_000_000;
-        let s = Sessions::new(2);
-        let t0 = 100 * SEC;
-        let (a, a_live) = s.admit(Role::Control, t0).unwrap();
-        let (b, b_live) = s.admit(Role::View, t0).unwrap();
-        let evicted = |l: &Liveness| *l.evict.borrow();
-        b_live.heard_us.store(t0 + 2 * SEC, Ordering::Relaxed);
-        // Nobody silent for over 5 s: busy.
-        assert!(s.admit(Role::View, t0 + 5 * SEC).is_none());
-        assert!(!evicted(&a_live) && !evicted(&b_live));
-        // `a` is: it is told to close, and the newcomer gets its place at once.
-        let (c, c_live) = s.admit(Role::View, t0 + 5 * SEC + 1).unwrap();
-        assert!(evicted(&a_live) && !evicted(&b_live));
-        assert_eq!(s.count(), 3, "a counts as a viewer until it has gone");
-        // `a` is not picked twice; `b` is not silent long enough yet, `c` just came.
-        assert!(s.admit(Role::View, t0 + 6 * SEC).is_none());
-        s.unregister(a);
-        // Then `b` is the longest silent.
-        let (d, _) = s.admit(Role::View, t0 + 8 * SEC).unwrap();
-        assert!(evicted(&b_live) && !evicted(&c_live));
-        let ids: Vec<String> = s.snapshot(None).into_iter().map(|r| r.id).collect();
-        assert_eq!(ids, [b, c, d].map(|id| format!("s{id}")));
-        s.close_all();
-        assert!(s.admit(Role::View, t0 + 60 * SEC).is_none(), "closing");
-    }
-
     #[tokio::test]
     async fn drained_waits_for_the_last_session() {
-        let s = Arc::new(Sessions::new(4));
-        let a = s.register(Role::View).unwrap().0;
+        let s = Arc::new(Sessions::new());
+        let a = s.register(Role::View).unwrap();
         let waiter = tokio::spawn({
             let s = Arc::clone(&s);
             async move { s.drained().await }

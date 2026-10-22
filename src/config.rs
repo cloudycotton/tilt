@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::builder::{BoolishValueParser, RangedI64ValueParser, RangedU64ValueParser};
+use clap::builder::{BoolishValueParser, RangedI64ValueParser};
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
@@ -102,9 +102,10 @@ pub struct Config {
     #[arg(long, env = "TILT_RC_FRAME_SKIP", value_parser = BoolishValueParser::new())]
     pub rc_frame_skip: bool,
 
-    /// Maximum simultaneous viewers
-    #[arg(long, env = "TILT_MAX_VIEWERS", default_value_t = 4, value_parser = RangedU64ValueParser::<usize>::new().range(1..))]
-    pub max_viewers: usize,
+    /// Ignored: there is no viewer limit any more. Still accepted so that existing launch
+    /// scripts keep working.
+    #[arg(long, env = "TILT_MAX_VIEWERS", hide = true, value_name = "N")]
+    pub max_viewers: Option<String>,
 
     /// UDP port tilt listens on for the stream (WebTransport) [default: the --bind port]
     #[arg(long, env = "TILT_UDP_PORT", value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
@@ -328,10 +329,7 @@ mod tests {
             (60, 8000, 1000, 20000)
         );
         assert_eq!((c.qp_min, c.qp_max, c.profile), (20, 28, Profile::High));
-        assert_eq!(
-            (c.tail_frames, c.rc_frame_skip, c.max_viewers),
-            (30, false, 4)
-        );
+        assert_eq!((c.tail_frames, c.rc_frame_skip), (30, false));
         assert_eq!(c.poll_ms, 1000);
     }
 
@@ -343,6 +341,14 @@ mod tests {
         for bad in ["1024", "0x720", "1024x", "8x8", "5000x720", "axb"] {
             assert!(parse(&["--no-auth", "--resize", bad]).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn max_viewers_is_accepted_and_ignored() {
+        // Launch scripts written for the old viewer limit keep working.
+        let c = parse(&["--token", "t", "--max-viewers", "2"]).unwrap();
+        assert_eq!(c.max_viewers.as_deref(), Some("2"));
+        assert!(parse(&["--token", "t"]).unwrap().max_viewers.is_none());
     }
 
     #[test]
@@ -429,7 +435,6 @@ mod tests {
             &["--tail-stop-bytes", "0"],
             &["--bitrate-kbps", "500"],
             &["--bitrate-kbps", "30000"],
-            &["--max-viewers", "0"],
             &["--profile", "main"],
             &["--bind", "localhost"],
         ] {

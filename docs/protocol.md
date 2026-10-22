@@ -55,10 +55,10 @@ All binary integers are little-endian. Every message is either:
 6. If `v != 1`, the server replies `{"t":"error","code":"version","msg":...}` and closes.
 7. If the token is wrong, the server sleeps 500 ms, then sends `{"t":"error","code":"auth"}` and
    closes.
-8. If viewers already number `--max-viewers`, the server sends `{"t":"error","code":"busy"}` and
-   closes, unless one of those sessions has sent nothing for over 5 s: then the longest-silent
-   one is closed (1000) and the new one admitted. If the token file is missing or holds no
-   token yet, it sends `{"t":"error","code":"not_ready"}` and closes.
+8. There is no limit on viewers: any number of sessions may watch, and control (section 4)
+   is what only one holds. If the token file is missing or holds no token yet, the server
+   sends `{"t":"error","code":"not_ready"}` and closes. (Servers before 0.4 had a viewer limit
+   and answered `{"t":"error","code":"busy"}`, closing with 4002; clients should retry then.)
 9. On success the server sends, in this order:
    - `{"t":"welcome","v":1,"session":"s7","role":"control"|"view","screen":{"w":W,"h":H},"server":"tilt/0.1.0","resize":bool}`
    - `{"t":"control","you":bool,"held":bool,"holder":"s3"}` (see section 4)
@@ -68,12 +68,12 @@ All binary integers are little-endian. Every message is either:
 
 | code | meaning |
 |---|---|
-| 1000 | normal; also sent after 30 s without any client message (reason `idle`), and to a session silent for over 5 s whose place a new client takes (see 1.8) |
+| 1000 | normal; also sent after 30 s without any client message (reason `idle`) |
 | 1001 | the server is shutting down |
 | 1008 | more than 100 malformed messages |
 | 1011 | server-side failure (the session's encoder thread could not start or stopped) |
 | 4001 | auth: wrong or missing token, or the first message was not `hello` |
-| 4002 | busy: `--max-viewers` sessions are already connected |
+| 4002 | busy: only from servers before 0.4, which had a viewer limit |
 | 4003 | version: `v` is not 1 |
 | 4004 | not_ready: the token file is missing or holds no token yet |
 | 4005 | hello timeout: no `hello` within 5 s |
@@ -197,7 +197,7 @@ Server to client:
   rate cap in force (`--max-fps`); `qp` is the mean quantizer of the last second's frames, 0
   when there were none. `patches` is how many of the last second's `fps` were patches; `enc_ms`
   and `qp` cover the H.264 frames only.
-- `{"t":"error","code":"auth"|"busy"|"version"|"not_ready"|"forbidden"|"hello_timeout"|"unsupported_size","msg":"…"}`.
+- `{"t":"error","code":"auth"|"version"|"not_ready"|"forbidden"|"hello_timeout"|"unsupported_size","msg":"…"}`.
   `unsupported_size` means the encoder cannot take the screen's size (smaller than 16×16, or
   more than 36864 macroblocks, about 4096×2304). The session stays open without video; when the
   screen changes to a size that works, `screen` and a KEY frame follow.
@@ -215,8 +215,6 @@ Unknown fields in client JSON are ignored. A repeated `hello` after the handshak
   - If a controlling session sends nothing for 3 s while it holds keys or buttons, release them.
     The session stays open.
   - If a session sends nothing for 30 s, close it (1000, `idle`).
-  - When `--max-viewers` sessions are open and a new client's `hello` succeeds, close the one
-    that has sent nothing for longest, if that is over 5 s (1000), and admit the new client.
   - Close a session whose write blocks for more than 10 s.
   - QUIC keep-alive every 5 s; a peer silent for 25 s (vanished without closing) is dropped.
   - More than 100 malformed messages in one session close it (1008).

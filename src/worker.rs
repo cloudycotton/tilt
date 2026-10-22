@@ -492,6 +492,14 @@ impl Worker {
             self.flow.on_ack(seq, decode_ms, at);
         }
         if let Some(on) = p.video {
+            if self.video_on && !on && self.enc.is_some() {
+                // A hidden page keeps its session but needs no encoder: give its memory back
+                // (several MB at 720p). Resuming forces a keyframe anyway, so a new encoder
+                // costs only its setup.
+                self.enc = None;
+                self.last_au = None;
+                crate::release_memory();
+            }
             self.video_on = on;
         }
         if p.idr {
@@ -1439,6 +1447,32 @@ mod tests {
         assert_eq!(w.flow.stats().inflight_frames, 0);
         w.step().unwrap();
         assert!(!w.state.hub.demand());
+    }
+
+    #[test]
+    fn a_paused_session_holds_no_encoder_and_resumes_on_a_keyframe() {
+        let (mut w, mut rx, pool) = worker(&["--tail-frames", "0"]);
+        publish(&w, &pool, 1, SIZE);
+        assert_eq!(step_until_sent(&mut w, &mut rx).len(), 1);
+        assert!(w.enc.is_some());
+        w.inbox.video(false);
+        let pending = w.inbox.take();
+        w.apply(pending);
+        assert!(
+            w.enc.is_none(),
+            "the encoder's memory is given back while hidden"
+        );
+        w.inbox.video(true);
+        let pending = w.inbox.take();
+        w.apply(pending);
+        publish(&w, &pool, 2, SIZE);
+        let video = step_until_sent(&mut w, &mut rx);
+        assert!(w.enc.is_some());
+        assert_ne!(
+            video[0].flags & FLAG_KEY,
+            0,
+            "a keyframe from the new encoder"
+        );
     }
 
     #[test]

@@ -79,7 +79,7 @@ test('a wrong token stops retrying and asks for a token', async ({ page, mock })
   expect(await page.evaluate(() => window.tilt.stats.role)).toBe('control');
 });
 
-test.describe('one viewer at most', () => {
+test.describe('an older server with a viewer limit', () => {
   test.use({ mockOptions: { maxViewers: 1 } });
 
   test('a busy server is retried until a slot frees up', async ({ browser, mock }) => {

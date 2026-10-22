@@ -121,6 +121,9 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
             cfg.bind
         );
     }
+    if cfg.max_viewers.is_some() {
+        info!("--max-viewers is ignored: any number may watch, and one at a time controls");
+    }
     assets::init();
     // Compressing the assets used some memory that is free again now.
     release_memory();
@@ -139,7 +142,7 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
         Arc::clone(&shutdown),
     )
     .context("starting screen capture")?;
-    let sessions = Sessions::new(cfg.max_viewers);
+    let sessions = Sessions::new();
     let (cursor, cursor_thread) = x11::cursor::spawn_cursor_thread(
         cfg.display.clone(),
         sessions.viewer_counter(),

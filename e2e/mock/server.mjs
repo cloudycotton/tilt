@@ -8,7 +8,7 @@
 //
 //   node server.mjs [--port 6090] [--host 127.0.0.1] [--token devtoken] [--view-token viewtoken]
 //                   [--no-auth] [--token-file PATH] [--stream high_1280x720] [--fps 30]
-//                   [--max-msg-bytes 262144] [--max-viewers 4] [--window 4] [--no-loop]
+//                   [--max-msg-bytes 262144] [--max-viewers N] [--window 4] [--no-loop]
 //                   [--log FILE] [--quiet]
 import fs from 'node:fs';
 import http from 'node:http';
@@ -28,6 +28,7 @@ const ASSETS = {
   '/keysyms.js': ['keysyms.js', 'text/javascript; charset=utf-8'],
   '/transport.js': ['transport.js', 'text/javascript; charset=utf-8'],
   '/icon.svg': ['icon.svg', 'image/svg+xml'],
+  '/runable.svg': ['runable.svg', 'image/svg+xml'],
 };
 
 const VIDEO = 0x01;
@@ -62,7 +63,8 @@ export const DEFAULTS = {
   viewToken: 'viewtoken',
   noAuth: false,
   tokenFile: null, // read on every hello, like TILT_TOKEN_FILE; missing file -> not_ready
-  maxViewers: 4,
+  // tilt has no viewer limit; tests set one to check how the page handles an older server's busy.
+  maxViewers: Infinity,
   resize: false, // like --resize: control sessions may send `resize`, which is recorded
   maxMsgBytes: 262144,
   fps: 30,

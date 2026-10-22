@@ -32,6 +32,20 @@ const GIVE_UP_AFTER_FAILURES = 4;
 const TOOLBAR_HIDE_MS = 3000;
 const TOAST_MS = 3500;
 const PROBE_MAX_EVENTS = 10000;
+// Playout smoothing (see `pace`): frames are shown on the server's capture rhythm, delayed by
+// what the network's jitter needs (how late frames came: the LATE_PERCENTILE of the last
+// LATE_SAMPLES, plus LATE_MARGIN_MS), up to SMOOTH_MAX_MS. The first update after SMOOTH_IDLE_MS without one is
+// shown at once, so typing and clicks are not delayed; continuous motion is smoothed.
+const SMOOTH_MAX_MS = 45;
+const SMOOTH_IDLE_MS = 120;
+const SMOOTH_WINDOW_MS = 4000;
+const LATE_SAMPLES = 120;
+const LATE_PERCENTILE = 0.95;
+const LATE_MARGIN_MS = 3;
+// Decoded frames held for later beyond this are dropped: hardware decoders have few buffers.
+const SMOOTH_MAX_HELD = 3;
+// An animation frame booked this long ago and still not run: draw without it.
+const RAF_LATE_MS = 100;
 const CURSOR_CACHE = 64;
 // Chrome and Firefox ignore CSS cursor images larger than 128x128.
 const CSS_CURSOR_MAX = 128;
@@ -155,6 +169,9 @@ function readOptions() {
     probe: probe.length === 2 && probe.every((v) => Number.isInteger(v) && v >= 0) ? probe : null,
     scale: get('scale') === '1' ? '1' : 'fit',
     framing: get('framing') === 'avcc' ? 'avcc' : 'annexb',
+    smooth: get('smooth') !== '0',
+    // No controls of our own: the host page draws them (see `host`).
+    embed: get('embed') === '1',
   };
 }
 
@@ -190,6 +207,8 @@ const stats = {
   // Beyond the brief's list: the server's session id and the H.264 framing in use (annexb | avcc).
   session: '',
   framing: opts.framing,
+  // Beyond the brief's list: the playout delay that smooths network jitter, in ms.
+  smoothMs: 0,
 };
 const probeEvents = [];
 
@@ -230,10 +249,16 @@ const video = {
   flush: null, // a watchdog flush in progress: { at, seq, decoded }
   needKey: true,
   pending: new Map(), // seq -> receive time, in seq order, until acked
-  // Frames and patches not drawn yet, in seq order: { seq, frame, patch, done }. A frame is
-  // done once it came out of the decoder (`frame`) or never will; a patch is done on arrival.
+  // Frames and patches not drawn yet, in seq order: { seq, cap, due, frame, patch, done }. A
+  // frame is done once it came out of the decoder (`frame`) or never will; a patch is done on
+  // arrival. `cap` is the server's capture time in ms, `due` when to show it (see `pace`).
   queue: [],
+  // Playout smoothing: the windowed minimum of (ready time - capture time), as [at, offset]
+  // pairs (a monotonic deque), recent lateness samples above that minimum, the delay in force,
+  // and when the canvas last changed.
+  pace: { mins: [], late: [], delay: 0, lastDrawAt: -Infinity },
   raf: 0, // the next refresh is booked: what is ready until then waits for it
+  rafAt: 0, // when it was booked
   lastIdrAt: -Infinity,
   idrTimer: 0,
   sizeNotice: false, // the server cannot encode the screen at its size (until its next KEY frame)
@@ -473,6 +498,7 @@ function onControl(m) {
   input.setEnabled(you);
   if (you && finePointer.matches && !touchDevice) input.focusKeyboard();
   updateControls();
+  host.changed();
   applyCursor();
   maybeTake();
 }
@@ -586,12 +612,13 @@ function onVideo(buf) {
   const dv = new DataView(buf);
   const flags = dv.getUint8(1);
   const seq = dv.getUint32(2, true);
+  const cap = Number(dv.getBigUint64(6, true)) / 1000;
   const width = dv.getUint16(14, true);
   const height = dv.getUint16(16, true);
   stats.bytes += buf.byteLength;
   const data = new Uint8Array(buf, VIDEO_HEADER);
-  if (flags & FLAG_PATCH) onPatch(seq, width, height, data);
-  else onAccessUnit(seq, (flags & FLAG_KEY) !== 0, width, height, data);
+  if (flags & FLAG_PATCH) onPatch(seq, cap, width, height, data);
+  else onAccessUnit(seq, cap, (flags & FLAG_KEY) !== 0, width, height, data);
 }
 
 /** Acks a frame that will not be decoded (decode_ms 0) and asks for a keyframe. */
@@ -602,7 +629,7 @@ function skipFrame(seq) {
   requestIdr();
 }
 
-function onAccessUnit(seq, key, width, height, data) {
+function onAccessUnit(seq, cap, key, width, height, data) {
   stats.lastSeq = seq;
   if (key) {
     stats.keyframes++;
@@ -617,7 +644,7 @@ function onAccessUnit(seq, key, width, height, data) {
     return;
   }
   video.pending.set(seq, performance.now());
-  video.queue.push({ seq, frame: null, patch: null, done: false });
+  video.queue.push({ seq, cap, due: 0, frame: null, patch: null, done: false });
   try {
     video.decoder.decode(new EncodedVideoChunk({
       type: key ? 'key' : 'delta',
@@ -707,6 +734,7 @@ function closeDecoder(ack) {
   video.pending.clear();
   for (const u of video.queue) if (u.frame) u.frame.close();
   video.queue = [];
+  video.pace = { mins: [], late: [], delay: 0, lastDrawAt: -Infinity };
 }
 
 function decoderFailed(e) {
@@ -777,17 +805,50 @@ function onDecoded(decoder, frame) {
   conn.attempt = 0;
   const seq = Math.round(frame.timestamp / 1000);
   const u = video.queue.find((q) => q.seq === seq && !q.done);
-  if (u) u.frame = frame;
-  else frame.close();
+  if (u) {
+    u.frame = frame;
+    pace(u);
+  } else {
+    frame.close();
+  }
   ackThrough(seq);
 }
 
 /** A patch: what changed since the last frame or patch, as pixels (src/video/patch.rs). */
-function onPatch(seq, width, height, data) {
+function onPatch(seq, cap, width, height, data) {
   stats.lastSeq = seq;
   video.pending.set(seq, performance.now());
-  video.queue.push({ seq, frame: null, patch: { width, height, data }, done: true });
+  const u = { seq, cap, due: 0, frame: null, patch: { width, height, data }, done: true };
+  pace(u);
+  video.queue.push(u);
   settle();
+}
+
+/**
+ * Sets when update `u`, ready now, is due on screen. The server's capture clock and ours differ
+ * by an unknown offset plus the trip; the smallest (ready - capture) over the last few seconds
+ * stands for the offset plus the fastest trip, and how far each update came after that is its
+ * lateness. Showing every update `delay` after its fastest possible time, with `delay` about the 95th
+ * percentile of lateness, spaces updates as they were captured: network jitter, encode times
+ * and decode times no longer bunch them up or leave gaps. Lateness from a rare loss stall stays
+ * above the percentile and does not inflate the delay.
+ */
+function pace(u) {
+  const p = video.pace;
+  const now = performance.now();
+  const offset = now - u.cap;
+  while (p.mins.length && p.mins[p.mins.length - 1][1] >= offset) p.mins.pop();
+  p.mins.push([now, offset]);
+  while (p.mins[0][0] < now - SMOOTH_WINDOW_MS) p.mins.shift();
+  const base = p.mins[0][1];
+  p.late.push(offset - base);
+  if (p.late.length > LATE_SAMPLES) p.late.shift();
+  const sorted = [...p.late].sort((a, b) => a - b);
+  const want = Math.min(SMOOTH_MAX_MS, sorted[Math.floor(sorted.length * LATE_PERCENTILE)] + LATE_MARGIN_MS);
+  // Up at once when the network gets worse, down slowly when it calms.
+  p.delay = want > p.delay ? want : p.delay + (want - p.delay) * 0.05;
+  stats.smoothMs = Math.round(p.delay);
+  u.due = u.cap + base + p.delay;
 }
 
 /**
@@ -798,13 +859,36 @@ function onPatch(seq, width, height, data) {
  * for it. So the canvas is drawn at most once per refresh: drawing each frame as it came made a
  * busy main thread on a loaded machine fall behind the decoder.
  */
-function refresh() {
+function refresh(frameTime) {
+  const now = performance.now();
+  const smoothing = opts.smooth && now - video.pace.lastDrawAt < SMOOTH_IDLE_MS;
+  // While motion goes on, draw only at the start of a display refresh (an animation frame),
+  // whatever is due by the middle of it: drawn between refreshes, updates due a frame apart
+  // would land on refreshes one or two apart, by chance. After a quiet spell, draw at once.
+  if (smoothing && frameTime === undefined) {
+    bookRefresh();
+    return;
+  }
+  const until = smoothing ? frameTime + 8 : Infinity;
+  let ready = 0;
+  while (ready < video.queue.length && video.queue[ready].done) ready++;
   let n = 0;
   let newest = -1;
-  while (n < video.queue.length && video.queue[n].done) {
+  while (n < ready && video.queue[n].due <= until) {
     if (video.queue[n].frame) newest = n;
     n++;
   }
+  // Too many decoded frames waiting: show the older ones' successor now.
+  let held = 0;
+  for (let i = n; i < ready; i++) if (video.queue[i].frame) held++;
+  while (held > SMOOTH_MAX_HELD && n < ready) {
+    if (video.queue[n].frame) {
+      newest = n;
+      held--;
+    }
+    n++;
+  }
+  const waiting = ready > n;
   let drew = false;
   video.queue.splice(0, n).forEach((u, i) => {
     if (i < newest) {
@@ -816,12 +900,19 @@ function refresh() {
       drew = drawPatch(u.seq, u.patch) || drew;
     }
   });
-  if (drew) video.raf = requestAnimationFrame(nextRefresh);
+  if (drew) video.pace.lastDrawAt = now;
+  // Drawn: no more until the next refresh. Updates still to come due: look again then.
+  if (drew || waiting) bookRefresh();
 }
 
-function nextRefresh() {
+function bookRefresh() {
+  video.raf = requestAnimationFrame(nextRefresh);
+  video.rafAt = performance.now();
+}
+
+function nextRefresh(frameTime) {
   video.raf = 0;
-  refresh();
+  refresh(frameTime);
 }
 
 /**
@@ -881,7 +972,15 @@ function settle() {
     d.setUint16(5, Math.min(65535, Math.round(now - at)), true);
     wsSend(b);
   }
-  if (!video.raf) refresh();
+  if (!video.raf) {
+    refresh();
+  } else if (performance.now() - video.rafAt > RAF_LATE_MS) {
+    // Animation frames stopped (a browser throttles them in an iframe it deems out of sight):
+    // draw without them rather than hold decoded frames.
+    cancelAnimationFrame(video.raf);
+    video.raf = 0;
+    refresh(performance.now());
+  }
 }
 
 function requestIdr() {
@@ -908,6 +1007,7 @@ function draw(frame) {
     stats.width = w;
     stats.height = h;
     layout();
+    host.changed();
   }
   ctx.drawImage(frame, 0, 0);
   stats.lastDrawnSeq = Math.round(frame.timestamp / 1000);
@@ -1301,6 +1401,7 @@ function setDot(state, label) {
   ui.dot.className = state;
   ui.dot.title = label;
   ui.dot.setAttribute('aria-label', label);
+  host.changed();
 }
 
 function updateControls() {
@@ -1338,12 +1439,21 @@ function showOverlay(title, detail = '', { retry = false, askToken = false } = {
   ui.tokenForm.hidden = !askToken;
   ui.overlay.classList.toggle('solid', !ui.canvas.width);
   ui.overlay.hidden = false;
+  const root = document.documentElement;
+  root.classList.toggle('waiting', !ui.canvas.width);
+  // The status animation plays once per call (each connection attempt): restart it.
+  root.classList.remove('attempt');
+  void root.offsetWidth;
+  root.classList.add('attempt');
   showToolbar();
+  host.changed();
 }
 
 function hideOverlay() {
   ui.overlay.hidden = true;
+  document.documentElement.classList.remove('waiting', 'attempt');
   armToolbarHide();
+  host.changed();
 }
 
 function showFatal() {
@@ -1354,6 +1464,7 @@ function showFatal() {
 
 let toastTimer = 0;
 function toast(text) {
+  host.post({ type: 'tilt:notice', text });
   ui.toast.textContent = text;
   ui.toast.hidden = false;
   clearTimeout(toastTimer);
@@ -1468,7 +1579,7 @@ function updateStats(now) {
   const n = (v, digits = 1) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(Number.isInteger(v) ? 0 : digits) : '-');
   const s = serverStats || {};
   ui.stats.textContent = [
-    `fps    ${n(rates.fpsDecoded)} decoded  ${n(rates.fpsDrawn)} drawn  ${n(rates.patchesPerS)} patches`,
+    `fps    ${n(rates.fpsDecoded)} decoded  ${n(rates.fpsDrawn)} drawn  ${n(rates.patchesPerS)} patches  smooth ${opts.smooth ? `${stats.smoothMs} ms` : 'off'}`,
     `recv   ${n(rates.kbps, 0)} kbps   ping ${stats.rttMs ?? '-'} ms`,
     `video  ${stats.width}x${stats.height} ${stats.codec || '-'} ${video.framing}${video.hw === 'prefer-software' ? ' software' : ''}  queue ${video.decoder ? video.decoder.decodeQueueSize : 0}`,
     `you    ${stats.role ? `${stats.role} role` : '-'}${stats.control ? ', in control' : ''}  errors ${stats.decodeErrors}  stalls ${stats.decoderStalls}`,
@@ -1595,6 +1706,14 @@ function wireUi() {
   });
 
   ui.retry.addEventListener('click', reconnect);
+  window.addEventListener('message', (e) => host.onMessage(e));
+  // Embedded, the screen has no Control button: pressing on it takes control (from whoever has
+  // it: the last to take control has it). That first press only takes control.
+  if (opts.embed) {
+    ui.viewport.addEventListener('pointerdown', () => {
+      if (conn.welcomed && stats.role === 'control' && !stats.control) takeControl();
+    }, true);
+  }
   ui.tokenForm.addEventListener('submit', (e) => {
     e.preventDefault();
     token = ui.tokenInput.value.trim();
@@ -1644,6 +1763,80 @@ function wireUi() {
     vv.addEventListener('scroll', onViewport);
   }
 }
+
+/**
+ * The embedding page (docs/guide.md, "Embedding"). Inside a frame, every change of state is
+ * posted to the parent as `{type: 'tilt:state', status, message, detail, control, held, role,
+ * session, screen}`, and notices as `{type: 'tilt:notice', text}`. The parent, and only the
+ * parent, may send `{type: 'tilt:control', take}`, `{type: 'tilt:type', text}`,
+ * `{type: 'tilt:fullscreen'}`, `{type: 'tilt:reconnect'}`, `{type: 'tilt:stats', on}`,
+ * `{type: 'tilt:scale', mode: 'fit' | '1'}` and `{type: 'tilt:theme', theme: 'light' | 'dark' |
+ * 'system'}`.
+ */
+const host = {
+  framed: window.parent !== window,
+  queued: false,
+  last: '',
+  post(msg) {
+    if (!this.framed) return;
+    try { window.parent.postMessage(msg, '*'); } catch { /* the parent went away */ }
+  },
+  /** Posts the state once the current task is done, if it differs from the last one posted. */
+  changed() {
+    if (!this.framed || this.queued) return;
+    this.queued = true;
+    queueMicrotask(() => {
+      this.queued = false;
+      const state = this.state();
+      const json = JSON.stringify(state);
+      if (json === this.last) return;
+      this.last = json;
+      this.post(state);
+    });
+  },
+  state() {
+    const status = !ui.unsupported.hidden || conn.fatal ? 'error'
+      : conn.welcomed && ui.overlay.hidden ? 'live'
+        : conn.everWelcomed ? 'reconnecting' : 'connecting';
+    return {
+      type: 'tilt:state',
+      status,
+      message: ui.overlay.hidden ? '' : ui.overlayMsg.textContent,
+      detail: ui.overlay.hidden ? '' : ui.overlayDetail.textContent,
+      control: stats.control,
+      held: conn.held === true,
+      role: stats.role,
+      session: stats.session,
+      screen: { w: stats.width, h: stats.height },
+    };
+  },
+  onMessage(e) {
+    if (e.source !== window.parent || !e.data || typeof e.data !== 'object') return;
+    const m = e.data;
+    switch (m.type) {
+      case 'tilt:control':
+        if (m.take === false) {
+          wantControl = false;
+          sendJson({ t: 'control', take: false });
+        } else {
+          takeControl();
+        }
+        break;
+      case 'tilt:type':
+        if (typeof m.text === 'string' && m.text && stats.control) input.sendText(m.text);
+        break;
+      case 'tilt:fullscreen': toggleFullscreen(); break;
+      case 'tilt:reconnect': reconnect(); break;
+      case 'tilt:stats': setStats(m.on === true); break;
+      case 'tilt:scale': if (m.mode === 'fit' || m.mode === '1') setScaleMode(m.mode); break;
+      case 'tilt:theme':
+        if (m.theme === 'light' || m.theme === 'dark') document.documentElement.dataset.theme = m.theme;
+        else if (m.theme === 'system') delete document.documentElement.dataset.theme;
+        break;
+      default: break;
+    }
+  },
+};
 
 window.tilt = {
   get ws() { return conn.ws; },
