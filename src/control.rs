@@ -98,6 +98,17 @@ impl ControlState {
         holds
     }
 
+    /// Queues `cmd` unless another session holds control, and says whether it did: a viewer may
+    /// resize the screen while nobody drives it, but not under someone who does.
+    pub fn input_unless_held(&self, sid: SessionId, cmd: InputCmd) -> bool {
+        let inner = self.lock();
+        let free = inner.holder.is_none_or(|holder| holder == sid);
+        if free {
+            self.input.send(cmd);
+        }
+        free
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         // The state stays consistent across a panic elsewhere: every update is a single step.
         self.inner.lock().unwrap_or_else(|e| e.into_inner())

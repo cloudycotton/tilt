@@ -276,6 +276,7 @@ pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
                 role,
                 screen: ScreenSize { w, h },
                 server: protocol::SERVER_ID,
+                resize: state.cfg.resize.is_some() && role == Role::Control,
             };
             let mut reader = Reader {
                 sid,
@@ -630,6 +631,29 @@ impl Reader<'_> {
                 };
                 let _ = self.replies.try_send(OutMsg::Text(error.to_json()));
             }
+            ClientText::Resize { w, h } => match self.state.cfg.resize {
+                Some(min) if self.role == Role::Control => {
+                    let cmd = InputCmd::Resize {
+                        session: self.sid,
+                        w,
+                        h,
+                        min,
+                    };
+                    if !self.state.control.input_unless_held(self.sid, cmd) {
+                        debug!(
+                            session = self.sid,
+                            "resize ignored: another viewer holds control"
+                        );
+                    }
+                }
+                _ => {
+                    let error = ServerText::Error {
+                        code: ErrorCode::Forbidden,
+                        msg: Some("this session cannot resize the screen".into()),
+                    };
+                    let _ = self.replies.try_send(OutMsg::Text(error.to_json()));
+                }
+            },
             ClientText::Control { take: true } => self.state.control.take(self.sid),
             ClientText::Control { take: false } => self.state.control.release(self.sid),
             ClientText::Idr => self.inbox.request_idr(),

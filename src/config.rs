@@ -116,6 +116,11 @@ pub struct Config {
     #[arg(long, env = "TILT_UDP_PUBLIC", value_name = "[HOST:]PORT", value_parser = parse_udp_public)]
     pub udp_public: Option<UdpPublic>,
 
+    /// Let control viewers give the screen their window's shape, at least MIN (WxH) on each
+    /// side. Xvfb resizes only within its startup screen, so start it large
+    #[arg(long, env = "TILT_RESIZE", value_name = "MIN", value_parser = parse_size)]
+    pub resize: Option<(u32, u32)>,
+
     /// Safety full-frame compare interval while viewers wait, in ms, 0 = off
     #[arg(long, env = "TILT_POLL_MS", default_value_t = 1000)]
     pub poll_ms: u64,
@@ -267,6 +272,16 @@ fn parse_udp_public(s: &str) -> Result<UdpPublic, String> {
     Ok(UdpPublic { host, port })
 }
 
+/// `WxH`, each side 16 to 4096.
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let side = |v: &str| v.parse::<u32>().ok().filter(|v| (16..=4096).contains(v));
+    match s.split_once(['x', 'X']) {
+        Some((w, h)) => side(w).zip(side(h)),
+        None => None,
+    }
+    .ok_or_else(|| format!("{s:?} is not WxH with sides from 16 to 4096"))
+}
+
 fn kbps_to_bps(kbps: u32) -> u32 {
     kbps.saturating_mul(1000)
 }
@@ -318,6 +333,16 @@ mod tests {
             (30, false, 4)
         );
         assert_eq!(c.poll_ms, 1000);
+    }
+
+    #[test]
+    fn resize_takes_a_minimum_size() {
+        assert_eq!(parse(&["--no-auth"]).unwrap().resize, None);
+        let c = parse(&["--no-auth", "--resize", "1024x720"]).unwrap();
+        assert_eq!(c.resize, Some((1024, 720)));
+        for bad in ["1024", "0x720", "1024x", "8x8", "5000x720", "axb"] {
+            assert!(parse(&["--no-auth", "--resize", bad]).is_err(), "{bad}");
+        }
     }
 
     #[test]

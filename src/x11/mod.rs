@@ -4,6 +4,7 @@ pub mod conn;
 pub mod cursor;
 pub mod damage;
 pub mod grab;
+pub mod screen;
 
 /// Fixtures for the X tests, which are `#[ignore]`d because they need `Xvfb` and the X client
 /// tools (xsetroot, xrandr, xdotool) installed: run them in the tilt-dev image with

@@ -321,6 +321,11 @@ pub enum ClientText {
     Video {
         on: bool,
     },
+    /// With `--resize`: the viewer's window, in CSS pixels.
+    Resize {
+        w: u32,
+        h: u32,
+    },
 }
 
 /// A server -> client JSON message, tagged by `t`.
@@ -333,6 +338,8 @@ pub enum ServerText {
         role: Role,
         screen: ScreenSize,
         server: &'static str,
+        /// Whether this session may send `resize` (`--resize`, control role).
+        resize: bool,
     },
     Control {
         you: bool,
@@ -431,13 +438,14 @@ mod tests {
             role: Role::Control,
             screen: ScreenSize { w: 1920, h: 1080 },
             server: SERVER_ID,
+            resize: true,
         };
         assert_eq!(
             welcome.to_json(),
             concat!(
                 r#"{"t":"welcome","v":1,"session":"s7","role":"control","screen":{"w":1920,"h":1080},"server":"tilt/"#,
                 env!("CARGO_PKG_VERSION"),
-                r#""}"#
+                r#"","resize":true}"#
             )
         );
         assert_eq!(
@@ -519,6 +527,10 @@ mod tests {
         assert_eq!(
             parse(r#"{"t":"video","on":false,"extra":1}"#),
             ClientText::Video { on: false }
+        );
+        assert_eq!(
+            parse(r#"{"t":"resize","w":600,"h":900}"#),
+            ClientText::Resize { w: 600, h: 900 }
         );
         assert!(serde_json::from_str::<ClientText>(r#"{"t":"resize","w":1}"#).is_err());
         assert!(serde_json::from_str::<ClientText>(r#"{"v":1}"#).is_err());

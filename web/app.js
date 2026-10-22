@@ -268,6 +268,27 @@ function wsSend(data) {
 
 const sendJson = (obj) => wsSend(JSON.stringify(obj));
 
+// ---- resize: with --resize, the screen takes this window's shape once it stops changing
+
+const RESIZE_SETTLE_MS = 300;
+const resize = { allowed: false, timer: 0, sent: '' };
+
+function requestResize() {
+  if (!resize.allowed) return;
+  clearTimeout(resize.timer);
+  resize.timer = setTimeout(sendResize, RESIZE_SETTLE_MS);
+}
+
+// The window, not the viewport: an on-screen keyboard shrinks the viewport, which is no reason to
+// reshape the remote screen.
+function sendResize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  const size = `${w}x${h}`;
+  if (!resize.allowed || !w || !h || size === resize.sent) return;
+  if (sendJson({ t: 'resize', w, h })) resize.sent = size;
+}
+
 // ---- connection
 
 function connect() {
@@ -420,6 +441,9 @@ function onWelcome(m) {
   stats.session = String(m.session ?? '');
   conn.server = String(m.server ?? '');
   stats.role = m.role === 'control' ? 'control' : 'view';
+  resize.allowed = m.resize === true;
+  resize.sent = '';
+  sendResize();
   setDot('ok', 'Connected');
   updateControls();
   showToolbar();
@@ -1148,6 +1172,7 @@ function zoomLimits() {
 }
 
 function layout() {
+  requestResize();
   view.vw = ui.viewport.clientWidth;
   view.vh = ui.viewport.clientHeight;
   input.layoutChanged();

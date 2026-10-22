@@ -174,6 +174,7 @@ Every flag also has an environment variable. With none of `--token`, `--token-fi
 | `--no-auth` | `TILT_NO_AUTH` | off | everyone gets control. Local testing only |
 | `--max-viewers <N>` | `TILT_MAX_VIEWERS` | 4 | viewers at once (each one costs an encoder) |
 | `--max-fps <N>` | `TILT_MAX_FPS` | 60 | frame rate cap per viewer, 1 to 60 |
+| `--resize <MIN>` | `TILT_RESIZE` | off | the screen takes each control viewer's window shape, at least MIN (`WxH`) per side. Xvfb resizes only within its startup screen: start it large, e.g. `-screen 0 2560x1600x24` |
 
 <details>
 <summary>More flags</summary>
