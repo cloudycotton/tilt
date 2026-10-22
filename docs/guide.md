@@ -7,6 +7,8 @@ Pick what you need. Every section stands on its own.
 - [Run the binary](#run-the-binary): on your own machine or VM
 - [Network](#network): what has to reach the VM (Firecracker and other VMs)
 - [Sail](#sail): sandboxes with a public UDP port
+- [Embedding](#embedding): the screen alone inside your app, with your own controls
+- [Page options](#page-options): what the link's `#…` part can set
 - [Flags](#flags)
 - [Tips and limits](#tips-and-limits)
 - [Build](#build)
@@ -157,6 +159,62 @@ Read the token with `cat /run/tilt/token` and open `https://sb-<id>-6090.sail.bo
 Sail keeps a UDP port's public address while your org holds it, but can hand out a new one
 (another Sailbox took it over): write the address again whenever `expose` returns another.
 
+## Embedding
+
+To put the desktop inside your own app, load the link in an `<iframe>` with `embed=1` in its
+fragment:
+
+```html
+<iframe src="https://desk.example.com/#token=…&embed=1&theme=dark"
+        allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+```
+
+- The page is the screen alone: no toolbar, menu or notices. Draw your own controls around it.
+- Pressing on the screen takes control, from whoever has it (that first press only takes control).
+- `theme=light` or `theme=dark` matches your app; without it the page follows the system. The
+  page's own background shows only while there is no picture yet: the Runable mark, in dots.
+
+The page talks to its parent with `postMessage`. It posts:
+
+| message | when |
+|---|---|
+| `{type: 'tilt:state', status, message, detail, control, held, role, session, screen: {w, h}}` | on any change. `status` is `connecting`, `live`, `reconnecting` or `error`; `message` and `detail` say why while it is not `live`; `control` is whether this page has control, `held` whether anyone has |
+| `{type: 'tilt:notice', text}` | for what the standalone page would show as a toast |
+
+It obeys these, from its parent only:
+
+| message | does |
+|---|---|
+| `{type: 'tilt:control', take: true \| false}` | take or let go of control |
+| `{type: 'tilt:type', text}` | type text (with control) |
+| `{type: 'tilt:fullscreen'}` | toggle fullscreen (the iframe needs `allow="fullscreen"`) |
+| `{type: 'tilt:reconnect'}` | reconnect now |
+| `{type: 'tilt:theme', theme: 'light' \| 'dark' \| 'system'}` | switch theme |
+| `{type: 'tilt:scale', mode: 'fit' \| '1'}` | fit the page, or 1:1 pixels |
+| `{type: 'tilt:stats', on}` | show the stream statistics |
+
+```js
+const frame = document.querySelector('iframe');
+addEventListener('message', (e) => {
+  if (e.source === frame.contentWindow && e.data.type === 'tilt:state') render(e.data);
+});
+frame.contentWindow.postMessage({ type: 'tilt:control', take: true }, '*');
+```
+
+## Page options
+
+Add these to the link's fragment, after the token: `#token=…&embed=1&theme=light`.
+
+| option | |
+|---|---|
+| `embed=1` | the screen alone, for [embedding](#embedding) |
+| `theme=light`, `theme=dark` | the page's theme; the system's without it |
+| `control=1` | take control on opening |
+| `stats=1` | show the stream statistics |
+| `scale=1` | 1:1 pixels rather than fitted |
+| `touch=trackpad`, `touch=direct` | how touch moves the pointer |
+| `smooth=0` | show frames as they arrive, with no jitter smoothing |
+
 ## Flags
 
 Every flag also has an environment variable. With none of `--token`, `--token-file` or
@@ -172,7 +230,6 @@ Every flag also has an environment variable. With none of `--token`, `--token-fi
 | `--view-token <TOKEN>` | `TILT_VIEW_TOKEN` | | token for view-only viewers |
 | `--token-file <PATH>` | `TILT_TOKEN_FILE` | | control token from a file, re-read on every connection |
 | `--no-auth` | `TILT_NO_AUTH` | off | everyone gets control. Local testing only |
-| `--max-viewers <N>` | `TILT_MAX_VIEWERS` | 4 | viewers at once (each one costs an encoder) |
 | `--max-fps <N>` | `TILT_MAX_FPS` | 60 | frame rate cap per viewer, 1 to 60 |
 | `--resize <MIN>` | `TILT_RESIZE` | off | the screen takes each control viewer's window shape, at least MIN (`WxH`) per side. Xvfb resizes only within its startup screen: start it large, e.g. `-screen 0 2560x1600x24` |
 
@@ -202,10 +259,16 @@ startup. `tilt serve [flags]` is the same as `tilt [flags]`.
 - **Keep xfwm4 compositing on** (xfce's default), and run
   `xfconf-query -c xfwm4 -p /general/unredirect_overlays -s false`. Without compositing, a fast
   scrolling terminal can freeze every viewer's picture for up to a second.
-- **Small VM (2 vCPUs)?** Use `--max-viewers 2`, and `--max-fps 30` if the desktop's own apps
-  need the CPU. Firecracker or another CPU-only microVM: see [performance](performance.md).
+- **Any number can watch; one at a time controls.** Taking control takes it from whoever has it.
+  A viewer whose page is hidden costs nothing (its video stops), but every viewer watching a busy
+  screen has its own encoder (below). `--max-viewers` is accepted and ignored.
+- **Small VM (2 vCPUs)?** Use `--max-fps 30` if the desktop's own apps need the CPU. Firecracker or another CPU-only microVM: see [performance](performance.md).
 - **Slow link?** It adapts by itself: bitrate first, then frame rate. Frames are never dropped
   once sent, and each one is the newest screen.
+- **Jittery link (Wi-Fi, mobile)?** The page shows frames on the rhythm they were captured at,
+  holding each back by what the network's jitter needs (up to 45 ms; `smooth` in the stream
+  statistics). On a steady link that is a few ms. The first change after a still screen, such as
+  a key press, is shown at once. `#smooth=0` turns this off.
 - **Sizes:** screens up to 9.4 Mpixel (e.g. 4096×2304). Pasted text over 4 KB is sent in pieces.
 
 <details>

@@ -43,7 +43,7 @@ pub const MAX_TEXT_BYTES: usize = 4096;
 // WebSocket close codes.
 pub const CLOSE_NORMAL: u16 = 1000;
 pub const CLOSE_AUTH: u16 = 4001;
-pub const CLOSE_BUSY: u16 = 4002;
+// 4002 (busy) is retired: there is no viewer limit any more.
 pub const CLOSE_VERSION: u16 = 4003;
 pub const CLOSE_NOT_READY: u16 = 4004;
 pub const CLOSE_HELLO_TIMEOUT: u16 = 4005;
@@ -399,7 +399,6 @@ pub struct Stats {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     Auth,
-    Busy,
     Version,
     NotReady,
     Forbidden,
@@ -414,7 +413,6 @@ impl ErrorCode {
     pub fn close_code(self) -> Option<u16> {
         match self {
             ErrorCode::Auth => Some(CLOSE_AUTH),
-            ErrorCode::Busy => Some(CLOSE_BUSY),
             ErrorCode::Version => Some(CLOSE_VERSION),
             ErrorCode::NotReady => Some(CLOSE_NOT_READY),
             ErrorCode::HelloTimeout => Some(CLOSE_HELLO_TIMEOUT),

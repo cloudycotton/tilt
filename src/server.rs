@@ -221,7 +221,7 @@ pub fn test_state(args: &[&str]) -> Arc<AppState> {
         hub,
         input,
         cursor: watch::channel(CursorState::default()).1,
-        sessions: Sessions::new(cfg.max_viewers),
+        sessions: Sessions::new(),
         cpus: 4,
         cfg,
     })

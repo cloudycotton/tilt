@@ -11,26 +11,46 @@
   }
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#0b0c0e">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0e0e0e" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
+<script>
+  // Before the first paint, so neither the theme nor the embed mode flashes in: #theme=light|dark
+  // picks a theme (the system's otherwise), #embed=1 hides every control for a host page that
+  // draws its own (see docs/guide.md, "Embedding").
+  (function () {
+    var q = new URLSearchParams(location.hash.slice(1));
+    var root = document.documentElement;
+    var theme = q.get('theme');
+    if (theme === 'light' || theme === 'dark') root.dataset.theme = theme;
+    if (q.get('embed') === '1') root.classList.add('embed');
+  })();
+</script>
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <!-- app.js imports these: fetching them now saves two round trips per load. -->
 <link rel="modulepreload" href="input.js">
 <link rel="modulepreload" href="keysyms.js">
 <title>tilt</title>
 <style>
+  /* Dark by default; light with the system's light theme or #theme=light. */
   :root {
     color-scheme: dark;
-    --bg: #0b0c0e;
-    --panel: #1a1c21;
-    --line: rgba(255, 255, 255, 0.1);
-    --fg: #e8eaef;
-    --muted: #9aa1ad;
-    --accent: #fff;
-    --on-accent: #0b0c0e;
-    --ok: #34c759;
-    --wait: #ffb020;
-    --bad: #ff453a;
+    --bg: #0e0e0e;
+    --panel: #1b1b1b;
+    --line: rgba(255, 255, 255, 0.08);
+    --fg: #ededed;
+    --muted: #9b9b9b;
+    --hover: rgba(255, 255, 255, 0.07);
+    --press: rgba(255, 255, 255, 0.12);
+    --accent: #ededed;
+    --on-accent: #0e0e0e;
+    --brand: #00e7ff;
+    --mark-dots: rgba(255, 255, 255, 0.24);
+    --mark-fill: rgba(255, 255, 255, 0.035);
+    --scrim: rgba(14, 14, 14, 0.72);
+    --ok: #25d174;
+    --wait: #ffb55b;
+    --bad: #ff8586;
     --kb: 0px;
     --strip: 0px;
     --sat: env(safe-area-inset-top, 0px);
@@ -40,9 +60,50 @@
     /* The lowest usable line: above the home indicator, or above the on-screen keyboard. */
     --bottom: max(var(--sab), var(--kb));
     --tap: 44px;
+    --mark: min(34vmin, 260px);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --line: rgba(0, 0, 0, 0.08);
+    --fg: #0d0d0d;
+    --muted: #6b6b6b;
+    --hover: rgba(0, 0, 0, 0.05);
+    --press: rgba(0, 0, 0, 0.09);
+    --accent: #0d0d0d;
+    --on-accent: #ffffff;
+    --brand: #00738f;
+    --mark-dots: rgba(0, 0, 0, 0.24);
+    --mark-fill: rgba(0, 0, 0, 0.035);
+    --scrim: rgba(250, 250, 250, 0.72);
+    --ok: #07703b;
+    --wait: #885619;
+    --bad: #b13031;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #fafafa;
+      --panel: #ffffff;
+      --line: rgba(0, 0, 0, 0.08);
+      --fg: #0d0d0d;
+      --muted: #6b6b6b;
+      --hover: rgba(0, 0, 0, 0.05);
+      --press: rgba(0, 0, 0, 0.09);
+      --accent: #0d0d0d;
+      --on-accent: #ffffff;
+      --brand: #00738f;
+        --mark-dots: rgba(0, 0, 0, 0.24);
+    --mark-fill: rgba(0, 0, 0, 0.035);
+      --scrim: rgba(250, 250, 250, 0.72);
+      --ok: #07703b;
+      --wait: #885619;
+      --bad: #b13031;
+    }
   }
   @media (pointer: fine) {
-    :root { --tap: 34px; }
+    :root { --tap: 32px; }
   }
   [hidden] { display: none !important; }
   * { box-sizing: border-box; }
@@ -53,7 +114,9 @@
     overscroll-behavior: none;
     background: var(--bg);
     color: var(--fg);
-    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    letter-spacing: 0.005em;
+    -webkit-font-smoothing: antialiased;
     -webkit-text-size-adjust: 100%;
     -webkit-tap-highlight-color: transparent;
   }
@@ -65,17 +128,49 @@
     height: var(--tap);
     padding: 0 10px;
     border: 0;
-    border-radius: 8px;
+    border-radius: 999px;
     background: transparent;
     cursor: pointer;
     touch-action: manipulation;
     user-select: none;
     -webkit-user-select: none;
+    transition: background-color 0.12s ease;
   }
-  button:disabled { opacity: 0.38; cursor: default; }
-  button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button:disabled { opacity: 0.35; cursor: default; }
+  button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
   @media (hover: hover) {
-    button:not(:disabled):hover { background: rgba(255, 255, 255, 0.08); }
+    button:not(:disabled):hover { background: var(--hover); }
+  }
+  button:not(:disabled):active { background: var(--press); }
+
+  /* Behind the screen: the Runable mark, drawn in fine dots. It shows wherever the screen does
+     not cover the page: before the first frame and around a screen whose shape differs from the
+     page's. A light sweeps through the dots once per connection attempt while there is no
+     picture: never endlessly, which would have the browser composite every display frame. */
+  #backdrop { position: fixed; inset: 0; pointer-events: none; }
+  #backdrop .mark {
+    position: absolute;
+    left: 50%;
+    top: 44%;
+    width: var(--mark);
+    aspect-ratio: 737 / 665;
+    transform: translate(-50%, -50%);
+    background: var(--mark-fill);
+    -webkit-mask: url(runable.svg) center / contain no-repeat;
+    mask: url(runable.svg) center / contain no-repeat;
+  }
+  #backdrop .mark::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(110deg, var(--mark-dots) 38%, var(--brand) 50%, var(--mark-dots) 62%) 100% 0 / 300% 100% no-repeat;
+    -webkit-mask: radial-gradient(circle, #000 1.2px, transparent 1.7px) center / 5px 5px;
+    mask: radial-gradient(circle, #000 1.2px, transparent 1.7px) center / 5px 5px;
+  }
+  .waiting.attempt #backdrop .mark::after { animation: sweep 2.6s cubic-bezier(0.45, 0, 0.25, 1); }
+  @keyframes sweep {
+    from { background-position: 100% 0; }
+    to { background-position: 0% 0; }
   }
 
   /* The remote screen stops above the on-screen keyboard and the extra-key strip, so no part of
@@ -87,7 +182,6 @@
     bottom: calc(var(--bottom) + var(--strip));
     left: var(--sal);
     overflow: hidden;
-    background: #000;
     touch-action: none;
     user-select: none;
     -webkit-user-select: none;
@@ -140,28 +234,36 @@
     position: absolute;
     left: 50%;
     bottom: 4px;
-    width: 40px;
+    width: 36px;
     height: 4px;
-    margin-left: -20px;
+    margin-left: -18px;
     border-radius: 2px;
-    background: rgba(255, 255, 255, 0.35);
+    background: var(--muted);
+    opacity: 0.5;
+  }
+
+  /* Flat panels: a backdrop blur or shadow over the video would be recomposited on every frame. */
+  .panel {
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--panel);
   }
 
   #toolbar {
     position: fixed;
     z-index: 20;
-    top: calc(var(--sat) + 6px);
-    left: calc(var(--sal) + 6px);
-    right: calc(var(--sar) + 6px);
+    top: calc(var(--sat) + 8px);
+    left: calc(var(--sal) + 8px);
+    right: calc(var(--sar) + 8px);
     width: fit-content;
-    max-width: calc(100% - 12px - var(--sal) - var(--sar));
+    max-width: calc(100% - 16px - var(--sal) - var(--sar));
     margin: 0 auto;
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 1px;
     padding: 3px;
     border: 1px solid var(--line);
-    border-radius: 10px;
+    border-radius: 999px;
     background: var(--panel);
     overflow-x: auto;
     overscroll-behavior: contain;
@@ -182,13 +284,13 @@
     padding: 0 6px;
     white-space: nowrap;
   }
-  #toolbar svg {
-    width: 20px;
-    height: 20px;
+  #toolbar svg, #menu .item svg {
+    width: 17px;
+    height: 17px;
     flex: none;
     fill: none;
     stroke: currentColor;
-    stroke-width: 2;
+    stroke-width: 1.8;
     stroke-linecap: round;
     stroke-linejoin: round;
   }
@@ -198,9 +300,9 @@
   }
   #dot {
     flex: none;
-    width: 10px;
-    height: 10px;
-    margin: 0 8px 0 6px;
+    width: 7px;
+    height: 7px;
+    margin: 0 7px 0 8px;
     border-radius: 50%;
     background: var(--wait);
   }
@@ -211,13 +313,6 @@
   @media (max-width: 479px) {
     #dot { margin: 0 4px; }
     #toolbar button { flex: 0 1 auto; width: var(--tap); min-width: min(36px, var(--tap)); padding: 0; }
-  }
-
-  /* Flat panels: a backdrop blur or shadow over the video would be recomposited on every frame. */
-  .panel {
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    background: var(--panel);
   }
 
   /* Full-size keys that wrap (modifiers above arrows) instead of scrolling: the strip cannot pan
@@ -242,7 +337,8 @@
     flex: none;
     min-width: 44px;
     height: 44px;
-    background: rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    background: var(--hover);
     font-weight: 600;
   }
   #keys button[data-state="1"] { box-shadow: inset 0 0 0 2px var(--accent); }
@@ -253,42 +349,35 @@
     z-index: 22;
     top: calc(var(--sat) + var(--tap) + 20px);
     right: calc(var(--sar) + 8px);
-    width: min(320px, calc(100% - 16px - var(--sal) - var(--sar)));
-    padding: 12px;
+    width: min(300px, calc(100% - 16px - var(--sal) - var(--sar)));
+    padding: 6px;
     display: grid;
-    gap: 12px;
+    gap: 6px;
   }
-  #menu .actions-list { display: grid; gap: 2px; }
+  #menu .actions-list { display: grid; gap: 1px; }
   #menu .item {
     display: flex;
     align-items: center;
     gap: 10px;
     width: 100%;
     padding: 0 10px;
+    border-radius: 8px;
     text-align: left;
   }
-  #menu .item svg {
-    width: 18px;
-    height: 18px;
-    flex: none;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 2;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    opacity: 0.8;
-  }
-  #menu .item[aria-pressed="true"] { background: rgba(255, 255, 255, 0.1); }
+  #menu .item svg { opacity: 0.75; }
+  #menu .item[aria-pressed="true"] { background: var(--hover); }
   #menu .item[aria-pressed="true"]::after { content: "On"; margin-left: auto; color: var(--muted); font-size: 12px; }
   #menu .scale { justify-content: space-between; padding-right: 3px; cursor: default; }
-  #btn-scale { min-width: 52px; background: rgba(255, 255, 255, 0.08); font-variant-numeric: tabular-nums; }
-  #menu h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-  .seg { display: flex; gap: 4px; padding: 3px; border-radius: 10px; background: rgba(255, 255, 255, 0.06); }
-  .seg button { flex: 1; }
-  .seg button[aria-checked="true"] { background: var(--accent); color: var(--on-accent); }
-  .check { display: flex; align-items: center; gap: 10px; min-height: var(--tap); cursor: pointer; }
-  .check input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
-  #menu-info { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  #btn-scale { min-width: 48px; border-radius: 8px; background: var(--hover); font-variant-numeric: tabular-nums; }
+  #menu h2 { margin: 4px 10px 6px; font-size: 11px; font-weight: 500; color: var(--muted); }
+  #menu .group { padding-top: 6px; border-top: 1px solid var(--line); display: grid; gap: 1px; }
+  .seg { display: flex; gap: 2px; margin: 0 4px 4px; padding: 2px; border-radius: 9px; background: var(--hover); }
+  .seg button { flex: 1; border-radius: 7px; }
+  .seg button[aria-checked="true"] { background: var(--panel); box-shadow: 0 0 0 1px var(--line); }
+  .check { display: flex; align-items: center; gap: 10px; min-height: var(--tap); padding: 0 10px; border-radius: 8px; cursor: pointer; }
+  @media (hover: hover) { .check:hover { background: var(--hover); } }
+  .check input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+  #menu-info { margin: 0; padding: 6px 10px 4px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 
   #typer {
     position: fixed;
@@ -298,25 +387,24 @@
     justify-content: center;
     align-items: flex-start;
     padding: calc(var(--sat) + 64px) calc(var(--sar) + 12px) 12px calc(var(--sal) + 12px);
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--scrim);
   }
-  #typer-form { width: min(520px, 100%); padding: 14px; display: grid; gap: 10px; }
-  #typer-form label { font-weight: 600; }
-  #typer-text {
+  #typer-form { width: min(480px, 100%); padding: 14px; display: grid; gap: 10px; }
+  #typer-form label { font-weight: 500; }
+  #typer-text, #token-input {
     width: 100%;
-    min-height: 120px;
-    padding: 10px;
+    padding: 10px 12px;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    background: rgba(0, 0, 0, 0.35);
+    border-radius: 10px;
+    background: var(--bg);
     font-size: 16px;
-    resize: vertical;
   }
-  .actions { display: flex; justify-content: flex-end; gap: 8px; }
-  .primary { background: var(--accent); color: var(--on-accent); font-weight: 600; padding: 0 18px; min-height: 44px; }
-  .secondary { background: rgba(255, 255, 255, 0.1); padding: 0 16px; min-height: 44px; }
+  #typer-text { min-height: 120px; resize: vertical; }
+  .actions { display: flex; justify-content: flex-end; gap: 6px; }
+  .primary { background: var(--accent); color: var(--on-accent); font-weight: 500; padding: 0 16px; min-height: 36px; }
+  .secondary { background: var(--hover); padding: 0 14px; min-height: 36px; }
   @media (hover: hover) {
-    .primary:not(:disabled):hover { background: #e4e5e9; }
+    .primary:not(:disabled):hover { background: var(--accent); opacity: 0.88; }
   }
 
   #stats {
@@ -328,40 +416,50 @@
     margin: 0;
     padding: 8px 10px;
     overflow: hidden;
-    border-radius: 8px;
-    background: rgba(0, 0, 0, 0.66);
-    color: #d6f5d6;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #e6e6e6;
     font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     white-space: pre;
     pointer-events: none;
   }
 
+  /* Status: under the backdrop's mark before the first frame; over the last frame, dimmed, while
+     reconnecting. */
   #overlay {
     position: fixed;
     z-index: 18;
     inset: 0;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: calc(var(--sat) + 64px) calc(var(--sar) + 16px) calc(var(--sab) + 16px) calc(var(--sal) + 16px);
-    background: rgba(0, 0, 0, 0.55);
+    padding: calc(var(--sat) + 16px) calc(var(--sar) + 16px) calc(var(--sab) + 16px) calc(var(--sal) + 16px);
+    background: var(--scrim);
     touch-action: none;
   }
-  #overlay.solid { background: var(--bg); }
-  #overlay .card { width: min(420px, 100%); padding: 20px; display: grid; gap: 12px; justify-items: center; text-align: center; }
-  #overlay-msg { margin: 0; font-size: 16px; font-weight: 600; }
-  #overlay-detail { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
-  #token-form { width: 100%; display: flex; gap: 8px; }
-  #token-input {
-    flex: 1;
-    min-width: 0;
-    min-height: 44px;
-    padding: 0 12px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    background: rgba(0, 0, 0, 0.35);
-    font-size: 16px;
+  #overlay.solid {
+    justify-content: flex-start;
+    padding-top: calc(44vh + var(--mark) * 0.45 + 20px);
+    background: transparent;
   }
+  #overlay .card { width: min(360px, 100%); display: grid; gap: 10px; justify-items: center; text-align: center; }
+  #overlay-msg { margin: 0; font-size: 13px; font-weight: 500; }
+  #overlay-detail { margin: -4px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  #overlay .spin {
+    width: 22px;
+    height: 22px;
+    color: var(--fg);
+    background: currentColor;
+    -webkit-mask: url(runable.svg) center / contain no-repeat;
+    mask: url(runable.svg) center / contain no-repeat;
+  }
+  .attempt #overlay .spin { animation: turn 1.2s cubic-bezier(0.65, 0, 0.35, 1) 2; }
+  /* The mark has three-fold symmetry: a third of a turn looks like a full one. */
+  @keyframes turn { to { transform: rotate(120deg); } }
+  #overlay.solid .spin { display: none; }
+  #token-form { width: 100%; display: flex; gap: 6px; margin-top: 4px; }
+  #token-input { flex: 1; min-width: 0; height: 36px; padding: 0 12px; }
 
   #unsupported {
     position: fixed;
@@ -373,27 +471,35 @@
     padding: calc(var(--sat) + 16px) calc(var(--sar) + 16px) calc(var(--sab) + 16px) calc(var(--sal) + 16px);
     background: var(--bg);
   }
-  #unsupported .card { width: min(480px, 100%); padding: 20px; }
-  #unsupported h1 { margin: 0 0 8px; font-size: 18px; }
+  #unsupported .card { width: min(440px, 100%); padding: 20px; }
+  #unsupported h1 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
   #unsupported-msg { margin: 0; color: var(--muted); }
 
   #toast {
     position: fixed;
     z-index: 40;
     left: 50%;
-    bottom: calc(var(--bottom) + var(--strip) + 24px);
+    bottom: calc(var(--bottom) + var(--strip) + 20px);
     max-width: calc(100% - 32px - var(--sal) - var(--sar));
-    padding: 10px 14px;
+    padding: 8px 14px;
+    border-radius: 999px;
     transform: translateX(-50%);
     pointer-events: none;
   }
 
+  /* Embedded: the screen alone. The host page draws its own controls and talks to this one
+     through postMessage (docs/guide.md, "Embedding"). */
+  .embed #toolbar, .embed #edge, .embed #menu, .embed #keys, .embed #toast { display: none !important; }
+
   @media (prefers-reduced-motion: reduce) {
-    #toolbar { transition: none; }
+    #toolbar, button { transition: none; }
+    .attempt #backdrop .mark::after, .attempt #overlay .spin { animation: none; }
   }
 </style>
 </head>
 <body>
+<div id="backdrop" aria-hidden="true"><div class="mark"></div></div>
+
 <div id="viewport">
   <div id="stage">
     <canvas id="screen" width="0" height="0" aria-label="Remote desktop"></canvas>
@@ -447,16 +553,18 @@
     </button>
     <div class="item scale"><span>Scale</span><button id="btn-scale" type="button" aria-label="Scale" title="Scaled to fit; switch to 1:1 pixels">Fit</button></div>
   </div>
-  <div id="touch-row">
+  <div id="touch-row" class="group">
     <h2>Touch input</h2>
     <div class="seg" role="radiogroup" aria-label="Touch input">
       <button type="button" role="radio" data-touch="trackpad" aria-checked="false">Trackpad</button>
       <button type="button" role="radio" data-touch="direct" aria-checked="false">Direct</button>
     </div>
   </div>
-  <label class="check"><input id="opt-stats" type="checkbox"> Stream statistics</label>
-  <label id="cmd-row" class="check"><input id="opt-cmd" type="checkbox"> Cmd+C/V/X/A/Z/F act as Ctrl</label>
-  <label id="alt-row" class="check"><input id="opt-alt" type="checkbox"> Option acts as Alt (no special characters)</label>
+  <div class="group">
+    <label class="check"><input id="opt-stats" type="checkbox"> Stream statistics</label>
+    <label id="cmd-row" class="check"><input id="opt-cmd" type="checkbox"> Cmd+C/V/X/A/Z/F act as Ctrl</label>
+    <label id="alt-row" class="check"><input id="opt-alt" type="checkbox"> Option acts as Alt (no special characters)</label>
+  </div>
   <p id="menu-info"></p>
 </div>
 
@@ -474,7 +582,8 @@
 <pre id="stats" aria-live="off" hidden></pre>
 
 <div id="overlay" class="solid">
-  <div class="card panel">
+  <div class="card">
+    <div class="spin" aria-hidden="true"></div>
     <p id="overlay-msg" role="status">Connecting…</p>
     <p id="overlay-detail" hidden></p>
     <form id="token-form" hidden>

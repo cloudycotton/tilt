@@ -40,7 +40,7 @@ test('after a reconnect, control stays with a viewer who took it meanwhile', asy
   await mock.waitFor((m) => m.type === 'rejected' && m.code === 'busy', { since });
   await b.evaluate(() => window.tilt.takeControl());
   await b.waitForFunction(() => window.tilt.stats.control);
-  mock.options.maxViewers = 4;
+  mock.options.maxViewers = Infinity;
   const a2 = (await mock.waitFor((m) => m.type === 'welcomed' && m.session !== a1 && m.session !== bid,
     { since, timeout: 10_000 })).session;
   await page.waitForTimeout(1000);
