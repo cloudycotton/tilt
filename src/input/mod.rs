@@ -118,6 +118,13 @@ pub enum InputCmd {
     },
     /// Server autorepeat is off while any session holds control, and restored after.
     SetControllerPresent(bool),
+    /// `--resize`: gives the screen the shape of a viewer's `w`x`h` window, at least `min`.
+    Resize {
+        session: u64,
+        w: u32,
+        h: u32,
+        min: (u32, u32),
+    },
 }
 
 impl InputCmd {
@@ -129,7 +136,8 @@ impl InputCmd {
             | InputCmd::Wheel { session, .. }
             | InputCmd::Key { session, .. }
             | InputCmd::Text { session, .. }
-            | InputCmd::ReleaseAll { session } => Some(session),
+            | InputCmd::ReleaseAll { session }
+            | InputCmd::Resize { session, .. } => Some(session),
             InputCmd::SetControllerPresent(_) => None,
         }
     }
@@ -694,6 +702,7 @@ impl Injector {
             InputCmd::Text { session, ref text } => return self.text(session, text, deadline),
             InputCmd::ReleaseAll { session } => self.release_all(session)?,
             InputCmd::SetControllerPresent(present) => self.set_controller_present(present)?,
+            InputCmd::Resize { w, h, min, .. } => self.resize((w, h), min)?,
         }
         Ok(Progress::Done)
     }
@@ -1093,6 +1102,24 @@ impl Injector {
             let restore = ChangeKeyboardControlAux::new().auto_repeat_mode(mode);
             self.conn.change_keyboard_control(&restore)?;
             self.record()?;
+        }
+        Ok(())
+    }
+
+    /// Gives the screen the shape of a `want` window; ScreenChangeNotify then updates `width`
+    /// and `height`, and capture follows on its own.
+    fn resize(&mut self, want: (u32, u32), min: (u32, u32)) -> Step {
+        let max = crate::x11::screen::max_size(&self.conn, self.root)?;
+        let size = crate::x11::screen::fit(want, min, max);
+        if crate::x11::screen::set_size(&self.conn, self.root, size)? {
+            (self.width, self.height) = size;
+            tracing::info!(
+                "input: resized the screen to {}x{} for a {}x{} viewer",
+                size.0,
+                size.1,
+                want.0,
+                want.1
+            );
         }
         Ok(())
     }

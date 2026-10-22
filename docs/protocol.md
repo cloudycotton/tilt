@@ -60,7 +60,7 @@ All binary integers are little-endian. Every message is either:
    one is closed (1000) and the new one admitted. If the token file is missing or holds no
    token yet, it sends `{"t":"error","code":"not_ready"}` and closes.
 9. On success the server sends, in this order:
-   - `{"t":"welcome","v":1,"session":"s7","role":"control"|"view","screen":{"w":W,"h":H},"server":"tilt/0.1.0"}`
+   - `{"t":"welcome","v":1,"session":"s7","role":"control"|"view","screen":{"w":W,"h":H},"server":"tilt/0.1.0","resize":bool}`
    - `{"t":"control","you":bool,"held":bool,"holder":"s3"}` (see section 4)
    - CURSOR_SHAPE and CURSOR_POS, if known
    - then video, starting with a KEY frame.
@@ -170,6 +170,12 @@ Client to server:
 - `{"t":"idr"}`: request a keyframe, for example after a decoder error. The server honours it
   subject to the 500 ms rate limit; a request that arrives during the limit is deferred, not
   dropped.
+- `{"t":"resize","w":W,"h":H}`: with `--resize MIN`, the viewer's window in CSS pixels. The
+  screen takes that shape, scaled up to at least MIN on each side and down into the largest
+  screen the X server allows, with even sides; `screen` and a KEY frame follow. Allowed when the
+  `welcome` says `"resize":true` (control role, server started with `--resize`) and nobody else
+  holds control; otherwise ignored, or `forbidden` for a session that may not send it. The web
+  client sends it after its welcome and whenever its window has kept a new size for 300 ms.
 - `{"t":"video","on":false|true}`: pause or resume video, for example when the page is hidden.
   Pausing forgets the frames in flight (ACKs for them are still accepted, and teach the server
   nothing). Resume forces an IDR.

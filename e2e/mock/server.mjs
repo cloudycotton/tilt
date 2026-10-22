@@ -63,6 +63,7 @@ export const DEFAULTS = {
   noAuth: false,
   tokenFile: null, // read on every hello, like TILT_TOKEN_FILE; missing file -> not_ready
   maxViewers: 4,
+  resize: false, // like --resize: control sessions may send `resize`, which is recorded
   maxMsgBytes: 262144,
   fps: 30,
   window: 4, // frames in flight before the stream waits for ACKs
@@ -525,6 +526,11 @@ export async function startMockServer(options = {}) {
           sess.forceIdr = true;
         } else if (m.on !== true) violation(sess, 'video.on is not a boolean');
         break;
+      case 'resize':
+        record(sess, { type: 'resize', w: m.w, h: m.h });
+        if (!Number.isInteger(m.w) || !Number.isInteger(m.h)) violation(sess, 'resize.w and resize.h are not integers');
+        else if (!opts.resize || sess.role !== 'control') sendJson(sess, { t: 'error', code: 'forbidden', msg: 'cannot resize' });
+        break;
       default:
         record(sess, { type: 'unknown', t: m && m.t });
         violation(sess, `unknown JSON message ${JSON.stringify(m && m.t)}`);
@@ -590,7 +596,7 @@ export async function startMockServer(options = {}) {
     sess.role = role;
     sess.welcomed = true;
     const st = state.stream;
-    sendJson(sess, { t: 'welcome', v: 1, session: sess.id, role, screen: { w: st.w, h: st.h }, server: SERVER });
+    sendJson(sess, { t: 'welcome', v: 1, session: sess.id, role, screen: { w: st.w, h: st.h }, server: SERVER, resize: opts.resize && role === 'control' });
     sendJson(sess, controlMsg(sess));
     sendRaw(sess, cursorShapeMsg());
     sendRaw(sess, cursorPosMsg());
