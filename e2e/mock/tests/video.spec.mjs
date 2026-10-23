@@ -1,6 +1,6 @@
 import {
-  BACKGROUND, COLORS, canvasRect, controlling, expect, expectColor, fixtureCodec, from, open, sample, sessionOf,
-  setVisibility, stats, test, waitDrawn,
+  BACKGROUND, COLORS, canvasRect, command, controlling, expect, expectColor, fixtureCodec, from, open, pollState, sample,
+  sessionOf, setVisibility, state, stats, test, waitDrawn,
 } from './fixtures.mjs';
 
 test('decodes and draws the stream at its native size', async ({ page, mock }) => {
@@ -21,8 +21,9 @@ test('decodes and draws the stream at its native size', async ({ page, mock }) =
   expectColor(await sample(page, 192, 192), COLORS[0]);
   expectColor(await sample(page, 900, 100), BACKGROUND);
   expect(await sample(page, 5000, 5)).toEqual([0, 0, 0, 0]);
-  await expect(page.locator('#overlay')).toBeHidden();
-  await expect(page.locator('#stats')).toContainText(fixtureCodec('high_1280x720'));
+  expect(await state(page)).toMatchObject({
+    status: 'live', message: '', detail: '', code: '', role: 'control', screen: { w: 1280, h: 720 },
+  });
   // Fit mode: 1280x720 in the 1280x720 test viewport fills it.
   expect(await canvasRect(page)).toEqual({ left: 0, top: 0, width: 1280, height: 720 });
   // The token left the address bar for sessionStorage.
@@ -154,23 +155,24 @@ test('a screen size the server cannot encode shows a notice until a keyframe at 
   const msg = 'cannot stream this screen: frame size 8192x4608 is too large';
   mock.unsupportedSize(msg);
   const last = mock.session(id).seq;
-  const overlay = page.locator('#overlay');
-  await expect(page.locator('#overlay-msg')).toHaveText('The remote screen cannot be streamed at its current size.');
-  await expect(page.locator('#overlay-detail')).toHaveText(msg);
-  // The frames still in the decoder are drawn, and the notice stays: it is not a toast.
+  const notice = { message: 'The remote screen cannot be streamed at its current size.', detail: msg, code: 'size' };
+  await pollState(page, 'message').toBe(notice.message);
+  expect(await state(page)).toMatchObject(notice);
+  expect((await state(page)).status).not.toBe('live');
+  // The frames still in the decoder are drawn, and the notice stays: it is not a passing one.
   await page.waitForFunction((seq) => window.tilt.stats.lastDrawnSeq >= seq, last);
   await page.waitForTimeout(300);
-  await expect(overlay).toBeVisible();
-  await expect(page.locator('#toast')).toBeHidden();
+  expect(await state(page)).toMatchObject(notice);
   // Hiding and showing the page turns video off and on: still no picture, so the notice stays.
   await setVisibility(page, 'hidden');
   await setVisibility(page, 'visible');
   await mock.waitFor((m) => m.session === id && m.type === 'video' && m.on === true);
   await page.waitForTimeout(500);
-  await expect(overlay).toBeVisible();
+  expect(await state(page)).toMatchObject(notice);
   mock.switchStream('high_1024x768');
   await page.waitForFunction(() => window.tilt.stats.width === 1024);
-  await expect(overlay).toBeHidden();
+  await pollState(page, 'status').toBe('live');
+  expect(await state(page)).toMatchObject({ message: '', detail: '', code: '', screen: { w: 1024, h: 768 } });
   expect(await sessionOf(page)).toBe(id);
   expect(mock.violations).toEqual([]);
 });
@@ -236,18 +238,21 @@ test('gives up on a decoder that fails every frame, after trying a software deco
   })).supported);
   const since = mock.messages.length;
   await page.evaluate(() => { window.__failing = true; });
-  await expect(page.locator('#overlay-msg')).toHaveText('This browser cannot decode the desktop stream.', { timeout: 15_000 });
+  await pollState(page, 'message', { timeout: 15_000 }).toBe('This browser cannot decode the desktop stream.');
+  expect(await state(page)).toMatchObject({ status: 'error', code: 'undecodable' });
+  expect((await state(page)).detail).not.toBe('');
   const s = await stats(page);
   expect(s.decodeErrors).toBe(4);
   expect((await page.evaluate(() => window.__configs)).includes('prefer-software')).toBe(software);
   // IDRs were asked for at growing intervals, then the stream was turned off.
   expect(from(mock, id, 'idr', since).length).toBeLessThanOrEqual(3);
   expect(from(mock, id, 'video', since).map((m) => m.on)).toEqual([false]);
-  // Retry starts over with the default decoder.
+  // tilt:reconnect (the host page's Retry) starts over with the default decoder.
   await page.evaluate(() => { window.__failing = false; });
-  await page.getByRole('button', { name: 'Retry' }).click();
+  await command(page, { type: 'tilt:reconnect' });
   await waitDrawn(page, s.framesDrawn + 10);
-  await expect(page.locator('#overlay')).toBeHidden();
+  await pollState(page, 'status').toBe('live');
+  expect(await state(page)).toMatchObject({ message: '', code: '' });
   expect(await page.evaluate(() => window.__configs.at(-1))).toBe('no-preference');
 });
 
@@ -258,8 +263,9 @@ test('turns video off for a stream it cannot decode, also after reconnecting', a
     };
   });
   await open(page, mock);
-  const message = page.locator('#overlay-msg');
-  await expect(message).toHaveText('This browser cannot decode the desktop stream.');
+  const undecodable = { status: 'error', code: 'undecodable', message: 'This browser cannot decode the desktop stream.' };
+  await pollState(page, 'message').toBe(undecodable.message);
+  expect(await state(page)).toMatchObject(undecodable);
   const id = await sessionOf(page);
   await mock.waitFor((m) => m.session === id && m.type === 'video' && m.on === false);
   await page.waitForTimeout(300); // frames already on the way
@@ -275,8 +281,8 @@ test('turns video off for a stream it cannot decode, also after reconnecting', a
   mock.drop(id);
   const next = (await mock.waitFor((m) => m.type === 'welcomed' && m.session !== id, { since })).session;
   await mock.waitFor((m) => m.session === next && m.type === 'video' && m.on === false, { since });
-  await expect(message).toHaveText('This browser cannot decode the desktop stream.');
-  await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+  await pollState(page, 'session').toBe(next);
+  expect(await state(page)).toMatchObject(undecodable);
 });
 
 test.describe('a stream that goes idle', () => {

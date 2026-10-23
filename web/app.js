@@ -1325,6 +1325,7 @@ function setScaleMode(mode) {
   view.tx = 0;
   view.ty = 0;
   layout();
+  host.changed();
 }
 
 function watchDpr() {
@@ -1557,6 +1558,7 @@ const host = {
       remote,
       session: stats.session,
       screen: { w: stats.width, h: stats.height },
+      scale: view.mode,
       modifiers: input.sticky(),
       fullscreen: Boolean(fullscreenElement()),
     };

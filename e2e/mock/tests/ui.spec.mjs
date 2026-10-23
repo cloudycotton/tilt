@@ -1,18 +1,42 @@
 import { solidCursor } from '../server.mjs';
 import {
-  canvasRect, clickMenu, clickToolbar, collect, controlling, expect, from, inputLog, isApple, keyEvents, keyLog, norm, open,
-  tapMenu, test, waitDrawn,
+  canvasRect, collect, command, controlling, expect, from, inputLog, isApple, keyEvents, keyLog, norm, open,
+  pollState, state, test, waitDrawn,
 } from './fixtures.mjs';
 
-test('shows the unsupported panel without WebCodecs', async ({ page, mock }) => {
+/**
+ * Loads the client in a frame of a host page on the mock's origin (a secure context, as WebCodecs
+ * in the frame needs) and collects what it posts. Returns the frame and a reader of the messages.
+ */
+async function framed(page, mock, hash) {
+  const hostUrl = new URL('host.html', mock.url).href;
+  await page.route(hostUrl, (route) => route.fulfill({ contentType: 'text/html', body: `
+    <iframe id="f" src="${mock.url}#${hash}" style="width:640px;height:360px;border:0"></iframe>
+    <script>
+      window.msgs = [];
+      addEventListener('message', (e) => msgs.push(e.data));
+      window.send = (m) => document.getElementById('f').contentWindow.postMessage(m, '*');
+    </script>` }));
+  await page.goto(hostUrl);
+  await expect.poll(() => page.frames().length).toBe(2);
+  const frame = page.frames().find((f) => f !== page.mainFrame());
+  await frame.waitForFunction(() => window.tilt !== undefined);
+  const msgs = (type) => page.evaluate((t) => window.msgs.filter((m) => m.type === t), type);
+  return { frame, msgs };
+}
+
+test('reports an unsupported browser without WebCodecs', async ({ page, mock }) => {
   await page.addInitScript(() => {
     delete window.VideoDecoder;
     delete window.EncodedVideoChunk;
   });
   await page.goto(`${mock.url}#token=devtoken`);
-  await expect(page.locator('#unsupported')).toBeVisible();
-  await expect(page.locator('#unsupported-msg')).toHaveText(
-    'This browser lacks WebCodecs H.264 decoding (needs Chrome/Edge 94+, Safari/iOS 16.4+, Android WebView 94+).');
+  await page.waitForFunction(() => window.tilt !== undefined);
+  expect(await state(page)).toMatchObject({
+    status: 'error',
+    code: 'unsupported',
+    message: 'This browser lacks WebCodecs H.264 decoding (needs Chrome/Edge 94+, Safari/iOS 16.4+, Android WebView 94+).',
+  });
   await page.waitForTimeout(300);
   expect(mock.messages.filter((m) => m.type === 'open')).toHaveLength(0);
 });
@@ -23,37 +47,48 @@ test('mentions the secure-context requirement on insecure origins', async ({ pag
     Object.defineProperty(window, 'isSecureContext', { value: false });
   });
   await page.goto(`${mock.url}#token=devtoken`);
-  await expect(page.locator('#unsupported-msg')).toContainText('not a secure context');
-  await expect(page.locator('#unsupported-msg')).toContainText('https://');
+  await page.waitForFunction(() => window.tilt !== undefined);
+  const s = await state(page);
+  expect(s.code).toBe('unsupported');
+  expect(s.message).toContain('not a secure context');
+  expect(s.message).toContain('https://');
 });
 
-test('stats overlay shows client and server numbers and remembers the toggle', async ({ page, mock }) => {
-  await open(page, mock, 'token=devtoken&stats=1');
-  await page.waitForFunction(() => window.tilt.stats.framesDrawn > 30 && window.tilt.stats.rttMs !== null);
-  const panel = page.locator('#stats');
-  await expect(panel).toBeVisible();
-  await expect(panel).toContainText(/fps +\d+(\.\d)? decoded +\d+(\.\d)? drawn/);
-  await expect(panel).toContainText(/ping \d+ ms/);
-  await expect(panel).toContainText('1280x720');
-  await expect(panel).toContainText(/server +\d+ fps/);
-  await expect(panel).toContainText(/viewers 1/);
-  await expect(panel).toContainText(/queue \d+/);
-  // The switch lives in the settings menu.
-  const stats = page.getByRole('checkbox', { name: 'Stream statistics' });
-  await clickToolbar(page, page.getByRole('button', { name: 'Settings' }));
-  await expect(stats).toBeChecked();
-  await stats.uncheck();
-  await expect(panel).toBeHidden();
-  // Without stats= in the URL the stored choice applies; the token comes from sessionStorage.
-  await page.goto(mock.url);
-  await waitDrawn(page, 1);
-  await expect(panel).toBeHidden();
-  await clickToolbar(page, page.getByRole('button', { name: 'Settings' }));
-  await stats.check();
-  await expect(panel).toBeVisible();
-  await page.reload();
-  await waitDrawn(page, 1);
-  await expect(panel).toBeVisible();
+test('stats=1 posts client and server numbers to the host page, until turned off', async ({ page, mock }) => {
+  const { frame, msgs } = await framed(page, mock, 'token=devtoken&stats=1');
+  await frame.waitForFunction(() => window.tilt.stats.framesDrawn > 30 && window.tilt.stats.rttMs !== null);
+  // Once a second: wait for one sent after the numbers above were in.
+  const since = (await msgs('tilt:stats')).length;
+  await expect.poll(async () => (await msgs('tilt:stats')).length, { timeout: 5000 }).toBeGreaterThan(since);
+  const { client, server } = (await msgs('tilt:stats')).at(-1);
+  expect(client.fpsDecoded).toEqual(expect.any(Number));
+  expect(client.fpsDrawn).toEqual(expect.any(Number));
+  expect(client.fpsDrawn).toBeGreaterThan(0);
+  expect(client.rttMs).toEqual(expect.any(Number));
+  expect([client.width, client.height]).toEqual([1280, 720]);
+  expect(client.codec).toMatch(/^avc1\./);
+  expect(client.queue).toEqual(expect.any(Number));
+  expect(client.decodeErrors).toBe(0);
+  expect(server).not.toBeNull();
+  expect(server.fps).toEqual(expect.any(Number));
+  expect(server.viewers).toBe(1);
+  expect(server.t).toBeUndefined();
+  // The host page turns them off and on.
+  await page.evaluate(() => window.send({ type: 'tilt:stats', on: false }));
+  await page.waitForTimeout(300); // one already on its way
+  const off = (await msgs('tilt:stats')).length;
+  await page.waitForTimeout(2200);
+  expect((await msgs('tilt:stats')).length).toBe(off);
+  await page.evaluate(() => window.send({ type: 'tilt:stats', on: true }));
+  await expect.poll(async () => (await msgs('tilt:stats')).length, { timeout: 3000 }).toBeGreaterThan(off);
+});
+
+test('without stats=1 the host page gets no statistics', async ({ page, mock }) => {
+  const { frame, msgs } = await framed(page, mock, 'token=devtoken');
+  await frame.waitForFunction(() => window.tilt.stats.framesDrawn > 0);
+  await page.waitForTimeout(2200);
+  expect(await msgs('tilt:stats')).toEqual([]);
+  expect((await msgs('tilt:state')).at(-1).status).toBe('live');
 });
 
 test.describe('in an 800x600 window', () => {
@@ -64,11 +99,8 @@ test.describe('in an 800x600 window', () => {
     const id = await controlling(page);
     expect(await canvasRect(page)).toEqual({ left: 0, top: 75, width: 800, height: 450 });
     const dpr = await page.evaluate(() => window.devicePixelRatio);
-    // It lives in the settings menu: found by id, as roles skip the closed menu.
-    const scale = page.locator('#btn-scale');
-    await expect(scale).toHaveText('Fit');
-    await clickMenu(page, scale);
-    await expect(scale).toHaveText('1:1');
+    await command(page, { type: 'tilt:scale', mode: '1' });
+    await expect.poll(async () => (await canvasRect(page)).width).toBeCloseTo(1280 / dpr, 3);
     const r = await canvasRect(page);
     expect(r.width).toBeCloseTo(1280 / dpr, 3);
     expect(r.height).toBeCloseTo(720 / dpr, 3);
@@ -85,8 +117,11 @@ test.describe('in an 800x600 window', () => {
       expect(Math.abs(down.px - 600)).toBeLessThanOrEqual(1);
       expect(Math.abs(down.py - 400)).toBeLessThanOrEqual(1);
     }
-    await clickMenu(page, scale);
-    await expect(scale).toHaveText('Fit');
+    await command(page, { type: 'tilt:scale', mode: 'fit' });
+    await expect.poll(() => canvasRect(page)).toEqual({ left: 0, top: 75, width: 800, height: 450 });
+    // Anything else is ignored.
+    await command(page, { type: 'tilt:scale', mode: '2' });
+    await page.waitForTimeout(100);
     expect(await canvasRect(page)).toEqual({ left: 0, top: 75, width: 800, height: 450 });
   });
 });
@@ -115,25 +150,16 @@ test('clicks map onto the remote screen after every window resize', async ({ pag
 test.describe('with no token file yet', () => {
   test.use({ mockOptions: { tokenFile: '/nonexistent/tilt-token' } });
 
-  test('runs no endless animations, connecting or connected', async ({ page, mock }) => {
-    // An endless CSS animation makes the browser composite every display frame, at 120 Hz on
-    // some screens, for as long as it runs; the page must stay quiet between video frames.
-    const endless = () => page.evaluate(() => document.getAnimations()
-      .filter((a) => a.effect && a.effect.getComputedTiming().iterations === Infinity).length);
+  test('reports the server not ready while connecting, with no endless animations', async ({ page, mock }) => {
     await open(page, mock, 'token=devtoken');
     // Retrying a server that is not ready yet: the "Connecting…" state.
-    await expect(page.locator('#overlay')).toBeVisible();
-    await expect(page.locator('#overlay-detail')).toContainText('not ready');
-    expect(await endless()).toBe(0);
+    await pollState(page, 'detail').toContain('not ready');
+    expect(await state(page)).toMatchObject({ status: 'connecting', message: 'Connecting…' });
+    // An endless CSS animation makes the browser composite every display frame; the page must
+    // stay quiet between video frames.
+    expect(await page.evaluate(() => document.getAnimations()
+      .filter((a) => a.effect && a.effect.getComputedTiming().iterations === Infinity).length)).toBe(0);
   });
-});
-
-test('runs no endless animations while streaming', async ({ page, mock }) => {
-  await open(page, mock, 'token=devtoken&control=1');
-  await controlling(page);
-  await expect(page.locator('#overlay')).toBeHidden();
-  expect(await page.evaluate(() => document.getAnimations()
-    .filter((a) => a.effect && a.effect.getComputedTiming().iterations === Infinity).length)).toBe(0);
 });
 
 test('scale=1 starts in 1:1 mode', async ({ page, mock }) => {
@@ -141,132 +167,123 @@ test('scale=1 starts in 1:1 mode', async ({ page, mock }) => {
   await waitDrawn(page, 1);
   const dpr = await page.evaluate(() => window.devicePixelRatio);
   expect((await canvasRect(page)).width).toBeCloseTo(1280 / dpr, 3);
-  await expect(page.locator('#btn-scale')).toHaveText('1:1');
+  await command(page, { type: 'tilt:scale', mode: 'fit' });
+  await expect.poll(async () => (await canvasRect(page)).width).toBeCloseTo(1280, 3);
 });
 
-test('Type text sends the dialog contents as TEXT', async ({ page, mock }) => {
+test('tilt:type sends the text as TEXT, only while in control', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickMenu(page, page.getByRole('button', { name: 'Type text' }));
-  await expect(page.locator('#typer')).toBeVisible();
-  await page.fill('#typer-text', 'echo "hi"\nls -la');
-  const since = mock.messages.length;
-  await page.click('#typer-send');
+  let since = mock.messages.length;
+  await command(page, { type: 'tilt:type', text: 'echo "hi"\nls -la' });
   const [msg] = await collect(mock, id, 'TEXT', since, 1);
   expect(msg.text).toBe('echo "hi"\nls -la');
-  await expect(page.locator('#typer')).toBeHidden();
-  // Focus returns to the remote keyboard.
-  expect(await page.evaluate(() => document.activeElement.id)).toBe('kbd');
+  // Without control nothing goes out.
+  await command(page, { type: 'tilt:control', take: false });
+  await pollState(page, 'control').toBe(false);
+  since = mock.messages.length;
+  await command(page, { type: 'tilt:type', text: 'nope' });
+  await page.waitForTimeout(300);
+  expect(from(mock, id, 'TEXT', since)).toEqual([]);
 });
 
 test('long text goes out in TEXT messages of at most 4096 UTF-8 bytes, split between characters', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickMenu(page, page.getByRole('button', { name: 'Type text' }));
   // 9801 bytes; the 2-byte 'é' straddles the first 4096-byte boundary.
   const text = `${'x'.repeat(4095)}é${'€'.repeat(1500)}${'😀'.repeat(300)}\nend`;
-  await page.fill('#typer-text', text);
   const since = mock.messages.length;
-  await page.click('#typer-send');
+  await command(page, { type: 'tilt:type', text });
   const msgs = await collect(mock, id, 'TEXT', since, 3);
   expect(msgs.map((m) => Buffer.byteLength(m.text))).toEqual([4095, 4094, 1612]);
   expect(msgs.map((m) => m.text).join('')).toBe(text);
   expect(mock.violations).toEqual([]);
 });
 
-test('extra keys: Esc, arrows with repeat, one-shot and locked Ctrl', async ({ page, mock }) => {
+test('host keys: Esc, arrows with repeat, one-shot and locked Ctrl', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickMenu(page, page.getByRole('button', { name: 'Keys' }));
-  const strip = page.locator('#keys');
-  await expect(strip).toBeVisible();
+  const key = (keysym, down) => command(page, { type: 'tilt:key', keysym, down });
+  const ctrl = async () => (await state(page)).modifiers.ctrl;
 
   let since = mock.messages.length;
-  await strip.getByRole('button', { name: 'Esc' }).click();
+  await key(0xff1b, true);
+  await key(0xff1b, false);
   expect(keyLog(await collect(mock, id, 'KEY', since, 2))).toEqual(['down ff1b', 'up ff1b']);
 
   // One-shot Ctrl: held for the next key only.
-  const ctrl = strip.getByRole('button', { name: 'Ctrl' });
   since = mock.messages.length;
-  await ctrl.click();
-  await expect(ctrl).toHaveAttribute('data-state', '1');
+  await command(page, { type: 'tilt:modifier', name: 'ctrl' });
+  expect(await ctrl()).toBe(1);
   await page.keyboard.press('c');
   expect(keyLog(await collect(mock, id, 'KEY', since, 4))).toEqual(['down ffe3', 'down 63', 'up 63', 'up ffe3']);
-  await expect(ctrl).toHaveAttribute('data-state', '0');
+  expect(await ctrl()).toBe(0);
 
-  // Locked Ctrl: stays down until tapped again.
+  // Locked Ctrl: stays down until toggled again.
   since = mock.messages.length;
-  await ctrl.click();
-  await ctrl.click();
-  await expect(ctrl).toHaveAttribute('data-state', '2');
+  await command(page, { type: 'tilt:modifier', name: 'ctrl' });
+  await command(page, { type: 'tilt:modifier', name: 'ctrl' });
+  expect(await ctrl()).toBe(2);
   await page.keyboard.press('x');
-  await strip.getByRole('button', { name: 'Tab' }).click();
-  await ctrl.click();
-  await expect(ctrl).toHaveAttribute('data-state', '0');
+  await key(0xff09, true);
+  await key(0xff09, false);
+  await command(page, { type: 'tilt:modifier', name: 'ctrl' });
+  expect(await ctrl()).toBe(0);
   expect(keyLog(await collect(mock, id, 'KEY', since, 6)))
     .toEqual(['down ffe3', 'down 78', 'up 78', 'down ff09', 'up ff09', 'up ffe3']);
 
   // Holding an arrow repeats it (repeated KEY down), then releases once.
-  const left = strip.getByRole('button', { name: 'Left arrow' });
-  const box = await left.boundingBox();
   since = mock.messages.length;
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await page.mouse.down();
+  await key(0xff51, true);
   await page.waitForTimeout(800);
-  await page.mouse.up();
+  await key(0xff51, false);
   const keys = keyLog(await collect(mock, id, 'KEY', since, 4));
   expect(keys.at(-1)).toBe('up ff51');
   expect(keys.slice(0, -1).every((k) => k === 'down ff51')).toBe(true);
   expect(keys.length).toBeGreaterThanOrEqual(5);
 });
 
-test('a held extra key stops when the window loses focus', async ({ page, mock }) => {
+test('a held host key stops when the window loses focus', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickMenu(page, page.getByRole('button', { name: 'Keys' }));
-  const box = await page.locator('#keys').getByRole('button', { name: 'Esc' }).boundingBox();
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await page.mouse.down();
+  await command(page, { type: 'tilt:key', keysym: 0xff1b, down: true });
   await page.waitForTimeout(700); // repeating since 500 ms
   const since = mock.messages.length;
   await page.evaluate(() => window.dispatchEvent(new Event('blur')));
   await page.waitForTimeout(600);
-  await page.mouse.up();
+  await command(page, { type: 'tilt:key', keysym: 0xff1b, down: false });
   await page.waitForTimeout(200);
   const log = inputLog(from(mock, id, ['KEY', 'RELEASE_ALL'], since));
   const at = log.indexOf('RELEASE_ALL');
   expect(at, 'RELEASE_ALL on blur').toBeGreaterThanOrEqual(0);
   // A repeat still on its way when the window lost focus may come first; nothing follows, not
-  // even a key up when the button is let go.
+  // even a key up when the host lets go.
   expect(log.slice(0, at).every((k) => k === 'down ff1b'), log.join(', ')).toBe(true);
   expect(log.slice(at)).toEqual(['RELEASE_ALL']);
 });
 
-test('extra-key modifiers are let go for typed text', async ({ page, mock }) => {
+test('host modifiers are let go for typed text', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  await clickMenu(page, page.getByRole('button', { name: 'Keys' }));
-  const ctrl = page.locator('#keys').getByRole('button', { name: 'Ctrl' });
+  const ctrl = async () => (await state(page)).modifiers.ctrl;
   // One-shot Ctrl, then a soft keyboard commits a whole word: text, not Ctrl+c Ctrl+v.
   let since = mock.messages.length;
-  await ctrl.click();
+  await command(page, { type: 'tilt:modifier', name: 'ctrl' });
   await page.evaluate(() => {
     const ta = document.getElementById('kbd');
     ta.value += 'cv';
     ta.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: 'cv', bubbles: true }));
   });
   expect(inputLog(await collect(mock, id, ['KEY', 'TEXT'], since, 3))).toEqual(['down ffe3', 'up ffe3', 'TEXT cv']);
-  await expect(ctrl).toHaveAttribute('data-state', '0');
-  // Locked Ctrl and Type text: Ctrl goes up for the text and down again after it.
+  expect(await ctrl()).toBe(0);
+  // Locked Ctrl and tilt:type: Ctrl goes up for the text and down again after it.
   since = mock.messages.length;
-  await ctrl.click();
-  await ctrl.click();
-  await expect(ctrl).toHaveAttribute('data-state', '2');
-  await clickMenu(page, page.getByRole('button', { name: 'Type text' }));
-  await page.fill('#typer-text', 'hello');
-  await page.click('#typer-send');
+  await command(page, { type: 'tilt:modifier', name: 'ctrl' });
+  await command(page, { type: 'tilt:modifier', name: 'ctrl' });
+  expect(await ctrl()).toBe(2);
+  await command(page, { type: 'tilt:type', text: 'hello' });
   expect(inputLog(await collect(mock, id, ['KEY', 'TEXT'], since, 4))).toEqual(['down ffe3', 'up ffe3', 'TEXT hello', 'down ffe3']);
-  await expect(ctrl).toHaveAttribute('data-state', '2');
+  expect(await ctrl()).toBe(2);
 });
 
 test('the controller sees the remote cursor as a CSS cursor; viewers get a sprite', async ({ browser, mock }) => {
@@ -301,103 +318,58 @@ test('the controller sees the remote cursor as a CSS cursor; viewers get a sprit
   await b.close();
 });
 
-test.describe('at phone size', () => {
-  test.use({ viewport: { width: 375, height: 667 } });
+for (const [name, viewport, hasTouch] of [
+  ['at phone size', { width: 375, height: 667 }, false],
+  ['on a narrow touch phone', { width: 360, height: 740 }, true],
+]) {
+  test.describe(name, () => {
+    test.use({ viewport, hasTouch });
 
-  test('has no horizontal page scroll and keeps the toolbar on screen', async ({ page, mock }) => {
-    await open(page, mock);
-    await waitDrawn(page, 1);
-    const m = await page.evaluate(() => ({
-      scrollWidth: document.documentElement.scrollWidth,
-      bodyScroll: document.body.scrollWidth,
-      width: window.innerWidth,
-      toolbar: document.getElementById('toolbar').getBoundingClientRect().toJSON(),
-      canvas: document.getElementById('screen').getBoundingClientRect().toJSON(),
-    }));
-    expect(m.scrollWidth).toBeLessThanOrEqual(m.width);
-    expect(m.bodyScroll).toBeLessThanOrEqual(m.width);
-    expect(m.toolbar.left).toBeGreaterThanOrEqual(0);
-    expect(m.toolbar.right).toBeLessThanOrEqual(m.width);
-    // 1280x720 fitted to 375 wide.
-    expect(m.canvas.width).toBeCloseTo(375, 3);
-    expect(m.canvas.height).toBeCloseTo(210.9375, 3);
-  });
-});
-
-test.describe('on a narrow touch phone', () => {
-  test.use({ viewport: { width: 360, height: 740 }, hasTouch: true });
-
-  test('fits every toolbar button and extra key on screen, above which the video sits', async ({ page, mock }) => {
-    await open(page, mock, 'token=devtoken&control=1');
-    await controlling(page);
-    await tapMenu(page, page.getByRole('button', { name: 'Keys' }));
-    await expect(page.locator('#keys')).toBeVisible();
-    // The remote screen gives way to the strip (a frame after the strip appears).
-    await expect.poll(() => page.evaluate(() => document.getElementById('viewport').getBoundingClientRect().bottom
-      <= document.getElementById('keys').getBoundingClientRect().top)).toBe(true);
-    const m = await page.evaluate(() => {
-      const shown = (sel) => [...document.querySelectorAll(sel)].filter((b) => b.getClientRects().length > 0)
-        .map((b) => ({ name: b.getAttribute('aria-label') || b.textContent.trim(), ...b.getBoundingClientRect().toJSON() }));
-      const bar = document.getElementById('toolbar');
-      return {
+    test('the screen fits the width, centred, with no page scroll', async ({ page, mock }) => {
+      await open(page, mock, 'token=devtoken&control=1');
+      await controlling(page);
+      const m = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        scrollHeight: document.documentElement.scrollHeight,
+        bodyScroll: document.body.scrollWidth,
         width: window.innerWidth,
-        pageScroll: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth),
-        barOverflow: bar.scrollWidth - bar.clientWidth,
-        buttons: shown('#toolbar button'),
-        keys: shown('#keys button'),
+        height: window.innerHeight,
+        viewport: document.getElementById('viewport').getBoundingClientRect().toJSON(),
         canvas: document.getElementById('screen').getBoundingClientRect().toJSON(),
-      };
+      }));
+      expect(m.scrollWidth).toBeLessThanOrEqual(m.width);
+      expect(m.bodyScroll).toBeLessThanOrEqual(m.width);
+      expect(m.scrollHeight).toBeLessThanOrEqual(m.height);
+      // The viewport is the whole window; 1280x720 fitted to its width, centred vertically.
+      expect([m.viewport.left, m.viewport.top, m.viewport.width, m.viewport.height]).toEqual([0, 0, m.width, m.height]);
+      expect(m.canvas.left).toBeCloseTo(0, 3);
+      expect(m.canvas.width).toBeCloseTo(m.width, 3);
+      expect(m.canvas.height).toBeCloseTo(m.width * 720 / 1280, 3);
+      expect(m.canvas.top).toBeCloseTo((m.height - m.width * 720 / 1280) / 2, 3);
     });
-    expect(m.pageScroll).toBeLessThanOrEqual(m.width);
-    expect(m.barOverflow).toBe(0);
-    expect(m.buttons.map((b) => b.name)).toEqual(expect.arrayContaining(['Control', 'Keyboard', 'Settings']));
-    for (const b of m.buttons) {
-      expect(b.left, b.name).toBeGreaterThanOrEqual(0);
-      expect(b.right, b.name).toBeLessThanOrEqual(m.width);
-      expect(b.width, b.name).toBeGreaterThanOrEqual(36);
-      expect(b.height, b.name).toBeGreaterThanOrEqual(44);
-    }
-    expect(m.keys).toHaveLength(9);
-    for (const k of m.keys) {
-      expect(k.left, k.name).toBeGreaterThanOrEqual(0);
-      expect(k.right, k.name).toBeLessThanOrEqual(m.width);
-      expect(k.width, k.name).toBeGreaterThanOrEqual(44);
-      expect(k.height, k.name).toBeGreaterThanOrEqual(44);
-    }
-    expect(m.canvas.width).toBeCloseTo(360, 3);
   });
-});
+}
 
-test('settings: Cmd+C can stay a Super shortcut on Apple clients', async ({ page, mock }) => {
+test('keymap: Cmd+C can stay a Super shortcut on Apple clients', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
-  test.skip(!(await page.evaluate(() => /Mac|iPhone|iPad/.test(navigator.platform))), 'Apple-only option');
-  await clickToolbar(page, page.getByRole('button', { name: 'Settings' }));
-  const option = page.getByRole('checkbox', { name: /act as Ctrl/ });
-  await expect(option).toBeChecked();
-  // Desktop pointers get no touch-mode choice.
-  await expect(page.locator('#touch-row')).toBeHidden();
-  await option.uncheck();
-  expect(await page.evaluate(() => localStorage.getItem('tilt.cmdToCtrl'))).toBe('0');
-  await page.mouse.click(640, 600);
-  await expect(page.locator('#menu')).toBeHidden();
+  test.skip(!(await isApple(page)), 'Apple-only option');
   await page.evaluate(() => document.getElementById('kbd').focus());
-  const since = mock.messages.length;
+  // By default Cmd+C acts as Ctrl+C.
+  let since = mock.messages.length;
+  await page.keyboard.press('Meta+c');
+  expect(keyLog(await collect(mock, id, 'KEY', since, 4))).toEqual(['down ffe3', 'down 63', 'up 63', 'up ffe3']);
+  await command(page, { type: 'tilt:keymap', cmdToCtrl: false });
+  since = mock.messages.length;
   await page.keyboard.press('Meta+c');
   expect(keyLog(await collect(mock, id, 'KEY', since, 4))).toEqual(['down ffeb', 'down 63', 'up 63', 'up ffeb']);
 });
 
-test('settings: Option can act as Alt on Apple clients', async ({ page, mock }) => {
+test('keymap: Option can act as Alt on Apple clients', async ({ page, mock }) => {
   await open(page, mock, 'token=devtoken&control=1');
   const id = await controlling(page);
   test.skip(!(await isApple(page)), 'Apple-only option');
-  await clickToolbar(page, page.getByRole('button', { name: 'Settings' }));
-  const option = page.getByRole('checkbox', { name: /Option acts as Alt/ });
-  await expect(option).not.toBeChecked();
-  await option.check();
-  expect(await page.evaluate(() => localStorage.getItem('tilt.optionAsAlt'))).toBe('1');
-  await page.mouse.click(640, 600);
-  await expect(page.locator('#menu')).toBeHidden();
+  await command(page, { type: 'tilt:keymap', optionAsAlt: true });
   await page.evaluate(() => document.getElementById('kbd').focus());
   // Option+c on a US Mac layout types ç; as Alt it is Alt+c.
   const since = mock.messages.length;
@@ -409,17 +381,20 @@ test('settings: Option can act as Alt on Apple clients', async ({ page, mock }) 
   expect(keyLog(await collect(mock, id, 'KEY', since, 4))).toEqual(['down ffe9', 'down 63', 'up 63', 'up ffe9']);
 });
 
-test('fullscreen toggles from the toolbar', async ({ page, mock }) => {
+test('tilt:fullscreen toggles fullscreen and the state follows', async ({ page, mock }) => {
   await open(page, mock);
   await waitDrawn(page, 1);
-  const button = page.getByRole('button', { name: 'Fullscreen' });
-  test.skip(!(await button.isVisible()), 'no Fullscreen API in this engine');
-  await button.click();
-  await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement || document.webkitFullscreenElement))).toBe(true);
-  await expect(button).toHaveAttribute('aria-pressed', 'true');
-  await button.click();
-  await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement || document.webkitFullscreenElement))).toBe(false);
-  await expect(button).toHaveAttribute('aria-pressed', 'false');
+  const fullscreen = () => page.evaluate(() => Boolean(document.fullscreenElement || document.webkitFullscreenElement));
+  test.skip(!(await page.evaluate(() => Boolean(document.documentElement.requestFullscreen
+    || document.documentElement.webkitRequestFullscreen))), 'no Fullscreen API in this engine');
+  // Entering fullscreen needs a user gesture: a click (which, as a viewer, sends nothing).
+  await page.mouse.click(640, 360);
+  await command(page, { type: 'tilt:fullscreen' });
+  await expect.poll(fullscreen).toBe(true);
+  await pollState(page, 'fullscreen').toBe(true);
+  await command(page, { type: 'tilt:fullscreen' });
+  await expect.poll(fullscreen).toBe(false);
+  await pollState(page, 'fullscreen').toBe(false);
 });
 
 test.describe('a base64 token', () => {
@@ -428,21 +403,39 @@ test.describe('a base64 token', () => {
 
   for (const [form, value] of [['as is', TOKEN], ['percent-encoded', encodeURIComponent(TOKEN)]]) {
     test(`is read from the URL fragment ${form}, keeping the other options`, async ({ page, mock }) => {
-      await open(page, mock, `token=${value}&stats=1`);
-      await waitDrawn(page, 1);
-      expect(await page.evaluate(() => window.tilt.stats.role)).toBe('control');
+      const { frame, msgs } = await framed(page, mock, `token=${value}&stats=1`);
+      await frame.waitForFunction(() => window.tilt.stats.framesDrawn > 0);
+      expect(await frame.evaluate(() => window.tilt.stats.role)).toBe('control');
       expect(mock.messages.filter((m) => m.type === 'rejected')).toEqual([]);
-      expect(await page.evaluate(() => location.hash)).toBe('#stats=1');
-      await expect(page.locator('#stats')).toBeVisible();
+      expect(await frame.evaluate(() => location.hash)).toBe('#stats=1');
+      // stats=1 still applies.
+      await expect.poll(async () => (await msgs('tilt:stats')).length, { timeout: 3000 }).toBeGreaterThan(0);
     });
   }
 });
 
 test('a new #token in the URL reconnects with it', async ({ page, mock }) => {
   await open(page, mock, 'token=wrong');
-  await expect(page.locator('#overlay-msg')).toContainText('Access denied');
+  await pollState(page, 'message').toContain('Access denied');
+  expect(await state(page)).toMatchObject({ status: 'error', code: 'auth' });
   await page.evaluate(() => { location.hash = 'token=devtoken'; });
   await waitDrawn(page, 3);
   expect(await page.evaluate(() => window.tilt.stats.role)).toBe('control');
   expect(page.url()).not.toContain('token');
+  await pollState(page, 'status').toBe('live');
+});
+
+test('tilt:token saves the token for the tab and reconnects with it', async ({ page, mock }) => {
+  await open(page, mock, 'token=wrong');
+  await pollState(page, 'code').toBe('auth');
+  await command(page, { type: 'tilt:token', token: ' devtoken ' });
+  await waitDrawn(page, 3);
+  await pollState(page, 'status').toBe('live');
+  expect(await page.evaluate(() => window.tilt.stats.role)).toBe('control');
+  expect(await page.evaluate(() => sessionStorage.getItem('tilt.token'))).toBe('devtoken');
+  // A reload keeps it.
+  await page.reload();
+  await page.waitForFunction(() => window.tilt !== undefined);
+  await waitDrawn(page, 1);
+  expect(await state(page)).toMatchObject({ status: 'live', role: 'control', message: '', code: '' });
 });

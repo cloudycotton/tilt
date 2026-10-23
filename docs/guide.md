@@ -181,7 +181,7 @@ The page posts these to its parent (or, opened with `window.open`, to its opener
 
 | message | when |
 |---|---|
-| `{type: 'tilt:state', status, message, detail, code, control, held, role, remote, session, screen: {w, h}, modifiers: {ctrl, alt, super}, fullscreen}` | on any change. `status` is `connecting`, `live`, `reconnecting` or `error`. While it is not `live`, `message` and `detail` say why, in words you can show, and `code` names the cause where there is one: `auth` (ask for a token, then send `tilt:token`), `version`, `webtransport`, `unsupported` (no WebCodecs), `undecodable` (offer a retry with `tilt:reconnect`), `size`. `control` is whether this page has control, `held` whether anyone has, `role` is `control` or `view` |
+| `{type: 'tilt:state', status, message, detail, code, control, held, role, remote, session, screen: {w, h}, scale, modifiers: {ctrl, alt, super}, fullscreen}` | on any change. `status` is `connecting`, `live`, `reconnecting` or `error`. While it is not `live`, `message` and `detail` say why, in words you can show, and `code` names the cause where there is one: `auth` (ask for a token, then send `tilt:token`), `version`, `webtransport`, `unsupported` (no WebCodecs), `undecodable` (offer a retry with `tilt:reconnect`), `size`. `control` is whether this page has control, `held` whether anyone has, `role` is `control` or `view`, `scale` is `fit` or `1` |
 | `{type: 'tilt:notice', text}` | something worth telling the viewer, such as "Another viewer took control." |
 | `{type: 'tilt:stats', client, server}` | once a second, after `tilt:stats` or with `stats=1`: frame rates, bitrate, round trip, decoder and server numbers |
 
