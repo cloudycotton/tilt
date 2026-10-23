@@ -1,6 +1,6 @@
 import {
-  COLORS, controlling, expect, expectColor, from, open, sample, sessionOf, setVisibility, startMockServer, stats, test,
-  waitDrawn,
+  COLORS, command, controlling, expect, expectColor, from, open, pollState, sample, sessionOf, setVisibility,
+  startMockServer, state, stats, test, waitDrawn,
 } from './fixtures.mjs';
 
 test('reconnects after tilt.ws.close() and takes control again', async ({ page, mock }) => {
@@ -13,13 +13,15 @@ test('reconnects after tilt.ws.close() and takes control again', async ({ page, 
     window.tilt.ws.close();
     return { ...window.tilt.stats };
   });
-  await expect(page.locator('#overlay-msg')).toHaveText('Reconnecting…');
-  // The last frame stays on screen under the overlay.
+  await pollState(page, 'message').toBe('Reconnecting…');
+  expect((await state(page)).status).toBe('reconnecting');
+  // The last frame stays on screen meanwhile.
   expectColor(await sample(page, 192, 192), COLORS[0]);
   await page.waitForFunction((n) => window.tilt.stats.framesDecoded > n + 5, before.framesDecoded, { timeout: 5000 });
   const second = await page.evaluate(() => window.tilt.stats.session);
   expect(second).not.toBe(first);
-  await expect(page.locator('#overlay')).toBeHidden();
+  await pollState(page, 'status').toBe('live');
+  expect((await state(page)).message).toBe('');
   await page.waitForFunction(() => window.tilt.stats.control);
   expect(mock.holder()).toBe(second);
   // ACKs in the new session restart at seq 1 and stay in order.
@@ -48,7 +50,7 @@ test('after a reconnect, control stays with a viewer who took it meanwhile', asy
   expect(mock.holder()).toBe(bid);
   expect(await b.evaluate(() => window.tilt.stats.control)).toBe(true);
   // Once B lets go, this page (which held control when it dropped) takes it back.
-  await b.evaluate(() => document.getElementById('btn-control').click());
+  await command(b, { type: 'tilt:control', take: false });
   await page.waitForFunction(() => window.tilt.stats.control);
   expect(mock.holder()).toBe(a2);
   await b.close();
@@ -82,7 +84,7 @@ test('a hidden page does not reconnect; shown again, it reconnects and takes con
   mock.drop(a1, 1000);
   await page.waitForTimeout(3000);
   expect(mock.messages.slice(since).filter((m) => m.type === 'hello')).toEqual([]);
-  await expect(page.locator('#overlay-msg')).toHaveText('Reconnecting…');
+  expect(await state(page)).toMatchObject({ status: 'reconnecting', message: 'Reconnecting…' });
   await setVisibility(page, 'visible');
   await page.waitForFunction(() => window.tilt.stats.control, null, { timeout: 5000 });
   expect(mock.holder()).toBe(await sessionOf(page));
@@ -148,24 +150,27 @@ test('keeps retrying while the server is down', async ({ page }) => {
   await waitDrawn(page, 5);
   const { port } = mock;
   await mock.close();
-  await expect(page.locator('#overlay-msg')).toHaveText('Reconnecting…');
+  await pollState(page, 'message').toBe('Reconnecting…');
   await page.waitForTimeout(2000);
   const again = await startMockServer({ quiet: true, port });
   try {
     const drawn = (await stats(page)).framesDrawn;
     await waitDrawn(page, drawn + 5, 15_000);
-    await expect(page.locator('#overlay')).toBeHidden();
+    await pollState(page, 'status').toBe('live');
     expect(again.messages.filter((m) => m.type === 'hello')).toHaveLength(1);
   } finally {
     await again.close();
   }
 });
 
-test('tilt.reconnect() opens a fresh session', async ({ page, mock }) => {
+for (const [name, reconnect] of [
+  ['tilt.reconnect()', (page) => page.evaluate(() => window.tilt.reconnect())],
+  ['the tilt:reconnect command', (page) => command(page, { type: 'tilt:reconnect' })],
+]) test(`${name} opens a fresh session`, async ({ page, mock }) => {
   await open(page, mock);
   await waitDrawn(page, 5);
   const first = await sessionOf(page);
-  await page.evaluate(() => window.tilt.reconnect());
+  await reconnect(page);
   await page.waitForFunction((id) => window.tilt.stats.session !== '' && window.tilt.stats.session !== id, first);
   const drawn = (await stats(page)).framesDrawn;
   await waitDrawn(page, drawn + 5);

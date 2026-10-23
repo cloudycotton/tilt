@@ -1,7 +1,9 @@
 // The client's WebTransport handling (web/transport.js) through the fake WebTransport in
 // fixtures.mjs, which can deliver video streams out of order, fail one, or never connect: what a
 // real QUIC path does only at random.
-import { expect, from, open, sessionOf, stats, test, waitDrawn } from './fixtures.mjs';
+import {
+  expect, from, open, pollState, sessionOf, state, stats, test, waitDrawn,
+} from './fixtures.mjs';
 
 test.describe('video streams out of order', () => {
   test.use({ wtMode: 'shuffle' });
@@ -57,22 +59,25 @@ test.describe('a video stream that fails', () => {
 test.describe('a session that never connects', () => {
   test.use({ wtMode: 'never' });
 
-  test('shows the overlay and tries again after the welcome timeout', async ({ page, mock }) => {
+  test('reports connecting and tries again after the welcome timeout', async ({ page, mock }) => {
     await open(page, mock);
-    await expect(page.locator('#overlay')).toBeVisible();
+    expect(await state(page)).toMatchObject({ status: 'connecting', message: 'Connecting…' });
     // The page gives a session 10 s to say welcome (WELCOME_TIMEOUT_MS in app.js).
     await expect.poll(() => page.evaluate(() => window.fakeWt.created), { timeout: 20_000 })
       .toBeGreaterThanOrEqual(2);
+    expect((await state(page)).status).toBe('connecting');
   });
 });
 
 test('closes from the server reach the page with their codes', async ({ page, mock }) => {
   await open(page, mock, 'token=wrong');
-  await expect(page.locator('#overlay-msg')).toHaveText('Access denied: the token is missing or wrong.');
+  await pollState(page, 'message').toBe('Access denied: the token is missing or wrong.');
+  expect(await state(page)).toMatchObject({ status: 'error', code: 'auth' });
 });
 
 test('a browser without WebTransport is told so', async ({ page, mock }) => {
   await page.addInitScript(() => { delete window.WebTransport; });
   await open(page, mock);
-  await expect(page.locator('#overlay-msg')).toContainText('needs WebTransport');
+  await pollState(page, 'message').toContain('needs WebTransport');
+  expect(await state(page)).toMatchObject({ status: 'error', code: 'webtransport' });
 });

@@ -1,5 +1,5 @@
 import {
-  canvasRect, collect, controlling, expect, from, INPUT_TYPES, inputLog, isApple, keyEvents, keyLog, norm, open,
+  canvasRect, collect, command, controlling, expect, from, INPUT_TYPES, inputLog, isApple, keyEvents, keyLog, norm, open,
   setVisibility, test,
 } from './fixtures.mjs';
 
@@ -229,11 +229,17 @@ test('a key released after focus left the viewer is released on the remote', asy
   const id = await ready(page, mock);
   const since = mock.messages.length;
   await page.keyboard.down('Shift');
-  await page.evaluate(() => document.getElementById('btn-type').click());
-  await expect(page.locator('#typer-text')).toBeFocused();
+  // Focus moves to a field of the page's own, outside the viewer (as a host page's text box).
+  await page.evaluate(() => {
+    const field = document.body.appendChild(document.createElement('input'));
+    field.id = 'elsewhere';
+    field.focus();
+  });
+  await expect(page.locator('#elsewhere')).toBeFocused();
   await page.keyboard.up('Shift');
+  // Typed there, keys are not the viewer's.
   await page.keyboard.type('abc');
-  await page.evaluate(() => document.getElementById('typer-form').requestSubmit());
+  await command(page, { type: 'tilt:type', text: 'abc' });
   expect(inputLog(await collect(mock, id, ['KEY', 'TEXT'], since, 3))).toEqual(['down ffe1', 'up ffe1', 'TEXT abc']);
 });
 
