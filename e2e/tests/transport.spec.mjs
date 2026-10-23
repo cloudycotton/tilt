@@ -25,7 +25,7 @@ test.afterEach(async ({ page }) => {
 test('streams and takes input over WebTransport', async ({ page, request }) => {
   test.skip(!(await hasWebTransport(page)), 'this browser has no WebTransport');
   expect(await advert(request), 'GET /transport').toBeTruthy();
-  await openTilt(page, `token=${CONTROL_TOKEN}&control=1&probe=${MARKER}`);
+  await openTilt(page, `token=${CONTROL_TOKEN}&remote=1&probe=${MARKER}`);
   await waitForControl(page);
   if (!(await page.evaluate(() => document.activeElement?.tagName === 'TEXTAREA'))) {
     await page.locator('textarea').first().focus();

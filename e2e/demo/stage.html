@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8">
 <title>tilt demo</title>
-<!-- The recording's frame: the tilt web client, unchanged, in an iframe set in a rounded screen.
-     Open as stage.html#<tilt url, with its own #token=...>. -->
+<!-- The recording's frame: the headless tilt web client, unchanged, in an iframe set in a rounded
+     screen. Open as stage.html#<tilt url, with its own #token=...&remote=1&bg=...>. This page is
+     the client's host page: the chin shows what its tilt:state messages say. -->
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; }
   body {
@@ -26,7 +27,7 @@
     height: 800px;
     border: 0;
     border-radius: 21px;
-    background: #000;
+    background: #101010;
   }
   .chin {
     width: fit-content;
@@ -41,10 +42,18 @@
 <body>
 <div>
   <div class="screen"><iframe id="tilt" title="tilt" allow="fullscreen; clipboard-read; clipboard-write"></iframe></div>
-  <div class="chin">You have control</div>
+  <div class="chin" id="chin">Connecting…</div>
 </div>
 <script>
-  document.getElementById('tilt').src = decodeURIComponent(location.hash.slice(1));
+  const frame = document.getElementById('tilt');
+  const chin = document.getElementById('chin');
+  frame.src = decodeURIComponent(location.hash.slice(1));
+  window.addEventListener('message', (e) => {
+    const m = e.data;
+    if (e.source !== frame.contentWindow || !m || m.type !== 'tilt:state') return;
+    chin.textContent = m.control ? 'You have control'
+      : m.message || (m.status === 'live' ? 'Viewing' : 'Connecting…');
+  });
 </script>
 </body>
 </html>

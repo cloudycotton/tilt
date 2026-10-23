@@ -50,7 +50,7 @@ sleep 1
 # The viewer: Chrome in kiosk mode showing the tilt client framed by e2e/demo/stage.html.
 Xvfb $viewer -screen 0 ${stage}x24 -nolisten tcp >/dev/null 2>&1 & pids+=($!)
 sleep 1
-url=$(node -e "console.log(encodeURIComponent(process.argv[1]))" "http://127.0.0.1:$port/#token=demo&control=1")
+url=$(node -e "console.log(encodeURIComponent(process.argv[1]))" "http://127.0.0.1:$port/#token=demo&remote=1&bg=101010")
 DISPLAY=$viewer google-chrome --no-sandbox --test-type --user-data-dir="$work/chrome-viewer" \
   --no-first-run --no-default-browser-check --password-store=basic --kiosk --hide-scrollbars \
   --window-position=0,0 --window-size=${stage/x/,} "file://$PWD/e2e/demo/stage.html#$url" \

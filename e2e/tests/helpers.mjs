@@ -1,5 +1,7 @@
 // Shared by the specs. They drive the web client only through its documented surface: the
-// window.tilt hook (brief 6.6), canvas#screen, the hidden textarea and the Control button.
+// window.tilt hook (brief 6.6: stats, state() and command()), canvas#screen and the hidden
+// textarea. The page is headless, so there are no buttons or overlays to look at.
+import { expect } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,7 +48,7 @@ export async function openTilt(page, hash) {
   } catch {
     const state = await page.evaluate(() => ({
       stats: window.tilt?.stats ?? 'no window.tilt',
-      page: document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 300),
+      state: window.tilt?.state() ?? null,
     }));
     throw new Error(`no frame drawn within ${FIRST_FRAME_TIMEOUT_MS / 1000} s: ${JSON.stringify(state)}`);
   }
@@ -57,6 +59,7 @@ export const markerColor = (page) => page.evaluate(() => window.e2e.marker());
 
 export async function waitForControl(page) {
   await page.waitForFunction(() => window.tilt.stats.control === true, null, { timeout: 10_000 });
+  expect(await page.evaluate(() => window.tilt.state().control), 'tilt.state().control').toBe(true);
 }
 
 /** Viewport coordinates `{x, y}` of screen pixel (x, y), and whether the canvas is on top there. */

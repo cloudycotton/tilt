@@ -41,10 +41,28 @@ test('stream renders at the screen size', async ({ page }) => {
   expect(s.canvas, 'canvas size').toEqual(EXPECT_SCREEN);
   expect([s.width, s.height], 'tilt.stats width x height').toEqual(EXPECT_SCREEN);
   expect(await markerColor(page), 'marker colour (is tilt-testpattern running?)').toBeGreaterThanOrEqual(0);
+  // What a host page is told: live, no status message, the screen size, and a controller's role.
+  const state = await page.evaluate(() => window.tilt.state());
+  expect(state.type).toBe('tilt:state');
+  expect(state.status, 'tilt.state().status').toBe('live');
+  expect(state.message, 'tilt.state().message once live').toBe('');
+  expect([state.screen.w, state.screen.h], 'tilt.state().screen').toEqual(EXPECT_SCREEN);
+  expect(state.role, 'tilt.state().role').toBe('control');
+  expect(state.control, 'tilt.state().control without remote=1').toBe(false);
+});
+
+test('control is taken and released by host command', async ({ page }) => {
+  await openTilt(page, `token=${CONTROL_TOKEN}`);
+  await page.waitForFunction(() => window.tilt.state().role === 'control', null, { timeout: 10_000 });
+  expect(await page.evaluate(() => window.tilt.state().control), 'control before the command').toBe(false);
+  await page.evaluate(() => window.tilt.command({ type: 'tilt:control', take: true }));
+  await waitForControl(page);
+  await page.evaluate(() => window.tilt.command({ type: 'tilt:control', take: false }));
+  await page.waitForFunction(() => window.tilt.state().control === false, null, { timeout: 10_000 });
 });
 
 test('key press to drawn marker latency', async ({ page }, testInfo) => {
-  await openTilt(page, `token=${CONTROL_TOKEN}&control=1&probe=${MARKER}`);
+  await openTilt(page, `token=${CONTROL_TOKEN}&remote=1&probe=${MARKER}`);
   await waitForControl(page);
   // The client focuses its hidden textarea when control arrives; make sure nothing took it.
   if (!(await page.evaluate(() => document.activeElement?.tagName === 'TEXTAREA'))) {
@@ -91,6 +109,7 @@ test('key press to drawn marker latency', async ({ page }, testInfo) => {
 });
 
 test('click on the marker advances it', async ({ page }, testInfo) => {
+  // control=1 is the older name for remote=1.
   await openTilt(page, `token=${CONTROL_TOKEN}&control=1&probe=${MARKER}`);
   await waitForControl(page);
   const before = await markerColor(page);
@@ -109,9 +128,8 @@ test('click on the marker advances it', async ({ page }, testInfo) => {
 
 test('view-only session cannot take control or send input', async ({ page }) => {
   await openTilt(page, `token=${VIEW_TOKEN}`);
-  await page.waitForFunction(() => window.tilt.stats.role === 'view', null, { timeout: 10_000 });
-  const control = page.locator('#btn-control').or(page.getByRole('button', { name: /control/i })).first();
-  await expect(control, 'Control button').toBeDisabled();
+  await page.waitForFunction(() => window.tilt.state().role === 'view', null, { timeout: 10_000 });
+  expect(await page.evaluate(() => window.tilt.state().control), 'tilt.state().control').toBe(false);
   const before = await markerColor(page);
   expect(before, 'marker colour (is tilt-testpattern running?)').toBeGreaterThanOrEqual(0);
 
@@ -136,6 +154,8 @@ test('view-only session cannot take control or send input', async ({ page }) => 
       };
       window.e2e.viewWs = ws;
       for (const msg of [key(1), key(0), button(1), button(0)]) ws.send(msg);
+      // Both ways a page asks for control: the host command and the hook.
+      window.tilt.command({ type: 'tilt:control', take: true });
       window.tilt.takeControl();
     },
     MARKER,
@@ -145,9 +165,12 @@ test('view-only session cannot take control or send input', async ({ page }) => 
   expect(await markerColor(page), 'marker colour 1 s after the input').toBe(before);
   const after = await page.evaluate(() => ({
     control: window.tilt.stats.control,
+    state: window.tilt.state(),
     sameSocket: window.tilt.ws === window.e2e.viewWs && window.tilt.ws.readyState === 1,
   }));
   expect(after.control, 'tilt.stats.control').toBe(false);
+  expect(after.state.control, 'tilt.state().control').toBe(false);
+  expect(after.state.role, 'tilt.state().role').toBe('view');
   // A refused take answers {"t":"error","code":"forbidden"} and keeps the session open.
   expect(after.sameSocket, 'the view session survives its refused take').toBe(true);
 });
@@ -186,4 +209,6 @@ test('stream resumes after the socket drops', async ({ page }, testInfo) => {
   const ms = Date.now() - started;
   writeResult(testInfo, 'reconnect', { resumed, ms: resumed ? ms : null });
   expect(resumed, `frames decoded on a new socket within ${RESUME_TIMEOUT_MS / 1000} s`).toBe(true);
+  // The host page hears that the picture is back.
+  await page.waitForFunction(() => window.tilt.state().status === 'live', null, { timeout: RESUME_TIMEOUT_MS });
 });
