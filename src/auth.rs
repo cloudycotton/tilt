@@ -212,7 +212,10 @@ mod tests {
     #[test]
     fn links_name_the_bound_address() {
         let bound: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-        assert_eq!(links(bound, "t"), ["http://127.0.0.1:7000/#token=t&remote=1"]);
+        assert_eq!(
+            links(bound, "t"),
+            ["http://127.0.0.1:7000/#token=t&remote=1"]
+        );
         let everywhere = links("0.0.0.0:6090".parse().unwrap(), "t");
         assert_eq!(everywhere[0], "http://localhost:6090/#token=t&remote=1");
     }
