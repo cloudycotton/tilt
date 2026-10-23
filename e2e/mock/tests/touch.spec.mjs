@@ -1,7 +1,7 @@
 // Touch gestures, driven by synthetic touch PointerEvents on the viewer (both engines), plus a
 // real touchscreen tap where the browser supports one.
 import {
-  canvasRect, collect, controlling, expect, from, INPUT_TYPES, norm, open, sessionOf, tapMenu, tapToolbar, test, waitDrawn,
+  canvasRect, collect, command, controlling, expect, from, INPUT_TYPES, norm, open, sessionOf, test, waitDrawn,
 } from './fixtures.mjs';
 
 /**
@@ -318,85 +318,47 @@ test.describe('real touchscreen', () => {
 test.describe('on a phone', () => {
   test.use({ hasTouch: true, viewport: { width: 390, height: 844 } });
 
-  test('keyboard button, extra keys and the auto-hiding toolbar', async ({ page, mock }) => {
+  test('the host page opens the keyboard and holds extra keys', async ({ page, mock }) => {
     await open(page, mock, 'token=devtoken&control=1');
     const id = await controlling(page);
     const active = () => page.evaluate(() => document.activeElement.id);
-    const keyboard = page.getByRole('button', { name: 'Keyboard' });
-    await expect(keyboard).toBeVisible();
-    // Control alone never pops up the soft keyboard; the Keyboard button does.
+    // Control alone never pops up the soft keyboard; the host page's tilt:keyboard does.
     expect(await active()).not.toBe('kbd');
-    await tapToolbar(page, keyboard);
+    await command(page, { type: 'tilt:keyboard', show: true });
     await expect.poll(active).toBe('kbd');
     let since = mock.messages.length;
     await page.keyboard.insertText('hi');
     expect((await collect(mock, id, 'TEXT', since, 1))[0].text).toBe('hi');
 
-    // Toolbar and extra keys keep the keyboard open.
-    await tapMenu(page, page.getByRole('button', { name: 'Keys' }));
-    await expect(page.locator('#keys')).toBeVisible();
+    // Extra keys keep the keyboard open.
     since = mock.messages.length;
-    await page.locator('#keys').getByRole('button', { name: 'Esc' }).tap();
-    expect((await collect(mock, id, 'KEY', since, 2)).map((m) => m.keysym)).toEqual([0xff1b, 0xff1b]);
+    await command(page, { type: 'tilt:key', keysym: 0xff1b, down: true });
+    await command(page, { type: 'tilt:key', keysym: 0xff1b, down: false });
+    expect((await collect(mock, id, 'KEY', since, 2)).map((m) => [m.keysym, m.down])).toEqual([[0xff1b, true], [0xff1b, false]]);
     expect(await active()).toBe('kbd');
-    await tapToolbar(page, keyboard);
+    await command(page, { type: 'tilt:keyboard', show: false });
     await expect.poll(active).not.toBe('kbd');
-
-    // The toolbar slides away after 3 s; a tap on the top edge brings it back.
-    await expect(page.locator('#toolbar')).toHaveClass(/away/, { timeout: 6000 });
-    await expect(page.locator('#edge')).toBeVisible();
-    await page.locator('#edge').tap();
-    await expect(page.locator('#toolbar')).not.toHaveClass(/away/);
-    await expect(page.locator('#edge')).toBeHidden();
   });
 
-  test('a tap on the top edge brings the toolbar back without pressing the button under it', async ({ page, mock }) => {
-    // With no slide the bar is back before the tap ends, as it is part-way through the slide when
-    // a real finger lifts.
-    await page.emulateMedia({ reducedMotion: 'reduce' });
-    await open(page, mock, 'token=devtoken&control=1');
-    await controlling(page);
-    const active = () => page.evaluate(() => document.activeElement.id);
-    await tapToolbar(page, page.getByRole('button', { name: 'Keyboard' }));
-    await expect.poll(active).toBe('kbd');
-    await expect(page.locator('#toolbar')).toHaveClass(/away/, { timeout: 6000 });
-    await page.evaluate(() => {
-      window.clicked = [];
-      window.addEventListener('click', (e) => window.clicked.push(e.target.closest('[id]').id), true);
-    });
-    // Low in the 14 px edge: where the buttons are once the bar is back.
-    await page.touchscreen.tap(195, 12);
-    await expect(page.locator('#toolbar')).not.toHaveClass(/away/);
-    // Taps click in order, so a click from the edge tap would come before this one.
-    await tapToolbar(page, page.getByRole('button', { name: 'Settings' }));
-    await expect.poll(() => page.evaluate(() => window.clicked)).toEqual(['btn-menu']);
-    await expect(page.locator('#typer')).toBeHidden();
-    // The soft keyboard stays open.
-    expect(await active()).toBe('kbd');
-  });
-
-  test('the touch mode can be switched and is remembered', async ({ page, mock }) => {
+  test('the touch mode defaults to trackpad on a phone and can be switched', async ({ page, mock }) => {
     await open(page, mock, 'token=devtoken&control=1');
     const id = await controlling(page);
-    // 390x844 is a phone: trackpad by default.
-    await tapToolbar(page, page.getByRole('button', { name: 'Settings' }));
-    const trackpad = page.getByRole('radio', { name: 'Trackpad' });
-    const direct = page.getByRole('radio', { name: 'Direct' });
-    await expect(trackpad).toHaveAttribute('aria-checked', 'true');
-    await direct.tap();
-    await expect(direct).toHaveAttribute('aria-checked', 'true');
-    await page.reload();
-    await controlling(page);
-    await tapToolbar(page, page.getByRole('button', { name: 'Settings' }));
-    await expect(page.getByRole('radio', { name: 'Direct' })).toHaveAttribute('aria-checked', 'true');
-    await page.locator('#viewport').tap({ position: { x: 300, y: 600 } });
-    await expect(page.locator('#menu')).toBeHidden();
-    // Direct mode: a tap clicks where the finger is.
-    const r = await canvasRect(page);
-    const since = mock.messages.length;
+    // 390x844 is a phone: trackpad by default, so a tap clicks at the virtual cursor (the
+    // server's pointer, the screen centre), not under the finger.
+    let since = mock.messages.length;
     await page.touchscreen.tap(195, 420);
-    const msgs = await collect(mock, (await sessionOf(page)), 'BUTTON', since, 2);
+    let msgs = await collect(mock, id, 'BUTTON', since, 2);
+    expect(msgs.map((m) => [m.button, m.down, m.px, m.py])).toEqual([[1, true, 640, 360], [1, false, 640, 360]]);
+    await page.waitForTimeout(400);
+
+    // Direct mode: a tap clicks where the finger is.
+    await command(page, { type: 'tilt:touch', mode: 'direct' });
+    const r = await canvasRect(page);
+    since = mock.messages.length;
+    await page.touchscreen.tap(195, 420);
+    msgs = await collect(mock, id, 'BUTTON', since, 2);
     expect(msgs.map((m) => [m.button, m.down, m.x, m.y])).toEqual([[1, true, ...norm(r, 195, 420)], [1, false, ...norm(r, 195, 420)]]);
-    expect(id).not.toBe(await sessionOf(page));
+    // The mode is not remembered: nothing is stored.
+    expect(await page.evaluate(() => localStorage.length)).toBe(0);
   });
 });
