@@ -346,7 +346,7 @@ function onClosed(code) {
 function scheduleReconnect() {
   clearTimeout(conn.timer);
   conn.timer = 0;
-  showStatus(conn.everWelcomed ? 'Reconnecting…' : 'Connecting…', conn.notice);
+  showStatus(stats.framesDrawn ? 'Reconnecting…' : 'Connecting…', conn.notice);
   // A hidden page gets about one timer wake-up a minute (Chrome's intensive throttling): too few
   // PINGs to keep a session from idling out, so each one would just cycle. The visibilitychange
   // handler connects as soon as the page is shown.
@@ -372,7 +372,7 @@ function reconnect() {
   video.failures = 0;
   setFraming(opts.framing);
   endSession();
-  if (status.shown) showStatus(conn.everWelcomed ? 'Reconnecting…' : 'Connecting…');
+  if (status.shown) showStatus(stats.framesDrawn ? 'Reconnecting…' : 'Connecting…');
   connect();
 }
 
@@ -1545,7 +1545,8 @@ const host = {
   state() {
     const s = conn.fatal || status.code === 'undecodable' ? 'error'
       : conn.welcomed && !status.shown ? 'live'
-        : conn.everWelcomed ? 'reconnecting' : 'connecting';
+        // Reconnecting only once there was a picture: a welcome alone is still connecting.
+        : stats.framesDrawn ? 'reconnecting' : 'connecting';
     return {
       type: 'tilt:state',
       status: s,

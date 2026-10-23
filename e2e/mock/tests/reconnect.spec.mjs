@@ -177,3 +177,21 @@ for (const [name, reconnect] of [
   await expect.poll(() => mock.session(first).closed).toBe(true);
   expect(mock.violations).toEqual([]);
 });
+
+test('welcomed but before its first frame, the page is still connecting, not reconnecting', async ({ page, mock }) => {
+  // A decoder that never outputs: the session is welcomed, but no frame is ever drawn.
+  await page.addInitScript(() => {
+    window.VideoDecoder = class {
+      constructor() { this.state = 'unconfigured'; this.decodeQueueSize = 0; }
+      configure() { this.state = 'configured'; }
+      decode() {}
+      flush() { return new Promise(() => {}); }
+      close() { this.state = 'closed'; }
+      static isConfigSupported(config) { return Promise.resolve({ supported: true, config }); }
+    };
+  });
+  await open(page, mock);
+  await page.waitForFunction(() => window.tilt.stats.session !== '');
+  expect(await state(page)).toMatchObject({ status: 'connecting', message: 'Connecting…' });
+  expect(await page.evaluate(() => window.tilt.stats.framesDrawn)).toBe(0);
+});
