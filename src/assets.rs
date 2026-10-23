@@ -53,11 +53,6 @@ pub static ASSETS: &[Asset] = &[
         content_type: "image/svg+xml",
         body: include_bytes!("../web/icon.svg"),
     },
-    Asset {
-        path: "/runable.svg",
-        content_type: "image/svg+xml",
-        body: include_bytes!("../web/runable.svg"),
-    },
 ];
 
 /// What is served for one entry of ASSETS, computed once.

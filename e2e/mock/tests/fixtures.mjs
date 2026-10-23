@@ -267,43 +267,13 @@ export async function setVisibility(page, state) {
   }, state);
 }
 
-/**
- * Clicks a toolbar button the way a mouse user does: the bar shows when the pointer touches the top
- * edge. It slides away 3 s later, which a loaded test machine can outlast before the click.
- */
-export async function clickToolbar(page, button) {
-  await expect(async () => {
-    await page.mouse.move(2, 1);
-    await expect(page.locator('#toolbar')).not.toHaveClass(/away/, { timeout: 2000 });
-    await button.click({ timeout: 2000 });
-  }).toPass({ timeout: 20_000 });
-}
+/** The page's state, as posted to a host page in `tilt:state` (docs/guide.md, "Embedding"). */
+export const state = (page) => page.evaluate(() => window.tilt.state());
 
-/**
- * Taps a toolbar button on a touch screen. The bar slides away 3 s after the last press, which a
- * loaded test machine can outlast: a tap on the top edge brings it back.
- */
-export async function tapToolbar(page, button) {
-  await expect(async () => {
-    if (await page.locator('#toolbar.away').count()) await page.locator('#edge').tap({ timeout: 2000 });
-    await button.tap({ timeout: 2000 });
-  }).toPass({ timeout: 20_000 });
-}
+/** Polls one field of the page's state (`status`, `message`, `detail`, `code`, `control`...). */
+export const pollState = (page, key, options) => expect.poll(async () => (await state(page))[key], options);
 
-/** Opens the settings menu and clicks one of its items (Type text, Extra keys, Scale). */
-export async function clickMenu(page, button) {
-  await expect(async () => {
-    if (await page.locator('#menu').isHidden()) await clickToolbar(page, page.getByRole('button', { name: 'Settings' }));
-    await button.click({ timeout: 2000 });
-  }).toPass({ timeout: 20_000 });
-}
-
-/** clickMenu for touch. */
-export async function tapMenu(page, button) {
-  await expect(async () => {
-    if (await page.locator('#menu').isHidden()) await tapToolbar(page, page.getByRole('button', { name: 'Settings' }));
-    await button.tap({ timeout: 2000 });
-  }).toPass({ timeout: 20_000 });
-}
+/** Sends a host page command, `{type: 'tilt:…', ...}`, as if the host page had posted it. */
+export const command = (page, msg) => page.evaluate((m) => window.tilt.command(m), msg);
 
 export { startMockServer };

@@ -210,7 +210,7 @@ Unknown fields in client JSON are ignored. A repeated `hello` after the handshak
   - Send PING every 1 s.
   - Declare the link dead after 5 s without any server message, provided a PONG was expected.
   - Reconnect with jittered backoff of 250 ms, 500 ms, 1 s, 2 s, then capped at 5 s.
-  - On reconnect, show the last frame under a "Reconnecting…" overlay.
+  - On reconnect, keep showing the last frame until the new session's first one.
 - **Server:**
   - If a controlling session sends nothing for 3 s while it holds keys or buttons, release them.
     The session stays open.

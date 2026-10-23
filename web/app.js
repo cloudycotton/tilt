@@ -1,4 +1,5 @@
-// tilt web client: connection, decoder, renderer, UI, stats and debug hooks (brief 6).
+// tilt web client, headless: connection, decoder, renderer and input. It draws no controls of its
+// own; the page that embeds it gets its state and drives it over postMessage (see `host`).
 import { createInput, message } from './input.js';
 import { WtSocket } from './transport.js';
 
@@ -29,8 +30,6 @@ const STALL_MS = 1000;
 // before giving up on the stream.
 const SOFTWARE_AFTER_FAILURES = 2;
 const GIVE_UP_AFTER_FAILURES = 4;
-const TOOLBAR_HIDE_MS = 3000;
-const TOAST_MS = 3500;
 const PROBE_MAX_EVENTS = 10000;
 // Playout smoothing (see `pace`): frames are shown on the server's capture rhythm, delayed by
 // what the network's jitter needs (how late frames came: the LATE_PERCENTILE of the last
@@ -74,40 +73,6 @@ const ui = {
   canvas: $('screen'),
   sprite: $('cursor'),
   kbd: $('kbd'),
-  toolbar: $('toolbar'),
-  edge: $('edge'),
-  dot: $('dot'),
-  control: $('btn-control'),
-  keyboard: $('btn-keyboard'),
-  keys: $('btn-keys'),
-  type: $('btn-type'),
-  scale: $('btn-scale'),
-  fullscreen: $('btn-fullscreen'),
-  menuBtn: $('btn-menu'),
-  strip: $('keys'),
-  menu: $('menu'),
-  touchRow: $('touch-row'),
-  cmdRow: $('cmd-row'),
-  cmdToggle: $('opt-cmd'),
-  altRow: $('alt-row'),
-  altToggle: $('opt-alt'),
-  info: $('menu-info'),
-  statsToggle: $('opt-stats'),
-  typer: $('typer'),
-  typerForm: $('typer-form'),
-  typerText: $('typer-text'),
-  typerSend: $('typer-send'),
-  typerCancel: $('typer-cancel'),
-  stats: $('stats'),
-  overlay: $('overlay'),
-  overlayMsg: $('overlay-msg'),
-  overlayDetail: $('overlay-detail'),
-  tokenForm: $('token-form'),
-  tokenInput: $('token-input'),
-  retry: $('overlay-retry'),
-  unsupported: $('unsupported'),
-  unsupportedMsg: $('unsupported-msg'),
-  toast: $('toast'),
 };
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -162,25 +127,27 @@ function readOptions() {
   const probe = (get('probe') || '').split(',').map(Number);
   return {
     token: takeHashToken() ?? load('sessionStorage', 'tilt.token'),
-    control: get('control') === '1',
-    stats: get('stats') !== null ? get('stats') === '1' : load('localStorage', 'tilt.stats') === '1',
+    // remote=1 (or yes, true; control=1 is the older name): the viewer controls the desktop by
+    // default. It takes control on opening, and a press on the screen takes it back.
+    remote: ['1', 'yes', 'true'].includes(get('remote') ?? '') || get('control') === '1',
+    // Post `tilt:stats` to the host page once a second.
+    stats: get('stats') === '1',
     touch: touch === 'trackpad' || touch === 'direct' ? touch
-      : load('localStorage', 'tilt.touch') || (Math.min(screen.width, screen.height) < 600 ? 'trackpad' : 'direct'),
+      : Math.min(screen.width, screen.height) < 600 ? 'trackpad' : 'direct',
     probe: probe.length === 2 && probe.every((v) => Number.isInteger(v) && v >= 0) ? probe : null,
     scale: get('scale') === '1' ? '1' : 'fit',
     framing: get('framing') === 'avcc' ? 'avcc' : 'annexb',
     smooth: get('smooth') !== '0',
-    // No controls of our own: the host page draws them (see `host`).
-    embed: get('embed') === '1',
   };
 }
 
 const opts = readOptions();
 let token = opts.token;
 let touchMode = opts.touch === 'direct' ? 'direct' : 'trackpad';
-let cmdToCtrl = load('localStorage', 'tilt.cmdToCtrl') !== '0';
-let optionAsAlt = load('localStorage', 'tilt.optionAsAlt') === '1';
-const APPLE = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+// On Apple devices: Cmd+C/V/X/A/Z/F act as Ctrl; Option types its special characters rather
+// than acting as Alt. The host page can change both (`tilt:keymap`).
+let cmdToCtrl = true;
+let optionAsAlt = false;
 // Phones and tablets; a laptop with a touchscreen keeps the desktop UI.
 const touchDevice = matchMedia('(pointer: coarse)').matches;
 const finePointer = matchMedia('(pointer: fine)');
@@ -228,10 +195,12 @@ const conn = {
   lost: '', // the id of this page's last session that held control when its connection went
   server: '',
   fatal: '',
-  askToken: false,
+  code: '', // with `fatal`: why the page stopped (auth, version, webtransport, unsupported)
   notice: '',
 };
-let wantControl = opts.control;
+let wantControl = opts.remote;
+let remote = opts.remote;
+let statsOn = opts.stats;
 let serverStats = null;
 let videoOn = true; // what this session's server was last told; sessions start with video on
 
@@ -321,9 +290,10 @@ function connect() {
   conn.timer = 0;
   detach();
   conn.openedAt = performance.now();
-  setDot('wait', 'Connecting');
+  host.changed();
   if (typeof WebTransport !== 'function') {
     conn.fatal = 'This browser cannot open the stream: tilt needs WebTransport (Chrome, Edge, Firefox 125+ or Safari 26.4+).';
+    conn.code = 'webtransport';
     showFatal();
     return;
   }
@@ -363,9 +333,12 @@ function onClosed(code) {
   endSession();
   if (!conn.fatal && code === 4001) {
     conn.fatal = 'Access denied: the token is missing or wrong.';
-    conn.askToken = true;
+    conn.code = 'auth';
   }
-  if (!conn.fatal && code === 4003) conn.fatal = 'This page and the server speak different protocol versions. Reload the page.';
+  if (!conn.fatal && code === 4003) {
+    conn.fatal = 'This page and the server speak different protocol versions. Reload the page.';
+    conn.code = 'version';
+  }
   if (conn.fatal) showFatal();
   else scheduleReconnect();
 }
@@ -373,7 +346,7 @@ function onClosed(code) {
 function scheduleReconnect() {
   clearTimeout(conn.timer);
   conn.timer = 0;
-  showOverlay(conn.everWelcomed ? 'Reconnecting…' : 'Connecting…', conn.notice);
+  showStatus(conn.everWelcomed ? 'Reconnecting…' : 'Connecting…', conn.notice);
   // A hidden page gets about one timer wake-up a minute (Chrome's intensive throttling): too few
   // PINGs to keep a session from idling out, so each one would just cycle. The visibilitychange
   // handler connects as soon as the page is shown.
@@ -391,7 +364,7 @@ function scheduleReconnect() {
 
 function reconnect() {
   conn.fatal = '';
-  conn.askToken = false;
+  conn.code = '';
   conn.notice = '';
   conn.attempt = 0;
   video.undecodable = '';
@@ -399,7 +372,7 @@ function reconnect() {
   video.failures = 0;
   setFraming(opts.framing);
   endSession();
-  if (!ui.overlay.hidden) showOverlay(conn.everWelcomed ? 'Reconnecting…' : 'Connecting…');
+  if (status.shown) showStatus(conn.everWelcomed ? 'Reconnecting…' : 'Connecting…');
   connect();
 }
 
@@ -422,8 +395,7 @@ function endSession() {
   video.lastIdrAt = -Infinity;
   cursor.shapes.clear();
   serverStats = null;
-  setDot(conn.fatal ? 'bad' : 'wait', conn.fatal ? 'Disconnected' : 'Connecting');
-  updateControls();
+  host.changed();
   applyCursor();
 }
 
@@ -469,9 +441,7 @@ function onWelcome(m) {
   resize.allowed = m.resize === true;
   resize.sent = '';
   sendResize();
-  setDot('ok', 'Connected');
-  updateControls();
-  showToolbar();
+  host.changed();
   videoOn = true;
   syncVideo();
   // Video stays off for a stream this browser cannot decode, so no frame will end "Reconnecting…".
@@ -490,14 +460,13 @@ function onControl(m) {
   const you = m.you === true;
   if (stats.control && !you && wantControl) {
     wantControl = false;
-    toast('Another viewer took control.');
+    notice('Another viewer took control.');
   }
   stats.control = you;
   conn.held = m.held === true;
   conn.holder = conn.held && typeof m.holder === 'string' ? m.holder : null;
   input.setEnabled(you);
   if (you && finePointer.matches && !touchDevice) input.focusKeyboard();
-  updateControls();
   host.changed();
   applyCursor();
   maybeTake();
@@ -535,10 +504,11 @@ function onServerError(m) {
   switch (code) {
     case 'auth':
       conn.fatal = 'Access denied: the token is missing or wrong.';
-      conn.askToken = true;
+      conn.code = 'auth';
       break;
     case 'version':
       conn.fatal = `This page and the server speak different protocol versions${msg ? ` (${msg})` : ''}. Reload the page.`;
+      conn.code = 'version';
       break;
     case 'busy':
       conn.notice = 'The server already has its maximum number of viewers.';
@@ -551,16 +521,16 @@ function onServerError(m) {
       break;
     case 'forbidden':
       wantControl = false;
-      toast('This is a view-only session: it cannot take control.');
+      notice('This is a view-only session: it cannot take control.');
       break;
     case 'unsupported_size':
       // The session stays open without video. The server sends this once per size; a KEY frame
       // follows only once the screen has a size that works.
       video.sizeNotice = true;
-      showOverlay('The remote screen cannot be streamed at its current size.', msg);
+      showStatus('The remote screen cannot be streamed at its current size.', msg, 'size');
       break;
     default:
-      toast(msg || `Server error: ${code}`);
+      notice(msg || `Server error: ${code}`);
   }
 }
 
@@ -599,10 +569,10 @@ function tick() {
   if (conn.take && conn.held && now > conn.take.until) {
     conn.take = null;
     wantControl = false;
-    toast('Another viewer has control.');
+    notice('Another viewer has control.');
   }
   watchDecoder(now);
-  updateStats(now);
+  if (statsOn) postStats(now);
 }
 
 // ---- video
@@ -760,7 +730,7 @@ function decoderFailed(e) {
     }
     if (video.failures === SOFTWARE_AFTER_FAILURES && config) preferSoftware(config);
   }
-  toast(`Video decoder error (${name}); resyncing.`);
+  notice(`Video decoder error (${name}); resyncing.`);
   requestIdr();
 }
 
@@ -790,7 +760,7 @@ function cannotDecode(key, what, e) {
 }
 
 function showUndecodable() {
-  showOverlay('This browser cannot decode the desktop stream.', video.undecodableDetail, { retry: true });
+  showStatus('This browser cannot decode the desktop stream.', video.undecodableDetail, 'undecodable');
 }
 
 function onDecoded(decoder, frame) {
@@ -1016,7 +986,7 @@ function draw(frame) {
   if (opts.probe) probe(stats.lastDrawnSeq);
   // A fresh frame in a live session ends "Connecting…", "Reconnecting…" and decoder trouble alike;
   // frames the decoder still held when the screen size failed do not.
-  if (!ui.overlay.hidden && conn.welcomed && !video.sizeNotice) hideOverlay();
+  if (status.shown && conn.welcomed && !video.sizeNotice) hideStatus();
 }
 
 /** Draws a patch's rectangles; false if it does not fit the canvas (no frame of its size yet). */
@@ -1354,8 +1324,6 @@ function setScaleMode(mode) {
   view.z = 1;
   view.tx = 0;
   view.ty = 0;
-  ui.scale.textContent = mode === 'fit' ? 'Fit' : '1:1';
-  ui.scale.title = mode === 'fit' ? 'Scaled to fit; switch to 1:1 pixels' : '1:1 pixels; switch to fit';
   layout();
 }
 
@@ -1379,8 +1347,8 @@ const input = createInput({
   optionAsAlt: () => optionAsAlt,
   view: viewApi,
   onChange() {
-    renderSticky();
     scheduleSprite();
+    host.changed();
   },
   onCursor: scheduleSprite,
   onPointerType(type) {
@@ -1395,145 +1363,45 @@ function takeControl() {
   sendJson({ t: 'control', take: true });
 }
 
-// ---- UI
+function releaseControl() {
+  wantControl = false;
+  conn.take = null;
+  sendJson({ t: 'control', take: false });
+}
 
-function setDot(state, label) {
-  ui.dot.className = state;
-  ui.dot.title = label;
-  ui.dot.setAttribute('aria-label', label);
+// ---- status: the page shows only the screen; the host page is told why there is no picture
+
+const status = { shown: true, msg: 'Connecting…', detail: '', code: '' };
+
+function showStatus(msg, detail = '', code = '') {
+  status.shown = true;
+  status.msg = msg;
+  status.detail = detail;
+  status.code = code;
   host.changed();
 }
 
-function updateControls() {
-  const canControl = conn.welcomed && stats.role === 'control';
-  ui.control.disabled = !canControl;
-  ui.control.setAttribute('aria-pressed', String(stats.control));
-  ui.control.title = !conn.welcomed ? 'Not connected'
-    : stats.role !== 'control' ? 'View-only session'
-      : stats.control ? 'Release control'
-        : conn.held ? 'Take control from the current controller' : 'Take control';
-  const typing = stats.control;
-  for (const b of [ui.keyboard, ui.keys, ui.type, ui.typerSend, ...ui.strip.querySelectorAll('button')]) b.disabled = !typing;
-  if (!typing) {
-    ui.strip.hidden = true;
-    ui.keys.setAttribute('aria-pressed', 'false');
-  }
-  ui.info.textContent = [stats.session && `session ${stats.session}`, stats.role && `${stats.role} role`, conn.server].filter(Boolean).join(' · ');
-  armToolbarHide();
-}
-
-function renderSticky() {
-  const s = input.sticky();
-  for (const b of ui.strip.querySelectorAll('[data-mod]')) {
-    const level = s[b.dataset.mod];
-    b.dataset.state = String(level);
-    b.setAttribute('aria-pressed', String(level > 0));
-  }
-}
-
-function showOverlay(title, detail = '', { retry = false, askToken = false } = {}) {
-  ui.overlayMsg.textContent = title;
-  ui.overlayDetail.textContent = detail;
-  ui.overlayDetail.hidden = !detail;
-  ui.retry.hidden = !retry;
-  ui.tokenForm.hidden = !askToken;
-  ui.overlay.classList.toggle('solid', !ui.canvas.width);
-  ui.overlay.hidden = false;
-  const root = document.documentElement;
-  root.classList.toggle('waiting', !ui.canvas.width);
-  // The status animation plays once per call (each connection attempt): restart it.
-  root.classList.remove('attempt');
-  void root.offsetWidth;
-  root.classList.add('attempt');
-  showToolbar();
-  host.changed();
-}
-
-function hideOverlay() {
-  ui.overlay.hidden = true;
-  document.documentElement.classList.remove('waiting', 'attempt');
-  armToolbarHide();
+function hideStatus() {
+  status.shown = false;
+  status.msg = '';
+  status.detail = '';
+  status.code = '';
   host.changed();
 }
 
 function showFatal() {
   clearTimeout(conn.timer);
-  setDot('bad', 'Disconnected');
-  showOverlay(conn.fatal, '', { retry: true, askToken: conn.askToken });
+  showStatus(conn.fatal, '', conn.code);
 }
 
-let toastTimer = 0;
-function toast(text) {
+/** Something the viewer should hear about: the host page decides whether and how to show it. */
+function notice(text) {
   host.post({ type: 'tilt:notice', text });
-  ui.toast.textContent = text;
-  ui.toast.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { ui.toast.hidden = true; }, TOAST_MS);
-}
-
-// Touch devices always hide the toolbar after a pause; desktops only while controlling, when it
-// would cover part of the remote screen.
-let hideTimer = 0;
-function showToolbar() {
-  ui.toolbar.classList.remove('away');
-  ui.edge.hidden = true;
-  armToolbarHide();
-}
-
-function armToolbarHide() {
-  clearTimeout(hideTimer);
-  if (!(touchDevice || stats.control)) {
-    ui.toolbar.classList.remove('away');
-    ui.edge.hidden = true;
-    return;
-  }
-  hideTimer = setTimeout(() => {
-    // Hover and focus stick after taps on mobile browsers, so they only count with a mouse.
-    const busy = !conn.welcomed || !ui.overlay.hidden || !ui.menu.hidden || !ui.typer.hidden
-      || (!touchDevice && (ui.toolbar.matches(':hover') || ui.toolbar.contains(document.activeElement)));
-    if (busy) {
-      armToolbarHide();
-      return;
-    }
-    ui.toolbar.classList.add('away');
-    // Touch users get a tap target at the top edge; mice reveal the bar by touching the edge.
-    ui.edge.hidden = !touchDevice;
-  }, TOOLBAR_HIDE_MS);
-}
-
-function setMenu(open) {
-  if (open) {
-    // Hang the menu under its button; the toolbar is centred, so the screen edge can be far off.
-    const r = ui.menuBtn.getBoundingClientRect();
-    ui.menu.style.right = `${Math.max(8, window.innerWidth - r.right)}px`;
-  }
-  ui.menu.hidden = !open;
-  ui.menuBtn.setAttribute('aria-expanded', String(open));
-  if (!open) armToolbarHide();
-}
-
-function setStats(on) {
-  ui.stats.hidden = !on;
-  ui.statsToggle.checked = on;
-  if (on) updateStats(performance.now());
 }
 
 function setTouchMode(mode) {
   touchMode = mode;
-  for (const b of ui.menu.querySelectorAll('[data-touch]')) b.setAttribute('aria-checked', String(b.dataset.touch === mode));
   scheduleSprite();
-}
-
-function openTyper() {
-  ui.typer.hidden = false;
-  ui.typerText.value = '';
-  ui.typerText.focus();
-}
-
-function closeTyper() {
-  ui.typer.hidden = true;
-  if (stats.control && finePointer.matches && !touchDevice) input.focusKeyboard();
-  armToolbarHide();
 }
 
 const fsRoot = document.documentElement;
@@ -1544,23 +1412,26 @@ const fullscreenElement = () => document.fullscreenElement || document.webkitFul
 function toggleFullscreen() {
   try {
     const p = fullscreenElement() ? exitFs.call(document) : requestFs.call(fsRoot);
-    if (p && p.catch) p.catch(() => toast('Fullscreen is not available here.'));
+    if (p && p.catch) p.catch(() => notice('Fullscreen is not available here.'));
   } catch {
-    toast('Fullscreen is not available here.');
+    notice('Fullscreen is not available here.');
   }
 }
 
 function onFullscreenChange() {
   const on = Boolean(fullscreenElement());
-  ui.fullscreen.setAttribute('aria-pressed', String(on));
   // Keyboard Lock (Chromium, fullscreen only) lets Esc and browser shortcuts reach the remote.
   const kl = navigator.keyboard;
   if (on && kl && kl.lock) kl.lock().catch(() => {});
   else if (!on && kl && kl.unlock) kl.unlock();
+  host.changed();
 }
 
+// ---- stream statistics, posted to the host page once a second while asked for
+
 let rates = { at: performance.now(), decoded: 0, drawn: 0, patches: 0, bytes: 0 };
-function updateStats(now) {
+
+function postStats(now) {
   const dt = (now - rates.at) / 1000;
   if (dt >= 0.5) {
     rates = {
@@ -1575,152 +1446,38 @@ function updateStats(now) {
       kbps: ((stats.bytes - rates.bytes) * 8) / 1000 / dt,
     };
   }
-  if (ui.stats.hidden) return;
-  const n = (v, digits = 1) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(Number.isInteger(v) ? 0 : digits) : '-');
-  const s = serverStats || {};
-  ui.stats.textContent = [
-    `fps    ${n(rates.fpsDecoded)} decoded  ${n(rates.fpsDrawn)} drawn  ${n(rates.patchesPerS)} patches  smooth ${opts.smooth ? `${stats.smoothMs} ms` : 'off'}`,
-    `recv   ${n(rates.kbps, 0)} kbps   ping ${stats.rttMs ?? '-'} ms`,
-    `video  ${stats.width}x${stats.height} ${stats.codec || '-'} ${video.framing}${video.hw === 'prefer-software' ? ' software' : ''}  queue ${video.decoder ? video.decoder.decodeQueueSize : 0}`,
-    `you    ${stats.role ? `${stats.role} role` : '-'}${stats.control ? ', in control' : ''}  errors ${stats.decodeErrors}  stalls ${stats.decoderStalls}`,
-    `server ${n(s.fps)} fps  ${n(s.kbps, 0)} kbps  target ${n(s.bitrate_kbps, 0)} kbps`,
-    `       rtt ${n(s.rtt_ms)} (min ${n(s.min_rtt_ms)})  queue ${n(s.queue_ms)}  enc ${n(s.enc_ms)} ms  patches ${n(s.patches)}`,
-    `       inflight ${n(s.inflight)}  skipped ${n(s.skipped)}  viewers ${n(s.viewers)}`,
-  ].join('\n');
+  const r = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.round(v * 10) / 10 : null);
+  host.post({
+    type: 'tilt:stats',
+    client: {
+      fpsDecoded: r(rates.fpsDecoded),
+      fpsDrawn: r(rates.fpsDrawn),
+      patchesPerS: r(rates.patchesPerS),
+      kbps: r(rates.kbps),
+      rttMs: stats.rttMs,
+      smoothMs: opts.smooth ? stats.smoothMs : null,
+      width: stats.width,
+      height: stats.height,
+      codec: stats.codec,
+      framing: video.framing,
+      software: video.hw === 'prefer-software',
+      queue: video.decoder ? video.decoder.decodeQueueSize : 0,
+      decodeErrors: stats.decodeErrors,
+      decoderStalls: stats.decoderStalls,
+    },
+    server: serverStats ? (({ t, ...rest }) => rest)(serverStats) : null,
+  });
 }
 
-function wireUi() {
-  // Toolbar presses must not take focus from the hidden textarea: that would stop desktop typing
-  // and close the soft keyboard. Cancelling mousedown keeps the click in every engine; cancelling
-  // pointerdown would lose it in WebKit.
-  for (const el of [ui.toolbar, ui.strip, ui.menu]) {
-    el.addEventListener('mousedown', (e) => {
-      if (!(e.target instanceof HTMLInputElement)) e.preventDefault();
-    });
-  }
-  ui.toolbar.addEventListener('pointerdown', armToolbarHide);
-  ui.edge.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    showToolbar();
-  });
-  // The bar slides in under the finger, so the touch must not end in a click: it would press the
-  // button now under it (in Chrome, and on iOS even after a drag). Cancelling pointerdown does not
-  // stop that click.
-  ui.edge.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
-  window.addEventListener('pointermove', (e) => {
-    if (e.pointerType === 'mouse' && e.clientY <= 4) showToolbar();
-  });
-
-  ui.control.addEventListener('click', () => {
-    if (!stats.control) {
-      takeControl();
-      return;
-    }
-    wantControl = false;
-    sendJson({ t: 'control', take: false });
-  });
-  ui.keyboard.hidden = !touchDevice;
-  let keyboardWasOpen = false;
-  ui.keyboard.addEventListener('pointerdown', () => { keyboardWasOpen = input.keyboardFocused(); });
-  ui.keyboard.addEventListener('click', () => {
-    // iOS opens the soft keyboard only for a focus() made inside this handler.
-    if (keyboardWasOpen) input.blurKeyboard();
-    else input.focusKeyboard();
-    keyboardWasOpen = false;
-  });
-  // Type text, Extra keys and Scale live in the settings menu, which closes once one is picked.
-  ui.keys.addEventListener('click', () => {
-    ui.strip.hidden = !ui.strip.hidden;
-    ui.keys.setAttribute('aria-pressed', String(!ui.strip.hidden));
-    setMenu(false);
-  });
-  ui.type.addEventListener('click', () => {
-    setMenu(false);
-    openTyper();
-  });
-  ui.scale.addEventListener('click', () => {
-    setScaleMode(view.mode === 'fit' ? '1' : 'fit');
-    setMenu(false);
-  });
-  ui.fullscreen.hidden = !requestFs;
-  ui.fullscreen.addEventListener('click', toggleFullscreen);
+function wire() {
+  window.addEventListener('message', (e) => host.onMessage(e));
+  // remote=1: pressing on the screen takes control, from whoever has it (the last to take control
+  // has it). That first press only takes control.
+  ui.viewport.addEventListener('pointerdown', () => {
+    if (remote && conn.welcomed && stats.role === 'control' && !stats.control) takeControl();
+  }, true);
   document.addEventListener('fullscreenchange', onFullscreenChange);
   document.addEventListener('webkitfullscreenchange', onFullscreenChange);
-  ui.statsToggle.addEventListener('change', () => {
-    setStats(ui.statsToggle.checked);
-    save('localStorage', 'tilt.stats', ui.statsToggle.checked ? '1' : '0');
-  });
-  ui.menuBtn.addEventListener('click', () => setMenu(ui.menu.hidden));
-  document.addEventListener('pointerdown', (e) => {
-    if (!ui.menu.hidden && !ui.menu.contains(e.target) && !ui.menuBtn.contains(e.target)) setMenu(false);
-  }, true);
-
-  // Extra keys act on pointerdown and never take focus, so the soft keyboard stays open.
-  ui.strip.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
-  for (const b of ui.strip.querySelectorAll('button')) {
-    if (b.dataset.mod) {
-      b.addEventListener('pointerdown', (e) => {
-        e.preventDefault();
-        if (!b.disabled) input.toggleSticky(b.dataset.mod);
-      });
-      continue;
-    }
-    const ks = parseInt(b.dataset.ks, 16);
-    b.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      if (!b.disabled) input.holdKey(ks);
-    });
-    for (const type of ['pointerup', 'pointercancel', 'pointerleave']) b.addEventListener(type, () => input.releaseKey(ks));
-  }
-
-  ui.touchRow.hidden = !touchDevice;
-  for (const b of ui.menu.querySelectorAll('[data-touch]')) {
-    b.addEventListener('click', () => {
-      setTouchMode(b.dataset.touch);
-      save('localStorage', 'tilt.touch', touchMode);
-    });
-  }
-  ui.cmdRow.hidden = !APPLE;
-  ui.cmdToggle.checked = cmdToCtrl;
-  ui.cmdToggle.addEventListener('change', () => {
-    cmdToCtrl = ui.cmdToggle.checked;
-    save('localStorage', 'tilt.cmdToCtrl', cmdToCtrl ? '1' : '0');
-  });
-  ui.altRow.hidden = !APPLE;
-  ui.altToggle.checked = optionAsAlt;
-  ui.altToggle.addEventListener('change', () => {
-    optionAsAlt = ui.altToggle.checked;
-    save('localStorage', 'tilt.optionAsAlt', optionAsAlt ? '1' : '0');
-  });
-
-  ui.typerForm.addEventListener('submit', (e) => {
-    e.preventDefault();
-    if (!stats.control) return;
-    if (ui.typerText.value) input.sendText(ui.typerText.value);
-    closeTyper();
-  });
-  ui.typerCancel.addEventListener('click', closeTyper);
-  ui.typerText.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeTyper();
-    else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) ui.typerForm.requestSubmit();
-  });
-
-  ui.retry.addEventListener('click', reconnect);
-  window.addEventListener('message', (e) => host.onMessage(e));
-  // Embedded, the screen has no Control button: pressing on it takes control (from whoever has
-  // it: the last to take control has it). That first press only takes control.
-  if (opts.embed) {
-    ui.viewport.addEventListener('pointerdown', () => {
-      if (conn.welcomed && stats.role === 'control' && !stats.control) takeControl();
-    }, true);
-  }
-  ui.tokenForm.addEventListener('submit', (e) => {
-    e.preventDefault();
-    token = ui.tokenInput.value.trim();
-    save('sessionStorage', 'tilt.token', token);
-    ui.tokenInput.value = '';
-    reconnect();
-  });
 
   window.addEventListener('hashchange', () => {
     const t = takeHashToken();
@@ -1743,13 +1500,6 @@ function wireUi() {
   });
 
   new ResizeObserver(layout).observe(ui.viewport);
-  // The viewport ends above the strip (CSS --strip), whose height depends on how its rows wrap.
-  // Applied a frame later: resizing the viewport inside this callback would trip the
-  // ResizeObserver loop limit.
-  new ResizeObserver(() => requestAnimationFrame(() => {
-    const h = ui.strip.hidden ? 0 : ui.strip.offsetHeight + 16;
-    document.documentElement.style.setProperty('--strip', `${h}px`);
-  })).observe(ui.strip);
   watchDpr();
   const vv = window.visualViewport;
   if (vv) {
@@ -1765,25 +1515,22 @@ function wireUi() {
 }
 
 /**
- * The embedding page (docs/guide.md, "Embedding"). Inside a frame, every change of state is
- * posted to the parent as `{type: 'tilt:state', status, message, detail, control, held, role,
- * session, screen}`, and notices as `{type: 'tilt:notice', text}`. The parent, and only the
- * parent, may send `{type: 'tilt:control', take}`, `{type: 'tilt:type', text}`,
- * `{type: 'tilt:fullscreen'}`, `{type: 'tilt:reconnect'}`, `{type: 'tilt:stats', on}`,
- * `{type: 'tilt:scale', mode: 'fit' | '1'}` and `{type: 'tilt:theme', theme: 'light' | 'dark' |
- * 'system'}`.
+ * The host page (docs/guide.md, "Embedding"): the page draws no controls, so everything else goes
+ * through postMessage. Inside a frame (or a window opened by the host), every change of state is
+ * posted as `tilt:state`, notices as `tilt:notice`, and statistics as `tilt:stats` while asked
+ * for. Commands are obeyed from that host page only.
  */
 const host = {
-  framed: window.parent !== window,
+  target: window.parent !== window ? window.parent : window.opener || null,
   queued: false,
   last: '',
   post(msg) {
-    if (!this.framed) return;
-    try { window.parent.postMessage(msg, '*'); } catch { /* the parent went away */ }
+    if (!this.target) return;
+    try { this.target.postMessage(msg, '*'); } catch { /* the host went away */ }
   },
   /** Posts the state once the current task is done, if it differs from the last one posted. */
   changed() {
-    if (!this.framed || this.queued) return;
+    if (!this.target || this.queued) return;
     this.queued = true;
     queueMicrotask(() => {
       this.queued = false;
@@ -1795,43 +1542,75 @@ const host = {
     });
   },
   state() {
-    const status = !ui.unsupported.hidden || conn.fatal ? 'error'
-      : conn.welcomed && ui.overlay.hidden ? 'live'
+    const s = conn.fatal || status.code === 'undecodable' ? 'error'
+      : conn.welcomed && !status.shown ? 'live'
         : conn.everWelcomed ? 'reconnecting' : 'connecting';
     return {
       type: 'tilt:state',
-      status,
-      message: ui.overlay.hidden ? '' : ui.overlayMsg.textContent,
-      detail: ui.overlay.hidden ? '' : ui.overlayDetail.textContent,
+      status: s,
+      message: status.shown ? status.msg : '',
+      detail: status.shown ? status.detail : '',
+      code: status.shown ? status.code : '',
       control: stats.control,
       held: conn.held === true,
       role: stats.role,
+      remote,
       session: stats.session,
       screen: { w: stats.width, h: stats.height },
+      modifiers: input.sticky(),
+      fullscreen: Boolean(fullscreenElement()),
     };
   },
   onMessage(e) {
-    if (e.source !== window.parent || !e.data || typeof e.data !== 'object') return;
-    const m = e.data;
+    if (this.target && e.source === this.target) this.run(e.data);
+  },
+  run(m) {
+    if (!m || typeof m !== 'object') return;
     switch (m.type) {
       case 'tilt:control':
-        if (m.take === false) {
-          wantControl = false;
-          sendJson({ t: 'control', take: false });
-        } else {
-          takeControl();
-        }
+        if (m.take === false) releaseControl();
+        else takeControl();
+        break;
+      case 'tilt:remote':
+        remote = m.on === true;
+        if (remote && !stats.control) takeControl();
+        host.changed();
         break;
       case 'tilt:type':
         if (typeof m.text === 'string' && m.text && stats.control) input.sendText(m.text);
         break;
+      case 'tilt:key':
+        if (!Number.isInteger(m.keysym)) break;
+        if (m.down === false) input.releaseKey(m.keysym);
+        else input.holdKey(m.keysym);
+        break;
+      case 'tilt:modifier':
+        if (['ctrl', 'alt', 'super'].includes(m.name)) input.toggleSticky(m.name);
+        break;
+      case 'tilt:keyboard':
+        if (m.show === false) input.blurKeyboard();
+        else if (stats.control) input.focusKeyboard();
+        break;
       case 'tilt:fullscreen': toggleFullscreen(); break;
       case 'tilt:reconnect': reconnect(); break;
-      case 'tilt:stats': setStats(m.on === true); break;
+      case 'tilt:token':
+        if (typeof m.token !== 'string') break;
+        token = m.token.trim();
+        save('sessionStorage', 'tilt.token', token);
+        reconnect();
+        break;
+      case 'tilt:stats':
+        statsOn = m.on !== false;
+        if (statsOn) postStats(performance.now());
+        break;
       case 'tilt:scale': if (m.mode === 'fit' || m.mode === '1') setScaleMode(m.mode); break;
-      case 'tilt:theme':
-        if (m.theme === 'light' || m.theme === 'dark') document.documentElement.dataset.theme = m.theme;
-        else if (m.theme === 'system') delete document.documentElement.dataset.theme;
+      case 'tilt:touch': if (m.mode === 'trackpad' || m.mode === 'direct') setTouchMode(m.mode); break;
+      case 'tilt:keymap':
+        if (typeof m.cmdToCtrl === 'boolean') cmdToCtrl = m.cmdToCtrl;
+        if (typeof m.optionAsAlt === 'boolean') optionAsAlt = m.optionAsAlt;
+        break;
+      case 'tilt:background':
+        if (typeof m.color === 'string') document.documentElement.style.setProperty('--bg', m.color);
         break;
       default: break;
     }
@@ -1846,19 +1625,20 @@ window.tilt = {
   get lastInputAt() { return input.lastInputAt; },
   takeControl,
   reconnect,
+  /** What the host page is posted as `tilt:state`. */
+  state: () => host.state(),
+  /** Runs a host page command (`{type: 'tilt:…'}`) as if the host had posted it. */
+  command: (m) => host.run(m),
 };
 
-wireUi();
+wire();
 setScaleMode(view.mode);
 setTouchMode(touchMode);
-setStats(opts.stats);
-updateControls();
 
 if (typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') {
-  ui.unsupportedMsg.textContent = window.isSecureContext ? UNSUPPORTED : `${UNSUPPORTED} ${INSECURE}`;
-  ui.unsupported.hidden = false;
-  ui.overlay.hidden = true;
-  setDot('bad', 'Unsupported browser');
+  conn.fatal = window.isSecureContext ? UNSUPPORTED : `${UNSUPPORTED} ${INSECURE}`;
+  conn.code = 'unsupported';
+  showFatal();
 } else {
   connect();
   setInterval(tick, PING_MS);

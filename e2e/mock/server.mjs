@@ -28,7 +28,6 @@ const ASSETS = {
   '/keysyms.js': ['keysyms.js', 'text/javascript; charset=utf-8'],
   '/transport.js': ['transport.js', 'text/javascript; charset=utf-8'],
   '/icon.svg': ['icon.svg', 'image/svg+xml'],
-  '/runable.svg': ['runable.svg', 'image/svg+xml'],
 };
 
 const VIDEO = 0x01;

@@ -7,7 +7,7 @@ Pick what you need. Every section stands on its own.
 - [Run the binary](#run-the-binary): on your own machine or VM
 - [Network](#network): what has to reach the VM (Firecracker and other VMs)
 - [Sail](#sail): sandboxes with a public UDP port
-- [Embedding](#embedding): the screen alone inside your app, with your own controls
+- [Embedding](#embedding): the headless page inside your app, with your own controls
 - [Page options](#page-options): what the link's `#…` part can set
 - [Flags](#flags)
 - [Tips and limits](#tips-and-limits)
@@ -21,7 +21,7 @@ On the Linux machine or VM whose screen you want:
 npx tilt-live
 ```
 
-Open the link it prints, then click the cursor button to take control.
+Open the link it prints: it ends in `&remote=1`, so the desktop is yours to control.
 
 - No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh`, then `tilt`.
 - Another display: `tilt --display :1`. Every [flag](#flags) works.
@@ -38,11 +38,9 @@ Open the link it prints, then click the cursor button to take control.
 docker compose up
 ```
 
-Open http://localhost:6090/#token=devtoken (view-only: `#token=viewtoken`).
-
-**Using the viewer:** the cursor button takes control. The toolbar hides while you're in control:
-move to the top edge (or tap it) to bring it back. Stream stats are in the `···` menu, or add
-`&stats=1` to the URL.
+Open http://localhost:6090/#token=devtoken&remote=1 to control the desktop, or
+http://localhost:6090/#token=viewtoken to watch it. The page is the screen alone: controls belong
+to the app that [embeds](#embedding) it.
 
 ## Run the binary
 
@@ -52,7 +50,7 @@ echo "$TILT_TOKEN"
 tilt --display :0
 ```
 
-Open `http://<host>:6090/#token=<token>`.
+Open `http://<host>:6090/#token=<token>&remote=1`.
 
 <details>
 <summary>Logs, health, status, shutdown</summary>
@@ -155,62 +153,78 @@ RestartSec=1
 WantedBy=multi-user.target
 ```
 
-Read the token with `cat /run/tilt/token` and open `https://sb-<id>-6090.sail.box/#token=<token>`.
+Read the token with `cat /run/tilt/token` and open `https://sb-<id>-6090.sail.box/#token=<token>&remote=1`.
 Sail keeps a UDP port's public address while your org holds it, but can hand out a new one
 (another Sailbox took it over): write the address again whenever `expose` returns another.
 
 ## Embedding
 
-To put the desktop inside your own app, load the link in an `<iframe>` with `embed=1` in its
-fragment:
+The page is headless: it shows the remote screen and nothing else. No toolbar, menu, status text
+or notices. Your app draws every control and drives the page over `postMessage`. Load the link in
+an `<iframe>`:
 
 ```html
-<iframe src="https://desk.example.com/#token=…&embed=1&theme=dark"
+<iframe src="https://desk.example.com/#token=…&remote=1"
         allow="clipboard-read; clipboard-write; fullscreen"></iframe>
 ```
 
-- The page is the screen alone: no toolbar, menu or notices. Draw your own controls around it.
-- Pressing on the screen takes control, from whoever has it (that first press only takes control).
-- `theme=light` or `theme=dark` matches your app; without it the page follows the system. The
-  page's own background shows only while there is no picture yet: the Runable mark, in dots.
+- **View only by default.** Without flags the frame shows the live screen and ignores the
+  viewer's mouse and keyboard.
+- **`remote=1`** (or `remote=yes`) gives the viewer the desktop: the page takes control as it
+  opens, and pressing on the screen takes it back if another viewer took it meanwhile (that press
+  only takes control). Control always goes to whoever took it last.
+- Around a screen whose shape differs from the frame's, and before the first frame, the page is
+  transparent, so your app's background shows. `bg=101010` (or any CSS colour) sets one instead.
+- A view-only token (`--view-token`) can never take control, whatever the flags.
 
-The page talks to its parent with `postMessage`. It posts:
+The page posts these to its parent (or, opened with `window.open`, to its opener):
 
 | message | when |
 |---|---|
-| `{type: 'tilt:state', status, message, detail, control, held, role, session, screen: {w, h}}` | on any change. `status` is `connecting`, `live`, `reconnecting` or `error`; `message` and `detail` say why while it is not `live`; `control` is whether this page has control, `held` whether anyone has |
-| `{type: 'tilt:notice', text}` | for what the standalone page would show as a toast |
+| `{type: 'tilt:state', status, message, detail, code, control, held, role, remote, session, screen: {w, h}, modifiers: {ctrl, alt, super}, fullscreen}` | on any change. `status` is `connecting`, `live`, `reconnecting` or `error`. While it is not `live`, `message` and `detail` say why, in words you can show, and `code` names the cause where there is one: `auth` (ask for a token, then send `tilt:token`), `version`, `webtransport`, `unsupported` (no WebCodecs), `undecodable` (offer a retry with `tilt:reconnect`), `size`. `control` is whether this page has control, `held` whether anyone has, `role` is `control` or `view` |
+| `{type: 'tilt:notice', text}` | something worth telling the viewer, such as "Another viewer took control." |
+| `{type: 'tilt:stats', client, server}` | once a second, after `tilt:stats` or with `stats=1`: frame rates, bitrate, round trip, decoder and server numbers |
 
-It obeys these, from its parent only:
+It obeys these, from its parent (or opener) only:
 
 | message | does |
 |---|---|
 | `{type: 'tilt:control', take: true \| false}` | take or let go of control |
+| `{type: 'tilt:remote', on: true \| false}` | switch `remote` on (also takes control) or off |
 | `{type: 'tilt:type', text}` | type text (with control) |
-| `{type: 'tilt:fullscreen'}` | toggle fullscreen (the iframe needs `allow="fullscreen"`) |
+| `{type: 'tilt:key', keysym, down: true \| false}` | press (repeating while held) or release an X keysym, e.g. `0xff1b` Esc, `0xff09` Tab, `0xff51`–`0xff54` arrows: build your own extra keys |
+| `{type: 'tilt:modifier', name: 'ctrl' \| 'alt' \| 'super'}` | cycle a sticky modifier: off, next key only, locked (see `modifiers`) |
+| `{type: 'tilt:keyboard', show: true \| false}` | focus the page's keyboard input (the soft keyboard on touch screens; iOS opens it only from a tap inside the frame) or let go of it |
+| `{type: 'tilt:token', token}` | connect with this token |
 | `{type: 'tilt:reconnect'}` | reconnect now |
-| `{type: 'tilt:theme', theme: 'light' \| 'dark' \| 'system'}` | switch theme |
-| `{type: 'tilt:scale', mode: 'fit' \| '1'}` | fit the page, or 1:1 pixels |
-| `{type: 'tilt:stats', on}` | show the stream statistics |
+| `{type: 'tilt:fullscreen'}` | toggle fullscreen (the iframe needs `allow="fullscreen"`) |
+| `{type: 'tilt:scale', mode: 'fit' \| '1'}` | fit the frame, or 1:1 pixels |
+| `{type: 'tilt:touch', mode: 'trackpad' \| 'direct'}` | how touch moves the pointer |
+| `{type: 'tilt:keymap', cmdToCtrl, optionAsAlt}` | on Apple devices: Cmd+C/V/X/A/Z/F act as Ctrl (on by default); Option acts as Alt rather than typing special characters (off by default) |
+| `{type: 'tilt:stats', on: true \| false}` | start or stop `tilt:stats` messages |
+| `{type: 'tilt:background', color}` | the page's background (CSS colour) |
 
 ```js
 const frame = document.querySelector('iframe');
+const send = (m) => frame.contentWindow.postMessage(m, '*');
 addEventListener('message', (e) => {
-  if (e.source === frame.contentWindow && e.data.type === 'tilt:state') render(e.data);
+  if (e.source !== frame.contentWindow) return;
+  if (e.data.type === 'tilt:state') render(e.data);          // your status, control button...
+  if (e.data.type === 'tilt:notice') showToast(e.data.text);
 });
-frame.contentWindow.postMessage({ type: 'tilt:control', take: true }, '*');
+escButton.onpointerdown = () => send({ type: 'tilt:key', keysym: 0xff1b, down: true });
+escButton.onpointerup = () => send({ type: 'tilt:key', keysym: 0xff1b, down: false });
 ```
 
 ## Page options
 
-Add these to the link's fragment, after the token: `#token=…&embed=1&theme=light`.
+Add these to the link's fragment, after the token: `#token=…&remote=1&bg=101010`.
 
 | option | |
 |---|---|
-| `embed=1` | the screen alone, for [embedding](#embedding) |
-| `theme=light`, `theme=dark` | the page's theme; the system's without it |
-| `control=1` | take control on opening |
-| `stats=1` | show the stream statistics |
+| `remote=1`, `remote=yes` | the viewer controls the desktop: take control on opening, and on a press ([embedding](#embedding)). `control=1` is the older name |
+| `bg=<colour>` | the page's background, a CSS colour or hex without `#`; transparent without it |
+| `stats=1` | post `tilt:stats` to the host page once a second |
 | `scale=1` | 1:1 pixels rather than fitted |
 | `touch=trackpad`, `touch=direct` | how touch moves the pointer |
 | `smooth=0` | show frames as they arrive, with no jitter smoothing |

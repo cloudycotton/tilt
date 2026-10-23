@@ -173,8 +173,8 @@ pub fn kept_token() -> anyhow::Result<(PathBuf, String)> {
     Ok((file, token))
 }
 
-/// Links that open the viewer with `token`: for a server on every interface, localhost and this
-/// machine's address.
+/// Links that open the viewer with `token`, in control (`remote=1`): for a server on every
+/// interface, localhost and this machine's address.
 pub fn links(bind: SocketAddr, token: &str) -> Vec<String> {
     let port = bind.port();
     let hosts = if bind.ip().is_unspecified() {
@@ -191,7 +191,7 @@ pub fn links(bind: SocketAddr, token: &str) -> Vec<String> {
         .into_iter()
         .map(|h| {
             let h = if h.contains(':') { format!("[{h}]") } else { h };
-            format!("http://{h}:{port}/#token={token}")
+            format!("http://{h}:{port}/#token={token}&remote=1")
         })
         .collect()
 }
@@ -212,9 +212,9 @@ mod tests {
     #[test]
     fn links_name_the_bound_address() {
         let bound: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-        assert_eq!(links(bound, "t"), ["http://127.0.0.1:7000/#token=t"]);
+        assert_eq!(links(bound, "t"), ["http://127.0.0.1:7000/#token=t&remote=1"]);
         let everywhere = links("0.0.0.0:6090".parse().unwrap(), "t");
-        assert_eq!(everywhere[0], "http://localhost:6090/#token=t");
+        assert_eq!(everywhere[0], "http://localhost:6090/#token=t&remote=1");
     }
 
     #[test]

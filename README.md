@@ -22,7 +22,8 @@
 npx tilt-live
 ```
 
-Open the link it prints, click the cursor button, and the desktop is yours.
+Open the link it prints and the desktop is yours. The page is the screen alone, made to
+[embed](docs/guide.md#embedding) in your app: your controls drive it with `postMessage`.
 
 <sub>Run it on the Linux machine or VM whose screen you want. It keeps itself up to date.
 No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/install.sh | sh` then `tilt`.</sub>
