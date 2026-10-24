@@ -5,7 +5,7 @@
 #
 #   tools/wan/run.sh "--delay 25 --jitter 4 --mbps 30 --loss 0.01" [SECONDS] [STEP_PX]
 #
-# Needs Xvfb, python3, node, and Playwright with Chromium (cd e2e && npm ci).
+# Needs Xvfb, python3, curl, node, and Playwright with Chromium (cd e2e && npm ci).
 # TILT=path picks another binary.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -26,5 +26,8 @@ pids+=($!)
 "$tilt" --display "$DISPLAY" --no-auth --bind 127.0.0.1:6090 --udp-port 6091 \
   --udp-public 127.0.0.1:7091 >/dev/null 2>&1 &
 pids+=($!)
-sleep 1
+for _ in $(seq 50); do
+  curl -sf http://127.0.0.1:6090/healthz >/dev/null && break
+  sleep 0.2
+done
 node "$here/measure.mjs" http://127.0.0.1:6090/ "${2:-10}" "${3:-12}" 2>/dev/null | grep '^{'
