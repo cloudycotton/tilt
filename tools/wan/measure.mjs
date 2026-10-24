@@ -59,8 +59,10 @@ await src.close();
 await view.close();
 
 const srcTime = new Map(shown);
+// The motion: from the first frame shown to the last change (the counter wraps at 4096).
 const first = samples.findIndex((s) => s[1] >= 1);
-const last = samples.findIndex((s) => s[1] === Math.max(...samples.map((x) => x[1])));
+let last = samples.length - 1;
+while (last > first && samples[last][1] === samples[last - 1][1]) last--;
 const w = samples.slice(first, last + 1);
 let repeats = 0;
 let skips = 0;
