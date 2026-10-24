@@ -451,10 +451,20 @@ impl FlowControl {
         MIN_BYTE_BUDGET.max(1.5 * bw * (min_rtt + 2.0 * fi))
     }
 
-    /// Enough frames to cover one RTT at full frame rate, plus one in the encoder.
+    /// Enough frames to cover one RTT at full frame rate, plus one in the encoder; two RTTs
+    /// while the path holds no queue of ours. A lost packet holds up its frame, and with it
+    /// the ACKs of every frame after it (the client decodes in order), for about one more RTT
+    /// while QUIC resends it. With credit for only one RTT the encoder then stops, and each
+    /// loss shows as a stutter (frames repeated, then skipped) rather than as a short delay.
+    /// Once a queue builds, the frames over one RTT would only lengthen it.
     fn frame_cap(&self, now: Instant) -> u32 {
         let fi = self.frame_interval_s();
-        let cap = ((self.min_rtt(now).as_secs_f64() + fi) / fi).ceil() as u32 + 1;
+        let rtts = if self.queue_ms(now) < CALM_QUEUE_MS {
+            2.0
+        } else {
+            1.0
+        };
+        let cap = ((rtts * self.min_rtt(now).as_secs_f64() + fi) / fi).ceil() as u32 + 1;
         cap.clamp(MIN_FRAME_CAP, MAX_FRAME_CAP)
     }
 
@@ -574,15 +584,41 @@ mod tests {
             .iter()
             .map(|&ms| frame_cap_at(ms * MS))
             .collect();
-        assert_eq!(caps, [3, 4, 5, 8, 14, 26, 32]);
+        // Two RTTs' worth of frames, plus one: room for a resent packet's delay.
+        assert_eq!(caps, [3, 5, 8, 14, 26, 32, 32]);
         // Before any sample the 50 ms default applies.
         let t0 = Instant::now();
-        assert_eq!(FlowControl::new(cfg(), t0).frame_cap(t0), 5);
+        assert_eq!(FlowControl::new(cfg(), t0).frame_cap(t0), 8);
+    }
+
+    #[test]
+    fn a_standing_queue_shrinks_the_frame_cap_to_one_rtt() {
+        fn ack(f: &mut FlowControl, t: &mut Instant, seq: u32, rtt: Duration) {
+            f.on_sent(seq, 100, *t);
+            *t += rtt;
+            f.on_ack(seq, 0, *t);
+        }
+        let t0 = Instant::now();
+        let mut f = FlowControl::new(cfg(), t0);
+        let mut t = t0;
+        ack(&mut f, &mut t, 1, 50 * MS);
+        assert_eq!(f.frame_cap(t), 8);
+        // RTTs of 90 ms over a 50 ms minimum: 40 ms of queue.
+        for seq in 2..40 {
+            ack(&mut f, &mut t, seq, 90 * MS);
+        }
+        assert!(f.stats().queue_ms > 25.0);
+        assert_eq!(f.frame_cap(t), 5);
+        // The queue drains: two RTTs again.
+        for seq in 40..80 {
+            ack(&mut f, &mut t, seq, 50 * MS);
+        }
+        assert_eq!(f.frame_cap(t), 8);
     }
 
     #[test]
     fn credit_counts_frames_and_bytes() {
-        // Small frames: the frame cap binds (5 at the 50 ms default).
+        // Small frames: the frame cap binds (8 at the 50 ms default).
         let t0 = Instant::now();
         let mut f = FlowControl::new(cfg(), t0);
         let mut n = 0;
@@ -590,7 +626,7 @@ mod tests {
             n += 1;
             f.on_sent(n, 1000, t0);
         }
-        assert_eq!(n, 5);
+        assert_eq!(n, 8);
         // Large frames: the byte budget binds. 1.5 * 1 MB/s * (50 + 33.3) ms = 125 KB.
         let mut f = FlowControl::new(cfg(), t0);
         let mut n = 0;

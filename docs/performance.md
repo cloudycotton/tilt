@@ -83,6 +83,36 @@ as soon as it arrives, and over any stretch at most one per frame interval goes 
 Grab to encode is now about 1 ms, and key-to-picture p95 on an animated screen stays at
 17–22 ms where it ranged 18–34 ms. The frame rate cap, and with it the CPU, is unchanged.
 
+## Over a lossy link
+
+On a path that loses packets, as across the internet to a Sail sandbox, QUIC resends the lost
+packet about one round trip later. Its frame waits for it, and so does every frame after it,
+since the browser decodes them in order, so their ACKs come a round trip late too. Credit used
+to cover one round trip of frames, so each loss also stopped the encoder: the picture froze,
+then jumped. Credit now covers two round trips while the path holds no queue of ours, and
+falls back to one once a queue builds (`frame_cap` in `src/flow.rs`), so a slow link queues no
+more than before.
+
+Continuous scrolling in Chrome at 60 fps, 720p, through `tools/wan/run.sh` (a UDP relay with
+delay, jitter, loss and a bandwidth cap), share of the viewer's refreshes that showed no new
+frame:
+
+| link | before | after |
+|---|---|---|
+| 50 ms round trip | 3.3% | 0.6% |
+| 50 ms round trip, 1% loss | 15% | 8% |
+| 100 ms round trip, 0.5% loss | 31% | 17% |
+| 50 ms round trip, 3 Mbit/s | ~75% | ~75% |
+
+Latency is unchanged on all four. What remains under loss is the resend itself: a frame one
+round trip late is longer than the 45 ms the page buffers to smooth jitter. Only forward error
+correction would hide it without adding that round trip of delay.
+
+```sh
+cargo build --release
+tools/wan/run.sh "--delay 25 --jitter 4 --mbps 30 --loss 0.01" 20
+```
+
 ## Measuring an encoder change
 
 Record each workload losslessly, keep one frame per screen change, and convert to raw I420:

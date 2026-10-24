@@ -1,0 +1,29 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>tilt motion source</title><style>
+body { margin: 0; font: 22px/1.5 serif; background: #fff; color: #222 }
+#counter { position: fixed; left: 0; top: 0; display: flex; z-index: 9 }
+#counter div { width: 32px; height: 32px }
+p:nth-child(3n) { background: linear-gradient(90deg, #fde, #def) }
+</style></head><body><div id="counter"></div><div id="text"></div><script>
+// Scrolls `step` px per display refresh while `go` is set, and paints the frame number as 12
+// black/white blocks top left. `shown` lists [frame, wall-clock ms] for measure.mjs.
+const blocks = [];
+for (let i = 0; i < 12; i++) blocks.push(document.getElementById('counter').appendChild(document.createElement('div')));
+let html = '';
+for (let i = 0; i < 3000; i++) html += `<p>${i} Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ${'x'.repeat(i % 40)}</p>`;
+document.getElementById('text').innerHTML = html;
+window.go = false;
+window.step = 12;
+window.shown = [];
+let n = 0;
+function tick() {
+  if (window.go) {
+    n++;
+    scrollBy(0, window.step);
+    window.shown.push([n, performance.timeOrigin + performance.now()]);
+  }
+  for (let i = 0; i < 12; i++) blocks[i].style.background = (n >> i) & 1 ? '#fff' : '#000';
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script></body></html>
