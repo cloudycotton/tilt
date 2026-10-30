@@ -466,7 +466,8 @@ export function createInput(env) {
       if (opt) optionTyped();
       return;
     }
-    if (!e.repeat && e !== pasteReplay && isPasteKey(e)) {
+    if (queuedKey(onKeyDown, e)) return;
+    if (!e.repeat && !replaying && isPasteKey(e)) {
       holdPasteKey(e);
       return;
     }
@@ -538,7 +539,7 @@ export function createInput(env) {
   }
 
   function onKeyUp(e) {
-    if (pasteKey && (e.code || e.key) === (pasteKey.code || pasteKey.key)) sendPasteKey();
+    if (queuedKey(onKeyUp, e)) return;
     const id = e.code || e.key;
     // A key pressed in the viewer is released wherever focus went meanwhile (the Type text box,
     // the menu): dropping its keyup would leave it held at the server.
@@ -710,8 +711,16 @@ export function createInput(env) {
 
   // ---- clipboard: a paste shortcut takes the local clipboard's text to the remote clipboard first
 
-  let pasteKey = null; // the paste shortcut's keydown, held back for the browser's paste event
-  let pasteReplay = null; // that keydown, while it goes to the remote after all
+  // How long a paste shortcut waits for the browser's paste event. macOS Chrome sends Cmd+V's
+  // through the browser process, so it can come well after the keydown.
+  const PASTE_WAIT_MS = 300;
+  // A paste event this soon after its shortcut went on without it is that shortcut's, late.
+  const LATE_PASTE_MS = 2000;
+  // While a paste shortcut waits for its paste event: the timer, and the key events from the
+  // shortcut's keydown on, which go to the remote in order once the text has gone first.
+  let pasteKey = null;
+  let replaying = false;
+  let pasteSentAt = -Infinity;
   // The local clipboard text last sent to the remote, or written there from it: pasting it again
   // keeps the remote clipboard, which may hold something newer that is not text (an image).
   let shared = null;
@@ -724,20 +733,44 @@ export function createInput(env) {
   // one (nothing to paste, or a browser that sends none) the key goes as it is: the remote
   // pastes its own clipboard.
   function holdPasteKey(e) {
-    pasteKey = e;
-    setTimeout(sendPasteKey, 0);
+    pasteKey = { timer: setTimeout(sendPasteKey, PASTE_WAIT_MS), queue: [[onKeyDown, e]] };
+  }
+
+  /** Holds a key event behind a waiting paste shortcut (V up, Ctrl up); true if it did. */
+  function queuedKey(handler, e) {
+    if (!pasteKey || replaying) return false;
+    // Too late to prevent once replayed: a key the viewer handles must not act locally too.
+    if (ours(e.target)) e.preventDefault();
+    pasteKey.queue.push([handler, e]);
+    return true;
   }
 
   function sendPasteKey() {
-    const e = pasteKey;
-    if (!e) return;
+    if (!pasteKey) return;
+    const { timer, queue } = pasteKey;
+    clearTimeout(timer);
     pasteKey = null;
-    pasteReplay = e;
-    try { onKeyDown(e); } finally { pasteReplay = null; }
+    pasteSentAt = performance.now();
+    replaying = true;
+    try {
+      for (const [handler, e] of queue) handler(e);
+    } finally {
+      replaying = false;
+    }
+  }
+
+  function dropPasteKey() {
+    if (pasteKey) clearTimeout(pasteKey.timer);
+    pasteKey = null;
   }
 
   function onPaste(e) {
-    if (!pasteKey) return; // a soft keyboard's paste: the textarea types it
+    if (!pasteKey) {
+      // Its shortcut went to the remote without it, which pasted its own clipboard: in the
+      // textarea it would be typed a second time.
+      if (performance.now() - pasteSentAt < LATE_PASTE_MS) e.preventDefault();
+      return; // else a soft keyboard's paste: the textarea types it
+    }
     e.preventDefault();
     const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
     if (text && text !== shared && enabled) {
@@ -1004,6 +1037,7 @@ export function createInput(env) {
   // ---- state
 
   function forget() {
+    dropPasteKey();
     clearTimeout(moveTimer);
     moveTimer = 0;
     pendingPos = null;

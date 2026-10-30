@@ -470,3 +470,78 @@ test('no input is sent before control is taken', async ({ page, mock }) => {
   expect(keyLog(await collect(mock, id, 'KEY', since, 2))).toEqual(['down 61', 'up 61']);
   expect(mock.holder()).toBe(id);
 });
+
+// The paste path's timings and key orders. Steps run in the page: key events on the hidden
+// textarea, waits, and the browser's paste event, which a browser applies to the textarea unless
+// it is cancelled (as here). `expect` is the input the remote gets, and `field` what the textarea
+// typed locally if anything leaked into it.
+const KEYS = {
+  Control: { key: 'Control', code: 'ControlLeft' },
+  v: { key: 'v', code: 'KeyV' },
+  a: { key: 'a', code: 'KeyA' },
+  Shift: { key: 'Shift', code: 'ShiftLeft' },
+  Insert: { key: 'Insert', code: 'Insert' },
+};
+const ctrlV = [['down', 'Control'], ['down', 'v']];
+const ctrlVUp = [['up', 'v'], ['up', 'Control']];
+const PASTED = ['down ffe3', 'CLIPBOARD word', 'down 76', 'up 76', 'up ffe3'];
+const KEYS_ONLY = ['down ffe3', 'down 76', 'up 76', 'up ffe3'];
+const PASTE_CASES = [
+  ['the paste event comes at once', [...ctrlV, ['paste', 'word'], ...ctrlVUp], PASTED],
+  ['the paste event comes a round trip late (macOS Chrome)', [...ctrlV, ['wait', 30], ['paste', 'word'], ...ctrlVUp], PASTED],
+  ['V and Ctrl come up before the late paste event', [...ctrlV, ['wait', 20], ...ctrlVUp, ['wait', 20], ['paste', 'word']], PASTED],
+  ['Ctrl comes up first', [...ctrlV, ['up', 'Control'], ['paste', 'word'], ['up', 'v']], ['down ffe3', 'CLIPBOARD word', 'down 76', 'up ffe3', 'up 76']],
+  ['V repeats while waiting', [...ctrlV, ['repeat', 'v'], ['repeat', 'v'], ['wait', 30], ['paste', 'word'], ...ctrlVUp],
+    ['down ffe3', 'CLIPBOARD word', 'down 76', 'down 76', 'down 76', 'up 76', 'up ffe3']],
+  ['another key is typed while waiting', [...ctrlV, ['up', 'v'], ['down', 'a'], ['up', 'a'], ['wait', 30], ['paste', 'word'], ['up', 'Control']],
+    ['down ffe3', 'CLIPBOARD word', 'down 76', 'up 76', 'down 61', 'up 61', 'up ffe3']],
+  ['no paste event comes: the remote pastes its own clipboard', [...ctrlV, ['wait', 500], ...ctrlVUp], KEYS_ONLY],
+  ['the paste event comes after the wait: dropped, not typed', [...ctrlV, ['wait', 500], ['paste', 'word'], ...ctrlVUp], KEYS_ONLY],
+  ['an empty clipboard leaves the remote one', [...ctrlV, ['paste', ''], ...ctrlVUp], KEYS_ONLY],
+  ['the same text twice is shared once', [...ctrlV, ['paste', 'word'], ...ctrlVUp, ...ctrlV, ['wait', 30], ['paste', 'word'], ...ctrlVUp], [...PASTED, ...KEYS_ONLY]],
+  ['new text replaces the shared text', [...ctrlV, ['paste', 'word'], ...ctrlVUp, ...ctrlV, ['paste', 'next'], ...ctrlVUp],
+    [...PASTED, 'down ffe3', 'CLIPBOARD next', 'down 76', 'up 76', 'up ffe3']],
+  ['text over 64 KB stays local: the remote pastes its own', [...ctrlV, ['paste', 'x'.repeat(65536)], ...ctrlVUp], KEYS_ONLY],
+  ['Shift+Insert', [['down', 'Shift'], ['down', 'Insert'], ['paste', 'word'], ['up', 'Insert'], ['up', 'Shift']],
+    ['down ffe1', 'CLIPBOARD word', 'down ff63', 'up ff63', 'up ffe1']],
+  ['focus leaves while waiting: nothing is pasted, everything is released', [...ctrlV, ['blur'], ['wait', 400]], ['down ffe3', 'RELEASE_ALL']],
+  ['a soft keyboard paste, with no shortcut, is typed', [['paste', 'word']], ['TEXT word'], 'word'],
+];
+
+for (const [name, steps, expected, field = ''] of PASTE_CASES) {
+  test(`paste: ${name}`, async ({ page, mock }) => {
+    const id = await ready(page, mock);
+    const since = mock.messages.length;
+    const typed = await page.evaluate(async ({ steps, keys }) => {
+      const ta = document.getElementById('kbd');
+      ta.focus();
+      const pad = ta.value;
+      const mods = { ctrlKey: false, shiftKey: false };
+      const flag = { Control: 'ctrlKey', Shift: 'shiftKey' };
+      for (const [what, arg] of steps) {
+        if (what === 'wait') {
+          await new Promise((r) => setTimeout(r, arg));
+        } else if (what === 'blur') {
+          window.dispatchEvent(new Event('blur'));
+        } else if (what === 'paste') {
+          const data = new DataTransfer();
+          if (arg) data.setData('text/plain', arg);
+          if (ta.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true })) && arg) {
+            ta.setRangeText(arg, ta.value.length, ta.value.length, 'end');
+            ta.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: arg }));
+          }
+        } else {
+          if (what === 'down' && flag[arg]) mods[flag[arg]] = true;
+          if (what === 'up' && flag[arg]) mods[flag[arg]] = false;
+          const type = what === 'up' ? 'keyup' : 'keydown';
+          ta.dispatchEvent(new KeyboardEvent(type, { ...keys[arg], ...mods, repeat: what === 'repeat', bubbles: true, cancelable: true }));
+        }
+      }
+      return ta.value.slice(pad.length);
+    }, { steps, keys: KEYS });
+    const types = ['KEY', 'TEXT', 'CLIPBOARD', 'RELEASE_ALL'];
+    expect(inputLog(await collect(mock, id, types, since, expected.length, 400))).toEqual(expected);
+    expect(typed).toBe(field);
+    expect(mock.violations).toEqual([]);
+  });
+}
