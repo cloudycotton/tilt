@@ -7,11 +7,14 @@
 //! stream of its own: its 18-byte header, then the whole access unit, so a lost packet of one
 //! frame holds up neither the next frames' transfer nor cursor, PONG or control messages.
 
+use std::time::Instant;
+
 use bytes::{Buf, Bytes, BytesMut};
 use wtransport::error::StreamReadError;
 use wtransport::{Connection, RecvStream, SendStream, VarInt};
 
 use crate::protocol::MSG_VIDEO;
+use crate::recovery::{self, Recovery};
 
 pub const KIND_TEXT: u8 = 0;
 pub const KIND_BINARY: u8 = 1;
@@ -43,6 +46,7 @@ pub struct Sink {
     /// Each video stream gets a lower priority than the one before, so QUIC sends (and resends)
     /// the oldest frame first, as the decoder needs them, rather than interleaving them.
     video_priority: i32,
+    recovery: Option<Recovery>,
 }
 
 impl Sink {
@@ -53,7 +57,12 @@ impl Sink {
             conn,
             control,
             video_priority: 0,
+            recovery: None,
         }
+    }
+
+    pub fn enable_recovery(&mut self) {
+        self.recovery = Some(Recovery::new(Instant::now()));
     }
 
     pub async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
@@ -77,12 +86,30 @@ impl Sink {
         Ok(())
     }
 
-    /// One VIDEO message (header and whole access unit) on a stream of its own. Finishing does
-    /// not wait for the peer's acknowledgement.
+    /// Ordinary VIDEO or negotiated recovery shards. Every shard keeps its frame's priority;
+    /// control stays ahead of both. Finishing never waits for the peer's acknowledgement.
     async fn video(&mut self, msg: &[u8]) -> anyhow::Result<()> {
+        let protect = self.recovery.as_mut().is_some_and(|r| {
+            r.protect(
+                msg.len(),
+                &self.conn.quic_connection().stats().path,
+                Instant::now(),
+            )
+        });
+        if protect {
+            for shard in recovery::shards(msg) {
+                self.video_stream(&shard).await?;
+            }
+        } else {
+            self.video_stream(msg).await?;
+        }
+        self.video_priority = self.video_priority.checked_sub(1).unwrap_or(0);
+        Ok(())
+    }
+
+    async fn video_stream(&mut self, msg: &[u8]) -> anyhow::Result<()> {
         let mut stream = self.conn.open_uni().await?.await?;
         stream.set_priority(self.video_priority);
-        self.video_priority = self.video_priority.checked_sub(1).unwrap_or(0);
         stream.write_all(msg).await?;
         // Errs only on a stream already reset; the data is queued either way.
         let _ = stream.quic_stream_mut().finish();

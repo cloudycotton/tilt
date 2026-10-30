@@ -40,18 +40,21 @@ All binary integers are little-endian. Every message is either:
    the QUIC connection once the client has acknowledged it. A client that reads the end of the
    stream or loses the connection without a close treats it as an abnormal close (1006) and
    reconnects. Messages longer than 64 KiB + 1 end the session.
-4. **Video.** Each access unit arrives on its own server-opened unidirectional stream: one VIDEO
-   message (section 2), then the end of the stream. Streams may complete out of order: decode in
+4. **Video.** Unless recovery is negotiated (below), each access unit arrives on its own
+   server-opened unidirectional stream: one VIDEO message (section 2), then the end of the
+   stream. Streams may complete out of order: decode in
    `seq` order, starting at 1. If a stream fails before its header was read, skip to the oldest
    seq that did arrive, ACK the last skipped seq (ACKs are cumulative) and request an IDR. VIDEO
    may arrive before the `welcome` on the control stream: hold it until then. A lost packet
-   delays only the frame it belongs to, never cursor updates, PONGs, input or the frames after
-   it. The server uses BBR congestion control; the ACK credit of section 3 decides how much
-   video is in flight.
+   does not block cursor updates, PONGs, input or later frames' transfer, but ordered decoding
+   waits for that frame. The server uses BBR congestion control; the ACK credit of section 3
+   decides how much video is in flight.
 5. Within 5 s the client sends, on the control stream, the text message
    `{"t":"hello","v":1,"token":"<token>","client":"tilt-web/0.1"}`.
    The `token` field may be omitted only in no-auth mode. Tokens never go in a URL; the web
    client reads them from the page's URL fragment (`#token=`).
+   A client supporting the recovery format below adds `"recovery":true`. Without it the server
+   sends only ordinary VIDEO streams. Older servers ignore this optional field.
 6. If `v != 1`, the server replies `{"t":"error","code":"version","msg":...}` and closes.
 7. If the token is wrong, the server sleeps 500 ms, then sends `{"t":"error","code":"auth"}` and
    closes.
@@ -129,6 +132,28 @@ Cursor messages: CURSOR_SHAPE is sent when the cursor image changes (new serial)
 when the pointer moves. Captured frames never contain the cursor; draw it from these.
 The shape is at most 128×128.
 
+### Optional recovery streams
+
+With `hello.recovery=true`, a VIDEO may instead arrive on five independent reliable
+unidirectional streams. Each carries `u8 0x05 | u32 seq | u32 length | u8 index | shard` (LE).
+`length` is the original VIDEO length including its 18-byte header. Indices 0–3 hold consecutive
+quarters of that message, each `ceil(length/4)` bytes; the last is zero-padded. Index 4 is the
+bytewise XOR of indices 0–3. Any four distinct shards recover the original message; strip the
+padding, validate its type and seq against the envelope, then deliver it in normal seq order.
+ACK the VIDEO once, never individual shards. Ignore late/duplicate shards for completed frames.
+With two missing shards, wait for reliable delivery; never decode a partial frame. A failed
+recovery stream reconnects the session rather than treating that shard as a missing VIDEO.
+
+The server protects frames of 4–128 KiB only, on paths with minimum RTT ≥80 ms and recent
+packet loss ≥0.2%. A transport RTT more than 15 ms above its minimum suppresses recovery for
+five seconds. Parity costs 25% of protected payload (rounded up), plus up to three padding
+bytes, 50 bytes of shard headers, and QUIC overhead. Ordinary VIDEO and recovery streams may
+be mixed in one session. The receiver bounds incomplete recovery groups to 32 and each
+reconstructed VIDEO to 128 KiB; malformed shards or exceeding the group limit reconnects.
+The web client's `tilt:stats.client` includes cumulative `recoveryFrames` and `recoveredFrames`;
+the latter counts reconstruction using parity, not necessarily a packet loss (shards can reorder).
+Existing video kbps statistics exclude recovery overhead.
+
 ## 3. Client to server, binary
 
 | type | name | layout after the type byte |
@@ -142,6 +167,10 @@ The shape is at most 128×128.
 | 0x31 | TEXT | `utf8 bytes…` (rest of message) — type this text: '\n' → Return, '\t' → Tab, otherwise per-codepoint keysym. At most 4096 bytes are typed: the server cuts longer text at the last character boundary before that and drops the rest (with a warning in its log). Send longer text as several messages. It is typed literally: the Control, Alt, Meta, Super or Hyper keys this session holds are released for the whole text and pressed again after it, and its own Shift or AltGr is lifted for characters that must not have it. Losing control, disconnecting or RELEASE_ALL stops the rest. |
 | 0x32 | RELEASE_ALL | (no payload) — release everything this session holds, and stop the TEXT it is still typing along with everything the session sent after that TEXT |
 | 0x33 | CLIPBOARD | `utf8 bytes…` (rest of message, at most 65535 bytes) — make this text the X CLIPBOARD selection's content, tilt owning it, before any input sent after it runs: send it just before a paste key (Ctrl+V), so the application pastes it. Offered as UTF8_STRING, `text/plain;charset=utf-8`, TEXT and STRING (Latin-1, `?` for other characters). |
+
+ACK `decode_ms` starts when the complete VIDEO is received (or reconstructed), **before** it
+waits for an earlier seq. Include that receiver reordering wait as well as decoding time, so
+it is not counted as network queue delay. Do not restart the timestamp for duplicate data.
 
 Every fixed-size message must have exactly the listed length; TEXT and CLIPBOARD must be valid UTF-8. Anything
 else counts as malformed (see section 5).

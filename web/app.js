@@ -301,14 +301,14 @@ function connect() {
   conn.ws = ws;
   ws.onopen = () => {
     if (ws !== conn.ws) return;
-    const hello = { t: 'hello', v: 1 };
+    const hello = { t: 'hello', v: 1, recovery: true };
     if (token) hello.token = token;
     hello.client = CLIENT;
     ws.send(JSON.stringify(hello));
     conn.lastRecvAt = performance.now();
   };
   ws.onmessage = (ev) => {
-    if (ws === conn.ws) onMessage(ev.data);
+    if (ws === conn.ws) onMessage(ev.data, ev.receivedAt);
   };
   ws.onclose = (ev) => {
     if (ws === conn.ws) onClosed(ev.code);
@@ -399,7 +399,7 @@ function endSession() {
   applyCursor();
 }
 
-function onMessage(data) {
+function onMessage(data, receivedAt) {
   conn.lastRecvAt = performance.now();
   if (typeof data === 'string') {
     onJson(data);
@@ -407,7 +407,7 @@ function onMessage(data) {
   }
   if (!data.byteLength) return;
   switch (new Uint8Array(data, 0, 1)[0]) {
-    case VIDEO: onVideo(data); break;
+    case VIDEO: onVideo(data, receivedAt); break;
     case CURSOR_SHAPE: onCursorShape(data); break;
     case CURSOR_POS: onCursorPos(data); break;
     case PONG: onPong(data); break;
@@ -578,7 +578,7 @@ function tick() {
 
 // ---- video
 
-function onVideo(buf) {
+function onVideo(buf, receivedAt = performance.now()) {
   if (buf.byteLength < VIDEO_HEADER) return;
   const dv = new DataView(buf);
   const flags = dv.getUint8(1);
@@ -588,8 +588,8 @@ function onVideo(buf) {
   const height = dv.getUint16(16, true);
   stats.bytes += buf.byteLength;
   const data = new Uint8Array(buf, VIDEO_HEADER);
-  if (flags & FLAG_PATCH) onPatch(seq, cap, width, height, data);
-  else onAccessUnit(seq, cap, (flags & FLAG_KEY) !== 0, width, height, data);
+  if (flags & FLAG_PATCH) onPatch(seq, cap, width, height, data, receivedAt);
+  else onAccessUnit(seq, cap, (flags & FLAG_KEY) !== 0, width, height, data, receivedAt);
 }
 
 /** Acks a frame that will not be decoded (decode_ms 0) and asks for a keyframe. */
@@ -600,7 +600,7 @@ function skipFrame(seq) {
   requestIdr();
 }
 
-function onAccessUnit(seq, cap, key, width, height, data) {
+function onAccessUnit(seq, cap, key, width, height, data, receivedAt) {
   stats.lastSeq = seq;
   if (key) {
     stats.keyframes++;
@@ -614,7 +614,9 @@ function onAccessUnit(seq, cap, key, width, height, data) {
     skipFrame(seq);
     return;
   }
-  video.pending.set(seq, performance.now());
+  // Includes time held behind an earlier frame, not just time in the decoder. Otherwise
+  // receiver reordering looks like network congestion to the server's bitrate controller.
+  video.pending.set(seq, receivedAt);
   video.queue.push({ seq, cap, due: 0, frame: null, patch: null, done: false });
   try {
     video.decoder.decode(new EncodedVideoChunk({
@@ -786,9 +788,9 @@ function onDecoded(decoder, frame) {
 }
 
 /** A patch: what changed since the last frame or patch, as pixels (src/video/patch.rs). */
-function onPatch(seq, cap, width, height, data) {
+function onPatch(seq, cap, width, height, data, receivedAt) {
   stats.lastSeq = seq;
-  video.pending.set(seq, performance.now());
+  video.pending.set(seq, receivedAt);
   const u = { seq, cap, due: 0, frame: null, patch: { width, height, data }, done: true };
   pace(u);
   video.queue.push(u);
@@ -1526,6 +1528,8 @@ function postStats(now) {
       queue: video.decoder ? video.decoder.decodeQueueSize : 0,
       decodeErrors: stats.decodeErrors,
       decoderStalls: stats.decoderStalls,
+      recoveryFrames: conn.ws?.protected ?? 0,
+      recoveredFrames: conn.ws?.recovered ?? 0,
     },
     server: serverStats ? (({ t, ...rest }) => rest)(serverStats) : null,
   });

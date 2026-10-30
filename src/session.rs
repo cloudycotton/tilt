@@ -323,7 +323,13 @@ async fn handshake(
         Message::Text(t) => serde_json::from_str::<ClientText>(t.as_str()).ok(),
         _ => None,
     };
-    let Some(ClientText::Hello { v, token, client }) = hello else {
+    let Some(ClientText::Hello {
+        v,
+        token,
+        client,
+        recovery,
+    }) = hello
+    else {
         tokio::time::sleep(AUTH_FAIL_DELAY).await;
         reject(sink, ErrorCode::Auth, "the first message must be hello").await;
         return None;
@@ -375,6 +381,9 @@ async fn handshake(
         client = client.as_deref().unwrap_or("?"),
         "hello"
     );
+    if recovery {
+        sink.enable_recovery();
+    }
     Some((sid, role))
 }
 

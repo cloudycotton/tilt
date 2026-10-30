@@ -9,6 +9,9 @@
 
 const VIDEO = 0x01;
 const VIDEO_HEADER = 18;
+const SHARD = 0x05;
+const SHARD_HEADER = 10;
+const MAX_RECOVERY_FRAME = 128 * 1024;
 const KIND_TEXT = 0;
 const KIND_BINARY = 1;
 const KIND_CLOSE = 2;
@@ -45,7 +48,10 @@ export class WtSocket extends EventTarget {
     // Video waits until the first control message (welcome) is out: the page acks only then.
     this.heard = false;
     this.expect = 1; // the next VIDEO seq to deliver
-    this.early = new Map(); // seq -> VIDEO message that came before `expect`'s
+    this.early = new Map(); // seq -> { buf, receivedAt }, before ordered delivery
+    this.shards = new Map(); // at most the server's 32 in-flight frames
+    this.recovered = 0;
+    this.protected = 0;
     this.lost = 0; // video streams that failed before giving their seq
     this.start(pageUrl);
   }
@@ -114,6 +120,8 @@ export class WtSocket extends EventTarget {
 
   shut() {
     this.readyState = 3;
+    this.early.clear();
+    this.shards.clear();
     if (this.wt) {
       try { this.wt.close(); } catch { /* closed already */ }
     }
@@ -132,9 +140,9 @@ export class WtSocket extends EventTarget {
     this.dispatchEvent(event);
   }
 
-  deliver(data) {
+  deliver(data, receivedAt = performance.now()) {
     if (this.readyState === 3) return;
-    this.emit(new MessageEvent('message', { data }));
+    this.emit(Object.assign(new MessageEvent('message', { data }), { receivedAt }));
   }
 
   async readControl(readable) {
@@ -191,19 +199,84 @@ export class WtSocket extends EventTarget {
 
   async readFrame(stream) {
     let buf;
+    let kind;
     try {
-      buf = await new Response(stream).arrayBuffer();
+      buf = await new Response(stream.pipeThrough(new TransformStream({
+        transform(chunk, controller) {
+          if (kind === undefined && chunk.length) kind = chunk[0];
+          controller.enqueue(chunk);
+        },
+      }))).arrayBuffer();
     } catch {
+      // A reset shard is not a missing VIDEO seq: other shards may already have repaired
+      // it. Reconnect rather than skipping an unrelated future frame or waiting forever.
+      if (kind === SHARD || this.protected) {
+        this.ended(1006);
+        return;
+      }
       buf = null;
     }
     if (this.readyState === 3) return;
+    if (buf && new Uint8Array(buf)[0] === SHARD) {
+      this.readShard(buf);
+      return;
+    }
     if (!buf || buf.byteLength < VIDEO_HEADER || new Uint8Array(buf, 0, 1)[0] !== VIDEO) {
       this.lost++;
     } else {
-      const seq = new DataView(buf).getUint32(2, true);
-      // Older than what was delivered: a duplicate, never expected from the server.
-      if (ahead(this.expect, seq) < 0x80000000) this.early.set(seq, buf);
+      this.acceptVideo(buf);
     }
+    this.drainVideo();
+  }
+
+  acceptVideo(buf) {
+    const seq = new DataView(buf).getUint32(2, true);
+    if (ahead(this.expect, seq) >= 0x80000000 || this.early.has(seq)) return;
+    this.early.set(seq, { buf, receivedAt: performance.now() });
+    this.shards.delete(seq);
+  }
+
+  /** Any four of five shards reconstruct a VIDEO, without waiting for retransmission. */
+  readShard(buf) {
+    if (buf.byteLength < SHARD_HEADER) return this.ended(1006);
+    const d = new DataView(buf);
+    const seq = d.getUint32(1, true);
+    const len = d.getUint32(5, true);
+    const index = d.getUint8(9);
+    const size = Math.ceil(len / 4);
+    if (!seq || len < VIDEO_HEADER || len > MAX_RECOVERY_FRAME || index > 4 ||
+        buf.byteLength !== SHARD_HEADER + size) return this.ended(1006);
+    if (ahead(this.expect, seq) >= 0x80000000 || this.early.has(seq)) return;
+    let group = this.shards.get(seq);
+    if (!group) {
+      // Do not silently drop a frame at the limit: that would leave cumulative ACKs stuck.
+      if (this.shards.size >= 32) return this.ended(1006);
+      group = { len, parts: new Map() };
+      this.shards.set(seq, group);
+      this.protected++;
+    }
+    if (group.len !== len) return this.ended(1006);
+    if (group.parts.has(index)) return;
+    group.parts.set(index, new Uint8Array(buf, SHARD_HEADER));
+    if (group.parts.size < 4) return;
+    const parts = group.parts;
+    let repaired = false;
+    for (let i = 0; i < 4; i++) {
+      if (parts.has(i)) continue;
+      const missing = new Uint8Array(parts.get(4));
+      for (const [j, bytes] of parts) {
+        if (j === 4) continue;
+        for (let k = 0; k < size; k++) missing[k] ^= bytes[k];
+      }
+      parts.set(i, missing);
+      repaired = true;
+    }
+    const video = new Uint8Array(len);
+    for (let i = 0; i < 4; i++) video.set(parts.get(i).subarray(0, Math.min(size, len - i * size)), i * size);
+    // The reconstructed header must agree with its envelope before it can advance ACKs.
+    if (video[0] !== VIDEO || new DataView(video.buffer).getUint32(2, true) !== seq) return this.ended(1006);
+    if (repaired) this.recovered++;
+    this.acceptVideo(video.buffer);
     this.drainVideo();
   }
 
@@ -211,11 +284,11 @@ export class WtSocket extends EventTarget {
   drainVideo() {
     if (!this.heard) return;
     for (;;) {
-      const buf = this.early.get(this.expect);
-      if (buf) {
+      const frame = this.early.get(this.expect);
+      if (frame) {
         this.early.delete(this.expect);
         this.expect = nextSeq(this.expect);
-        this.deliver(buf);
+        this.deliver(frame.buf, frame.receivedAt);
         if (this.readyState === 3) return;
         continue;
       }
@@ -229,6 +302,9 @@ export class WtSocket extends EventTarget {
       }
       const last = oldest === 1 ? 0xffffffff : oldest - 1;
       this.expect = oldest;
+      for (const seq of this.shards.keys()) {
+        if (ahead(this.expect, seq) >= 0x80000000) this.shards.delete(seq);
+      }
       if (this.onskip) this.onskip(last);
     }
   }

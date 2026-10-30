@@ -104,9 +104,29 @@ frame:
 | 100 ms round trip, 0.5% loss | 31% | 17% |
 | 50 ms round trip, 3 Mbit/s | ~75% | ~75% |
 
-Latency is unchanged on all four. What remains under loss is the resend itself: a frame one
-round trip late is longer than the 45 ms the page buffers to smooth jitter. Only forward error
-correction would hide it without adding that round trip of delay.
+Latency was unchanged on all four. Those measurements predate optional recovery: on long,
+lossy paths the server can now split a frame across four reliable data streams and one XOR
+parity stream. Any four reconstruct it, without waiting for the fifth stream's retransmission.
+Recovery adds about 25% payload to protected frames, is negotiated with the client, and backs
+off for five seconds when QUIC RTT shows queue growth. See [the wire format](protocol.md#optional-recovery-streams).
+The client's ACK processing time also includes the wait behind an earlier frame, so that wait
+no longer masquerades as network queue delay.
+
+At 250 ms RTT, 1% independent packet loss in each direction, 30 Mbit/s, no configured jitter,
+and 1280×720, three 20-second runs per variant on a 4-vCPU x86-64 orb
+gave these medians (same scrolling workload, default smoothing):
+
+| metric | before | ACK timing only | ACK timing + recovery |
+|---|---|---|---|
+| refreshes without a new frame | 47.0% | 49.2% | 36.4% |
+| p95 gap between new frames | 133 ms | 183 ms | 50 ms |
+| p95 source-animation-to-viewer latency | 415 ms | 415 ms | 349 ms |
+
+ACK timing alone corrects the congestion signal but does not remove loss stalls. Recovery is
+not a cure for constrained bandwidth: at 3 Mbit/s it stayed disabled, and repeated refreshes
+ranged 72.6–76.5% before and 70.7–79.2% after. These short, unseeded simulations include startup
+transients, not measurements of a real intercontinental route. Input still needs a round trip;
+the animation latency above measures only server animation to browser display.
 
 ```sh
 cargo build --release

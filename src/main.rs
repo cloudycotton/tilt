@@ -11,6 +11,7 @@ mod flow;
 mod hub;
 mod input;
 mod protocol;
+mod recovery;
 mod server;
 mod session;
 mod transport;

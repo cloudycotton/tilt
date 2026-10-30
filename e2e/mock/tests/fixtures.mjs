@@ -68,6 +68,38 @@ function installFakeWebTransport({ mode }) {
         }
         videos++;
         const key = (b[1] & 1) !== 0;
+        if (mode === 'reorder-delay' && videos === 10) {
+          setTimeout(() => uni.enqueue(once(b)), 250);
+          return;
+        }
+        if (mode === 'recovery' && videos % 7 !== 0) {
+          const seq = new DataView(b.buffer, b.byteOffset).getUint32(2, true);
+          const size = Math.ceil(b.length / 4);
+          const parts = Array.from({ length: 5 }, () => new Uint8Array(size + 10));
+          parts.forEach((p, i) => {
+            const d = new DataView(p.buffer);
+            p[0] = 5;
+            d.setUint32(1, seq, true);
+            d.setUint32(5, b.length, true);
+            p[9] = i;
+          });
+          for (let i = 0; i < b.length; i++) {
+            parts[Math.floor(i / size)][10 + i % size] = b[i];
+            parts[4][10 + i % size] ^= b[i];
+          }
+          // Alternate each missing data shard and missing parity; also send duplicates.
+          const late = seq % 5;
+          parts.forEach((p, i) => {
+            if (i !== late && !(seq === 6 && i === 3)) { uni.enqueue(once(p)); uni.enqueue(once(p)); }
+          });
+          // The first five never receive the missing shard. Frame 6 loses two: recovery
+          // must wait for retransmission instead of decoding incomplete bytes.
+          if (seq > 5) setTimeout(() => {
+            uni.enqueue(once(parts[late]));
+            if (seq === 6) uni.enqueue(once(parts[3]));
+          }, 300);
+          return;
+        }
         if (mode === 'lose' && videos === 10 && !key) {
           log.lost++;
           uni.enqueue(new ReadableStream({ start(c) { c.error(new Error('stream reset')); } }));

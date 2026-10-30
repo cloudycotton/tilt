@@ -5,6 +5,37 @@ import {
   expect, from, open, pollState, sessionOf, state, stats, test, waitDrawn,
 } from './fixtures.mjs';
 
+test.describe('recovery shards', () => {
+  test.use({ wtMode: 'recovery' });
+
+  test('decode with any single shard absent and ignore duplicates and late originals', async ({ page, mock }) => {
+    await open(page, mock);
+    await waitDrawn(page, 60);
+    expect((await stats(page)).decodeErrors).toBe(0);
+    const id = await sessionOf(page);
+    const acks = from(mock, id, 'ACK').map(a => a.seq);
+    expect(acks.length).toBeGreaterThanOrEqual(55);
+    expect(acks).toEqual(acks.map((_, i) => i + 1));
+    expect(from(mock, id, 'idr')).toEqual([]);
+    expect(mock.violations).toEqual([]);
+  });
+});
+
+test.describe('receiver reordering time', () => {
+  test.use({ wtMode: 'reorder-delay' });
+
+  test('is included in ACK processing time, not mistaken for network delay', async ({ page, mock }) => {
+    await open(page, mock);
+    await waitDrawn(page, 30);
+    const id = await sessionOf(page);
+    const acks = from(mock, id, 'ACK');
+    // Frame 10 is on the wire 250 ms longer. Frame 11 arrived promptly but waited for 10.
+    expect(acks.find(a => a.seq === 11).decodeMs).toBeGreaterThan(150);
+    expect(acks.find(a => a.seq === 11).decodeMs - acks.find(a => a.seq === 10).decodeMs).toBeGreaterThan(100);
+    expect(mock.violations).toEqual([]);
+  });
+});
+
 test.describe('video streams out of order', () => {
   test.use({ wtMode: 'shuffle' });
 

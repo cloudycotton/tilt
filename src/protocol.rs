@@ -325,6 +325,8 @@ pub enum ClientText {
         v: u32,
         token: Option<String>,
         client: Option<String>,
+        #[serde(default)]
+        recovery: bool,
     },
     Control {
         take: bool,
@@ -522,7 +524,8 @@ mod tests {
             ClientText::Hello {
                 v: 1,
                 token: Some("tok".into()),
-                client: Some("tilt-web/0.1".into())
+                client: Some("tilt-web/0.1".into()),
+                recovery: false,
             }
         );
         assert_eq!(
@@ -530,7 +533,8 @@ mod tests {
             ClientText::Hello {
                 v: 1,
                 token: None,
-                client: None
+                client: None,
+                recovery: false,
             }
         );
         assert_eq!(
