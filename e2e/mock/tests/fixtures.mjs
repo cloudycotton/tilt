@@ -161,7 +161,7 @@ export const test = base.extend({
 export const COLORS = [[230, 40, 40], [40, 200, 60], [40, 80, 230], [240, 240, 240]];
 export const BACKGROUND = [32, 32, 32];
 
-export const INPUT_TYPES = ['MOVE', 'BUTTON', 'WHEEL', 'KEY', 'TEXT', 'RELEASE_ALL'];
+export const INPUT_TYPES = ['MOVE', 'BUTTON', 'WHEEL', 'KEY', 'TEXT', 'RELEASE_ALL', 'CLIPBOARD'];
 
 /** The codec string the client should derive from a fixture's first SPS. */
 export function fixtureCodec(stream) {
@@ -217,6 +217,7 @@ export const inputLog = (msgs) => msgs.map((m) => {
   switch (m.type) {
     case 'KEY': return `${m.down ? 'down' : 'up'} ${m.keysym.toString(16)}`;
     case 'TEXT': return `TEXT ${m.text}`;
+    case 'CLIPBOARD': return `CLIPBOARD ${m.text}`;
     case 'BUTTON': return `BUTTON ${m.button} ${m.down ? 'down' : 'up'}`;
     case 'WHEEL': return `WHEEL ${m.dx},${m.dy}`;
     default: return m.type;

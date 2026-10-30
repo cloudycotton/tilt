@@ -423,6 +423,7 @@ function onJson(text) {
     case 'welcome': onWelcome(m); break;
     case 'control': onControl(m); break;
     case 'stats': serverStats = m; break;
+    case 'clipboard': onClipboard(m); break;
     case 'error': onServerError(m); break;
     default: break; // 'screen' needs nothing: the KEY frame that follows carries the new size
   }
@@ -1356,7 +1357,67 @@ const input = createInput({
     lastPointer = type === 'mouse' ? 'mouse' : 'touch';
     applyCursor();
   },
+  onCopyKey,
+  onPasted(text) {
+    host.post({ type: 'tilt:clipboard', from: 'local', text });
+  },
 });
+
+// ---- clipboard: what is copied on the remote screen goes to the local clipboard
+
+// How long a copy shortcut waits for the remote clipboard to change.
+const COPY_WAIT_MS = 2000;
+// A copy shortcut's local clipboard write, started inside the key's event (Safari and Firefox
+// write only from a user gesture) and finished when the copied text arrives; null when none waits.
+let copyWait = null;
+
+function onCopyKey() {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') return;
+  // Each shortcut writes on its own gesture: an older one's write may have been given up.
+  if (copyWait) copyWait.cancel();
+  const wait = {};
+  const text = new Promise((resolve, reject) => {
+    wait.resolve = resolve;
+    wait.cancel = () => {
+      clearTimeout(wait.timer);
+      if (copyWait === wait) copyWait = null;
+      reject(new Error('nothing copied'));
+    };
+    // Nothing was copied (Ctrl+C interrupted a terminal): the local clipboard stays as it is.
+    wait.timer = setTimeout(wait.cancel, COPY_WAIT_MS);
+  });
+  try {
+    const item = new ClipboardItem({ 'text/plain': text.then((t) => new Blob([t], { type: 'text/plain' })) });
+    wait.written = navigator.clipboard.write([item]);
+  } catch {
+    clearTimeout(wait.timer);
+    return;
+  }
+  wait.written.catch(() => {});
+  copyWait = wait;
+}
+
+function onClipboard(m) {
+  if (typeof m.text !== 'string') return;
+  const { text } = m;
+  let written;
+  if (copyWait) {
+    clearTimeout(copyWait.timer);
+    copyWait.resolve(text);
+    written = copyWait.written;
+    copyWait = null;
+  } else {
+    // Copied without a shortcut (a menu): browsers that want a user gesture refuse this one.
+    written = navigator.clipboard?.writeText ? navigator.clipboard.writeText(text) : Promise.reject();
+  }
+  written.then(
+    () => {
+      input.clipboardWritten(text);
+      host.post({ type: 'tilt:clipboard', from: 'remote', text, copied: true });
+    },
+    () => host.post({ type: 'tilt:clipboard', from: 'remote', text, copied: false }),
+  );
+}
 
 function takeControl() {
   wantControl = true;

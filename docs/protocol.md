@@ -141,8 +141,9 @@ The shape is at most 128×128.
 | 0x30 | KEY | `u8 down, u32 keysym` — a `down` for an already-down keysym means autorepeat |
 | 0x31 | TEXT | `utf8 bytes…` (rest of message) — type this text: '\n' → Return, '\t' → Tab, otherwise per-codepoint keysym. At most 4096 bytes are typed: the server cuts longer text at the last character boundary before that and drops the rest (with a warning in its log). Send longer text as several messages. It is typed literally: the Control, Alt, Meta, Super or Hyper keys this session holds are released for the whole text and pressed again after it, and its own Shift or AltGr is lifted for characters that must not have it. Losing control, disconnecting or RELEASE_ALL stops the rest. |
 | 0x32 | RELEASE_ALL | (no payload) — release everything this session holds, and stop the TEXT it is still typing along with everything the session sent after that TEXT |
+| 0x33 | CLIPBOARD | `utf8 bytes…` (rest of message, at most 65535 bytes) — make this text the X CLIPBOARD selection's content, tilt owning it, before any input sent after it runs: send it just before a paste key (Ctrl+V), so the application pastes it. Offered as UTF8_STRING, `text/plain;charset=utf-8`, TEXT and STRING (Latin-1, `?` for other characters). |
 
-Every fixed-size message must have exactly the listed length; TEXT must be valid UTF-8. Anything
+Every fixed-size message must have exactly the listed length; TEXT and CLIPBOARD must be valid UTF-8. Anything
 else counts as malformed (see section 5).
 
 Coordinate mapping, done on the server against the current screen size W×H:
@@ -197,6 +198,10 @@ Server to client:
   rate cap in force (`--max-fps`); `qp` is the mean quantizer of the last second's frames, 0
   when there were none. `patches` is how many of the last second's `fps` were patches; `enc_ms`
   and `qp` cover the H.264 frames only.
+- `{"t":"clipboard","text":"…"}`: an application on the display copied this text (the CLIPBOARD
+  selection changed hands), sent only to the session holding control, as it happens. Only text
+  that converts to UTF8_STRING in one go, at most 65535 bytes, is sent; other content (images,
+  larger text) is not. Text CLIPBOARD set is not sent back.
 - `{"t":"error","code":"auth"|"version"|"not_ready"|"forbidden"|"hello_timeout"|"unsupported_size","msg":"…"}`.
   `unsupported_size` means the encoder cannot take the screen's size (smaller than 16×16, or
   more than 36864 macroblocks, about 4096×2304). The session stays open without video; when the

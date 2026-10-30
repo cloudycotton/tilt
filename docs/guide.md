@@ -183,6 +183,7 @@ The page posts these to its parent (or, opened with `window.open`, to its opener
 |---|---|
 | `{type: 'tilt:state', status, message, detail, code, control, held, role, remote, session, screen: {w, h}, scale, modifiers: {ctrl, alt, super}, fullscreen}` | on any change. `status` is `connecting`, `live`, `reconnecting` or `error`. While it is not `live`, `message` and `detail` say why, in words you can show, and `code` names the cause where there is one: `auth` (ask for a token, then send `tilt:token`), `version`, `webtransport`, `unsupported` (no WebCodecs), `undecodable` (offer a retry with `tilt:reconnect`), `size`. `control` is whether this page has control, `held` whether anyone has, `role` is `control` or `view`, `scale` is `fit` or `1` |
 | `{type: 'tilt:notice', text}` | something worth telling the viewer, such as "Another viewer took control." |
+| `{type: 'tilt:clipboard', from, text, copied}` | the clipboard was shared (below). `from: 'local'`: a paste took the local clipboard's `text` to the remote. `from: 'remote'`: an application copied `text` on the remote screen; `copied` is whether it is in the local clipboard now. When it is `false` (the browser refused: Safari and Firefox write only soon after a key or click in the page), offer a Copy button that writes `text` |
 | `{type: 'tilt:stats', client, server}` | once a second, after `tilt:stats` or with `stats=1`: frame rates, bitrate, round trip, decoder and server numbers |
 
 It obeys these, from its parent (or opener) only:
@@ -267,6 +268,22 @@ Every flag also has an environment variable. With none of `--token`, `--token-fi
 Usage errors (a missing token, an inconsistent quantizer or bitrate range) exit with code 2 at
 startup. `tilt serve [flags]` is the same as `tilt [flags]`.
 </details>
+
+### Clipboard
+
+While the page has control, the clipboard is shared both ways, as text up to 64 KB:
+
+- **Paste:** Ctrl+V (or Cmd+V, Ctrl+Shift+V, Shift+Insert) in the page first makes the local
+  clipboard's text the remote clipboard's, then sends the key, so the remote application pastes
+  it. The browser hands the page its clipboard for that key without asking. When the local
+  clipboard still holds what was last shared, the remote one is left alone: it may hold something
+  newer that is not text, such as an image.
+- **Copy:** text copied on the remote screen goes to the local clipboard. Copied with a shortcut
+  in the page (Ctrl+C, Ctrl+Shift+C, Ctrl+X, Ctrl+Insert), this works in every browser. Copied
+  any other way (an Edit menu), Chrome and Edge write it while the page has focus; Safari and
+  Firefox may refuse, and `tilt:clipboard` says so with `copied: false`.
+- The iframe needs `allow="clipboard-read; clipboard-write"`. Images, files and larger text stay
+  on their side, as does the select-to-copy (PRIMARY) selection.
 
 ## Tips and limits
 

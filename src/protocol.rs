@@ -28,6 +28,7 @@ pub const MSG_WHEEL: u8 = 0x22;
 pub const MSG_KEY: u8 = 0x30;
 pub const MSG_TEXT: u8 = 0x31;
 pub const MSG_RELEASE_ALL: u8 = 0x32;
+pub const MSG_CLIPBOARD: u8 = 0x33;
 
 /// VIDEO flags bit0: an IDR with SPS+PPS in the payload.
 pub const FLAG_KEY: u8 = 1 << 0;
@@ -39,6 +40,8 @@ pub const VIDEO_HEADER_LEN: usize = 18;
 /// the keymap lacks costs a keyboard remap), so this bounds the time one message holds the
 /// input thread. Clients send longer text as several messages. (Addition to the brief.)
 pub const MAX_TEXT_BYTES: usize = 4096;
+/// The most clipboard text shared either way: what fits in one client message.
+pub const MAX_CLIPBOARD_BYTES: usize = 65535;
 
 // WebSocket close codes.
 pub const CLOSE_NORMAL: u16 = 1000;
@@ -191,6 +194,10 @@ pub enum ClientMsg {
         dropped: usize,
     },
     ReleaseAll,
+    /// Make this the remote clipboard's content (the viewer is about to paste).
+    Clipboard {
+        text: String,
+    },
 }
 
 /// Why a client binary message was rejected. The reader counts these; it never panics.
@@ -290,6 +297,11 @@ impl ClientMsg {
                 fixed(0)?;
                 ClientMsg::ReleaseAll
             }
+            MSG_CLIPBOARD => ClientMsg::Clipboard {
+                text: std::str::from_utf8(p)
+                    .map_err(|_| ParseError::Utf8)?
+                    .to_owned(),
+            },
             other => return Err(ParseError::UnknownType(other)),
         })
     }
@@ -354,6 +366,10 @@ pub enum ServerText {
         h: u32,
     },
     Stats(Stats),
+    /// Text copied on the remote screen, for the controlling viewer's clipboard.
+    Clipboard {
+        text: String,
+    },
     Error {
         code: ErrorCode,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -705,6 +721,15 @@ mod tests {
             }
         );
         assert_eq!(ok(&[0x32]), ClientMsg::ReleaseAll);
+        // Clipboard text is not cut at TEXT's limit.
+        let long = "é".repeat(MAX_TEXT_BYTES);
+        let mut m = vec![MSG_CLIPBOARD];
+        m.extend_from_slice(long.as_bytes());
+        assert_eq!(ok(&m), ClientMsg::Clipboard { text: long });
+        assert_eq!(
+            ClientMsg::parse(&[MSG_CLIPBOARD, 0xff]),
+            Err(ParseError::Utf8)
+        );
     }
 
     #[test]

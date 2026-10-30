@@ -204,3 +204,37 @@ test('commands run directly through window.tilt.command', async ({ page, mock })
   await pollState(page, 'control').toBe(true);
   expect(mock.messages.slice(since).some((m) => m.type === 'hello')).toBe(true);
 });
+
+test('a paste shortcut takes the local clipboard to the remote one first; a remote copy comes back', async ({ page, mock, context, browserName }) => {
+  if (browserName === 'chromium') await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: mock.url });
+  const host = await hostPage(page, mock, 'token=devtoken&remote=1');
+  const id = await controlling(host.frame);
+  await host.frame.locator('#screen').click();
+  const clipboard = (m) => m.type === 'tilt:clipboard';
+  const paste = async () => {
+    const since = mock.messages.length;
+    await page.keyboard.press('Control+v');
+    return inputLog(await collect(mock, id, ['KEY', 'CLIPBOARD'], since, 4));
+  };
+
+  // The text goes before the V, so the remote application pastes it.
+  await page.keyboard.press('Control+c'); // a copy shortcut that copies nothing changes nothing
+  await host.frame.evaluate(() => navigator.clipboard.writeText('from here ✓\nline 2'));
+  expect(await paste()).toEqual(['down ffe3', 'CLIPBOARD from here ✓\nline 2', 'down 76', 'up 76', 'up ffe3']);
+  expect((await host.of('tilt:clipboard'))).toEqual([{ type: 'tilt:clipboard', from: 'local', text: 'from here ✓\nline 2' }]);
+  // Unchanged since: the remote clipboard may hold something newer (an image), so it stays.
+  expect(await paste()).toEqual(['down ffe3', 'down 76', 'up 76', 'up ffe3']);
+
+  // Copied on the remote after a copy shortcut: into the local clipboard, and the host is told.
+  await page.keyboard.press('Control+c');
+  mock.copy('from there ✓');
+  await expect.poll(async () => (await host.of('tilt:clipboard')).length).toBe(2);
+  expect((await host.of('tilt:clipboard'))[1]).toEqual({ type: 'tilt:clipboard', from: 'remote', text: 'from there ✓', copied: true });
+  // Pasting it back is not a change either.
+  expect(await paste()).toEqual(['down ffe3', 'down 76', 'up 76', 'up ffe3']);
+  // It is in the local clipboard: pasted into the host page.
+  await page.evaluate(() => document.body.appendChild(document.createElement('textarea')).focus());
+  await page.keyboard.press('Control+v');
+  expect(await page.evaluate(() => document.querySelector('body > textarea').value)).toBe('from there ✓');
+  expect(mock.violations).toEqual([]);
+});

@@ -129,9 +129,18 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
     release_memory();
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Clipboard sharing is optional: tilt runs without it on a display that cannot.
+    let (clipboard, copied) =
+        match x11::clipboard::spawn_clipboard_thread(&cfg.display, Arc::clone(&shutdown)) {
+            Ok((handle, copied)) => (Some(handle), copied),
+            Err(e) => {
+                warn!("clipboard sharing is off: {e:#}");
+                (None, tokio::sync::watch::channel(None).1)
+            }
+        };
     // Input first: capture needs its handle for the pull-forward after injected input.
     let (input, input_thread) =
-        input::spawn_input_thread(cfg.display.clone(), Arc::clone(&shutdown))
+        input::spawn_input_thread(cfg.display.clone(), clipboard, Arc::clone(&shutdown))
             .context("starting input injection")?;
     let (hub, wake) = FrameHub::new();
     let capture = capture::spawn_capture(
@@ -165,6 +174,7 @@ fn run(cfg: Arc<Config>) -> anyhow::Result<ExitCode> {
         hub,
         input,
         cursor,
+        copied,
         sessions,
         cpus: config::available_cpus(),
     });

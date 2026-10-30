@@ -42,6 +42,7 @@ const WHEEL = 0x22;
 const KEY = 0x30;
 const TEXT = 0x31;
 const RELEASE_ALL = 0x32;
+const CLIPBOARD = 0x33;
 const FLAG_KEY = 1;
 const FLAG_MORE = 2;
 const FLAG_PATCH = 4;
@@ -53,7 +54,8 @@ const MARKER_COLORS = 4;
 // Exact binary message sizes; TEXT is variable, up to MAX_TEXT_BYTES of UTF-8 (src/protocol.rs).
 const SIZES = { [ACK]: 7, [PING]: 5, [MOVE]: 5, [BUTTON]: 7, [WHEEL]: 9, [KEY]: 6, [RELEASE_ALL]: 1 };
 const MAX_TEXT_BYTES = 4096;
-const INPUT = new Set([MOVE, BUTTON, WHEEL, KEY, TEXT, RELEASE_ALL]);
+const MAX_CLIPBOARD_BYTES = 65535;
+const INPUT = new Set([MOVE, BUTTON, WHEEL, KEY, TEXT, RELEASE_ALL, CLIPBOARD]);
 
 export const DEFAULTS = {
   port: 0,
@@ -456,6 +458,10 @@ export async function startMockServer(options = {}) {
         if (b.length - 1 > MAX_TEXT_BYTES) violation(sess, `TEXT of ${b.length - 1} bytes, over ${MAX_TEXT_BYTES}`);
         rec = { type: 'TEXT', text: b.subarray(1).toString('utf8') };
         break;
+      case CLIPBOARD:
+        if (b.length - 1 > MAX_CLIPBOARD_BYTES) violation(sess, `CLIPBOARD of ${b.length - 1} bytes, over ${MAX_CLIPBOARD_BYTES}`);
+        rec = { type: 'CLIPBOARD', text: b.subarray(1).toString('utf8') };
+        break;
       default:
         rec = { type: 'RELEASE_ALL' };
     }
@@ -472,7 +478,7 @@ export async function startMockServer(options = {}) {
   function onBinary(sess, b) {
     const type = b[0];
     const size = SIZES[type];
-    if (b.length === 0 || (size === undefined && type !== TEXT)) {
+    if (b.length === 0 || (size === undefined && type !== TEXT && type !== CLIPBOARD)) {
       violation(sess, `unknown binary type 0x${(type ?? 0).toString(16)}`);
       return;
     }
@@ -798,6 +804,10 @@ export async function startMockServer(options = {}) {
     setCursor(shape) {
       state.cursor = { serial: state.cursor.serial + 1, ...(shape || { w: 0, h: 0, xhot: 0, yhot: 0, rgba: Buffer.alloc(0) }) };
       broadcast(cursorShapeMsg());
+    },
+    /** Something was copied on the remote screen: the controller is sent it, as the real server does. */
+    copy(text) {
+      if (state.holder) sendJson(state.holder, { t: 'clipboard', text });
     },
     moveCursor(x, y) {
       state.cursorPos = [x, y];

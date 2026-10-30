@@ -44,6 +44,7 @@ use x11rb::x11_utils::X11Error;
 
 use crate::clock;
 use crate::protocol::denormalize;
+use crate::x11::clipboard::ClipboardHandle;
 use keymap::{KeyPlan, Keycodes, Keymap, ModState, Modifiers, SpareKeycodes};
 
 /// The XTest pointer device has 10 buttons.
@@ -116,6 +117,12 @@ pub enum InputCmd {
     ReleaseAll {
         session: u64,
     },
+    /// Makes `text` the CLIPBOARD's content before the commands after it run, so that a paste
+    /// key sent next pastes it.
+    Clipboard {
+        session: u64,
+        text: String,
+    },
     /// Server autorepeat is off while any session holds control, and restored after.
     SetControllerPresent(bool),
     /// `--resize`: gives the screen the shape of a viewer's `w`x`h` window, at least `min`.
@@ -137,6 +144,7 @@ impl InputCmd {
             | InputCmd::Key { session, .. }
             | InputCmd::Text { session, .. }
             | InputCmd::ReleaseAll { session }
+            | InputCmd::Clipboard { session, .. }
             | InputCmd::Resize { session, .. } => Some(session),
             InputCmd::SetControllerPresent(_) => None,
         }
@@ -180,10 +188,12 @@ impl InputHandle {
 /// keycodes before it exits, after a panic too.
 pub fn spawn_input_thread(
     display: String,
+    clipboard: Option<ClipboardHandle>,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<(InputHandle, JoinHandle<()>)> {
     // Set up before spawning, so a display without XTest fails startup rather than the thread.
-    let injector = Injector::connect(&display, shutdown)?;
+    let mut injector = Injector::connect(&display, shutdown)?;
+    injector.clipboard = clipboard;
     let (tx, rx) = crossbeam_channel::unbounded();
     let last_input_us = Arc::new(AtomicU64::new(0));
     let stamp = Arc::clone(&last_input_us);
@@ -450,6 +460,8 @@ struct Injector {
     next_repeat_check: Instant,
     /// Whether anything was injected since the last flush.
     injected: bool,
+    /// Where Clipboard commands go; None without clipboard sharing.
+    clipboard: Option<ClipboardHandle>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -525,6 +537,7 @@ impl Injector {
             repeat_restore: None,
             next_repeat_check: Instant::now(),
             injected: false,
+            clipboard: None,
             shutdown,
         })
     }
@@ -701,6 +714,11 @@ impl Injector {
             } => self.key_up(session, keysym)?,
             InputCmd::Text { session, ref text } => return self.text(session, text, deadline),
             InputCmd::ReleaseAll { session } => self.release_all(session)?,
+            InputCmd::Clipboard { ref text, .. } => {
+                if let Some(clipboard) = &self.clipboard {
+                    clipboard.set(text.clone());
+                }
+            }
             InputCmd::SetControllerPresent(present) => self.set_controller_present(present)?,
             InputCmd::Resize { w, h, min, .. } => self.resize((w, h), min)?,
         }

@@ -19,6 +19,7 @@ use crate::protocol::{self, ClientMsg, ClientText, ErrorCode, ScreenSize, Server
 use crate::server::AppState;
 use crate::transport::{CloseFrame, Message, Sink, Stream};
 use crate::worker::{self, Inbox};
+use crate::x11::clipboard::Copied;
 use crate::x11::cursor::CursorState;
 
 /// Shown to clients as `s<id>`.
@@ -244,6 +245,7 @@ pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
                 inbox: &inbox,
                 cursor_serial: None,
                 cursor_pos: None,
+                controlling: false,
             };
             tokio::select! {
                 r = reader.run(&mut stream) => r,
@@ -252,6 +254,7 @@ pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
                     out_rx,
                     reply_rx,
                     state.cursor.clone(),
+                    state.copied.clone(),
                     control_rx,
                     state.sessions.closing(),
                 ) => r,
@@ -531,6 +534,7 @@ impl Reader<'_> {
                 InputCmd::Text { session: sid, text }
             }
             ClientMsg::ReleaseAll => InputCmd::ReleaseAll { session: sid },
+            ClientMsg::Clipboard { text } => InputCmd::Clipboard { session: sid, text },
         };
         let held = match &cmd {
             InputCmd::Key { keysym, down, .. } => Held::Key(*keysym, *down),
@@ -641,15 +645,19 @@ struct Writer<'a> {
     inbox: &'a Inbox,
     cursor_serial: Option<u32>,
     cursor_pos: Option<(i32, i32)>,
+    /// Whether this session holds control: only its holder is sent what is copied.
+    controlling: bool,
 }
 
 impl Writer<'_> {
+    #[allow(clippy::too_many_arguments)] // one channel per source the select! below waits on
     async fn run(
         mut self,
         welcome: String,
         mut out: mpsc::Receiver<OutMsg>,
         mut replies: mpsc::Receiver<OutMsg>,
         mut cursor: watch::Receiver<CursorState>,
+        mut copied: watch::Receiver<Copied>,
         mut control: watch::Receiver<ControlStatus>,
         mut closing: watch::Receiver<bool>,
     ) -> (Option<CloseFrame>, &'static str) {
@@ -662,6 +670,8 @@ impl Writer<'_> {
         if self.send_control(status).await.is_err() {
             return dead;
         }
+        // Only what is copied from now on.
+        copied.borrow_and_update();
         let state = cursor.borrow_and_update().clone();
         if (state.shape.is_some() || (state.x, state.y) != (0, 0))
             && self.send_cursor(&state).await.is_err()
@@ -689,6 +699,15 @@ impl Writer<'_> {
                     let state = cursor.borrow_and_update().clone();
                     self.send_cursor(&state).await
                 }
+                Ok(()) = copied.changed() => {
+                    let text = copied.borrow_and_update().as_deref().map(str::to_owned);
+                    match text {
+                        Some(text) if self.controlling => {
+                            self.send(Message::Text(ServerText::Clipboard { text }.to_json())).await
+                        }
+                        _ => Ok(()),
+                    }
+                }
             };
             if sent.is_err() {
                 return dead;
@@ -707,6 +726,7 @@ impl Writer<'_> {
     }
 
     async fn send_control(&mut self, s: ControlStatus) -> Result<(), ()> {
+        self.controlling = s.you;
         self.send(Message::Text(s.message().to_json())).await
     }
 

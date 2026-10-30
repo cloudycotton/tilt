@@ -7,6 +7,7 @@ const WHEEL = 0x22;
 const KEY = 0x30;
 const TEXT = 0x31;
 const RELEASE_ALL = 0x32;
+const CLIPBOARD = 0x33;
 
 const DRAG_INTERVAL_MS = 1000 / 240;
 // Hover moves go out at once, at most this often: 125 Hz, above most screens' refresh.
@@ -38,6 +39,8 @@ const PAD_CHAR = '\u200B';
 const PAD = PAD_CHAR.repeat(32);
 // The server types at most this much UTF-8 per TEXT message and drops the rest.
 const TEXT_CHUNK_BYTES = 4096;
+// The most clipboard text one CLIPBOARD message carries.
+const CLIPBOARD_MAX_BYTES = 65535;
 
 // MouseEvent.button -> X button number, and -> its bit in MouseEvent.buttons.
 const X_BUTTON = [1, 2, 3, 8, 9];
@@ -75,6 +78,8 @@ export function message(type, len) {
  *   onChange()                   sticky modifiers changed
  *   onCursor()                   the virtual cursor moved
  *   onPointerType(type)          the last pointer type used on the viewer
+ *   onCopyKey()                  a copy shortcut (Ctrl+C, Ctrl+X, Ctrl+Insert) is going to the remote
+ *   onPasted(text)               the local clipboard's text went to the remote clipboard for a paste
  * }
  */
 export function createInput(env) {
@@ -461,6 +466,11 @@ export function createInput(env) {
       if (opt) optionTyped();
       return;
     }
+    if (!e.repeat && e !== pasteReplay && isPasteKey(e)) {
+      holdPasteKey(e);
+      return;
+    }
+    if (!e.repeat && isCopyKey(e)) env.onCopyKey();
     const id = e.code || e.key;
     if (fakeCtrl) {
       if (e.code === 'AltRight' && Math.abs(e.timeStamp - fakeCtrl.ts) < 1) {
@@ -528,6 +538,7 @@ export function createInput(env) {
   }
 
   function onKeyUp(e) {
+    if (pasteKey && (e.code || e.key) === (pasteKey.code || pasteKey.key)) sendPasteKey();
     const id = e.code || e.key;
     // A key pressed in the viewer is released wherever focus went meanwhile (the Type text box,
     // the menu): dropping its keyup would leave it held at the server.
@@ -695,6 +706,53 @@ export function createInput(env) {
     resetPad();
     ta.focus({ preventScroll: true });
     caretToEnd();
+  }
+
+  // ---- clipboard: a paste shortcut takes the local clipboard's text to the remote clipboard first
+
+  let pasteKey = null; // the paste shortcut's keydown, held back for the browser's paste event
+  let pasteReplay = null; // that keydown, while it goes to the remote after all
+  // The local clipboard text last sent to the remote, or written there from it: pasting it again
+  // keeps the remote clipboard, which may hold something newer that is not text (an image).
+  let shared = null;
+
+  const shortcut = (e) => e.ctrlKey || (APPLE && e.metaKey);
+  const isPasteKey = (e) => (shortcut(e) && e.code === 'KeyV') || (e.shiftKey && !shortcut(e) && e.code === 'Insert');
+  const isCopyKey = (e) => shortcut(e) && (e.code === 'KeyC' || e.code === 'KeyX' || e.code === 'Insert');
+
+  // Not prevented, so that the browser fires its paste event with the local clipboard. Without
+  // one (nothing to paste, or a browser that sends none) the key goes as it is: the remote
+  // pastes its own clipboard.
+  function holdPasteKey(e) {
+    pasteKey = e;
+    setTimeout(sendPasteKey, 0);
+  }
+
+  function sendPasteKey() {
+    const e = pasteKey;
+    if (!e) return;
+    pasteKey = null;
+    pasteReplay = e;
+    try { onKeyDown(e); } finally { pasteReplay = null; }
+  }
+
+  function onPaste(e) {
+    if (!pasteKey) return; // a soft keyboard's paste: the textarea types it
+    e.preventDefault();
+    const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+    if (text && text !== shared && enabled) {
+      const utf8 = encoder.encode(text);
+      if (utf8.length <= CLIPBOARD_MAX_BYTES) {
+        flushMove();
+        const m = new Uint8Array(1 + utf8.length);
+        m[0] = CLIPBOARD;
+        m.set(utf8, 1);
+        send(m);
+        shared = text;
+        env.onPasted(text);
+      }
+    }
+    sendPasteKey();
   }
 
   // ---- touch
@@ -922,6 +980,7 @@ export function createInput(env) {
   document.addEventListener('keydown', onKeyDown);
   document.addEventListener('keyup', onKeyUp);
   ta.addEventListener('input', onInput);
+  document.addEventListener('paste', onPaste, true);
   ta.addEventListener('compositionstart', () => {
     composing = true;
     deadEnd = false;
@@ -1006,6 +1065,8 @@ export function createInput(env) {
     keyboardFocused() { return document.activeElement === ta; },
     /** Literal text (the Type text dialog). */
     sendText: sendLiteral,
+    /** The remote clipboard's text is in the local clipboard now. */
+    clipboardWritten(text) { shared = text; },
     holdKey,
     releaseKey,
     /** Extra-key strip modifiers: off -> next key only -> locked -> off. */

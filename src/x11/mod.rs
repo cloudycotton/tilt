@@ -1,5 +1,6 @@
 //! X11 access over x11rb's pure-Rust connection.
 
+pub mod clipboard;
 pub mod conn;
 pub mod cursor;
 pub mod damage;

@@ -83,7 +83,7 @@ impl Input {
     fn start(xvfb: &Xvfb) -> Input {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (handle, thread) =
-            spawn_input_thread(xvfb.display.clone(), Arc::clone(&shutdown)).unwrap();
+            spawn_input_thread(xvfb.display.clone(), None, Arc::clone(&shutdown)).unwrap();
         Input {
             handle,
             shutdown,

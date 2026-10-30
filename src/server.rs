@@ -24,6 +24,7 @@ use crate::input::InputHandle;
 use crate::protocol::ScreenSize;
 use crate::session::{SessionStatus, Sessions};
 use crate::wt;
+use crate::x11::clipboard::Copied;
 use crate::x11::cursor::CursorState;
 
 /// Everything the handlers, sessions and encoder workers share.
@@ -34,6 +35,8 @@ pub struct AppState {
     pub control: ControlState,
     pub input: InputHandle,
     pub cursor: watch::Receiver<CursorState>,
+    /// Text copied on the display, for the controlling viewer.
+    pub copied: watch::Receiver<Copied>,
     pub sessions: Sessions,
     /// The CPUs tilt may use, for `--profile auto`.
     pub cpus: usize,
@@ -48,6 +51,7 @@ pub struct AppParts {
     pub hub: Arc<FrameHub>,
     pub input: InputHandle,
     pub cursor: watch::Receiver<CursorState>,
+    pub copied: watch::Receiver<Copied>,
     pub sessions: Sessions,
     pub cpus: usize,
 }
@@ -61,6 +65,7 @@ impl AppState {
             control: ControlState::new(p.input.clone()),
             input: p.input,
             cursor: p.cursor,
+            copied: p.copied,
             sessions: p.sessions,
             cpus: p.cpus,
             wt: Mutex::new(None),
@@ -221,6 +226,7 @@ pub fn test_state(args: &[&str]) -> Arc<AppState> {
         hub,
         input,
         cursor: watch::channel(CursorState::default()).1,
+        copied: watch::channel(None).1,
         sessions: Sessions::new(),
         cpus: 4,
         cfg,
